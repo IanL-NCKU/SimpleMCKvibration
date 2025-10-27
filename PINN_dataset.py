@@ -32,13 +32,25 @@ class Vibration_DataNormalizer:
             self.linear_mean[feat] = np.mean(data_dict[feat])
             self.linear_std[feat] = np.std(data_dict[feat])
 
-    def transform(self, data_dict):
-        """Normalize data"""
+    def transform(self, data_dict, t_zero_threshold=1e-9):
+        """Normalize data
+
+        Args:
+            data_dict: Dictionary with feature arrays
+            t_zero_threshold: Values below this for 't' are clamped to avoid log10(0) = -inf
+        """
         normalized = {}
 
         # Log-space normalization
         for feat in self.log_features:
-            log_values = np.log10(data_dict[feat])
+            values = data_dict[feat].copy()
+
+            # Special handling for time to avoid log10(0)
+            if feat == 't':
+                # Clamp very small values (including 0) to small positive value
+                values = np.where(values < t_zero_threshold, t_zero_threshold, values)
+
+            log_values = np.log10(values)
             normalized[feat] = (log_values - self.log_mean[feat]) / self.log_std[feat]
 
         # Standard normalization
@@ -76,14 +88,40 @@ class Vibration_DataNormalizer:
             normalized['v0']
         ], axis=1)
 
-    def inverse_transform(self, normalized_dict):
-        """Denormalize data"""
+    def inverse_transform(self, normalized_dict, t_zero_threshold=1e-9):
+        """Denormalize data
+
+        Args:
+            normalized_dict: Dictionary with normalized feature arrays
+            t_zero_threshold: If denormalized 't' would be below this, set to exactly 0.0
+        """
         original = {}
 
         # Inverse log-space normalization
         for feat in self.log_features:
-            log_values = normalized_dict[feat] * self.log_std[feat] + self.log_mean[feat]
-            original[feat] = 10 ** log_values  # Exponentiate back
+            # Special handling for time: check threshold in normalized space
+            if feat == 't':
+                # Convert threshold from real space to normalized space
+                # threshold_real = 1e-9  →  log10(1e-9) = -9  →  normalize
+                threshold_log = np.log10(t_zero_threshold)
+                threshold_norm = (threshold_log - self.log_mean[feat]) / self.log_std[feat]
+
+                # Add safety margin to ensure clamped values are always caught
+                # Values clamped to 1e-10 during normalization should definitely be below this
+                threshold_norm_with_margin = threshold_norm + 0.5
+
+                # Map values below threshold directly to 0, compute rest normally
+                normalized_values = normalized_dict[feat]
+                values = np.where(
+                    normalized_values < threshold_norm_with_margin,
+                    0.0,  # Map to exactly 0
+                    10 ** (normalized_values * self.log_std[feat] + self.log_mean[feat])  # Normal denorm
+                )
+            else:
+                log_values = normalized_dict[feat] * self.log_std[feat] + self.log_mean[feat]
+                values = 10 ** log_values
+
+            original[feat] = values
 
         # Inverse standard normalization
         for feat in self.linear_features:
@@ -196,10 +234,10 @@ def load_vibration_data(filepath='vibration_data_normalized.npz', batch_size=32,
 
     # Split into train (70%), val (15%), test (15%)
     X_train, X_temp, y_train, y_temp = train_test_split(
-        input_data, output_data, test_size=0.3, random_state=42)
+        input_data, output_data, test_size=0.2, random_state=42)
 
     X_val, X_test, y_val, y_test = train_test_split(
-        X_temp, y_temp, test_size=0.5, random_state=42)
+        X_temp, y_temp, test_size=0.8, random_state=42)
 
     # Normalize inputs if requested
     normalizer = None

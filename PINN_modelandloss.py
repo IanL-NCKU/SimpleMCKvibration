@@ -6,20 +6,25 @@ from abc import ABC, abstractmethod
 class VibrationPINN(nn.Module):
     """Physics-Informed Neural Network for vibration prediction"""
 
-    def __init__(self, hidden_dims=[64, 128, 128, 64], activation='tanh', use_log_output=False):
+    def __init__(self, hidden_dims=[64, 128, 128, 64], activation='ELU', use_log_output=False,
+                 use_finetune=False, finetune_hidden_dims=[32, 32], finetune_scale=0.1):
         super().__init__()
 
         self.use_log_output = use_log_output
+        self.use_finetune = use_finetune
+        self.finetune_scale = finetune_scale  # Controls max correction (e.g., 0.1 = ±10%)
 
-        # Choose activation
+        # Choose activation function
         if activation == 'tanh':
             act = nn.Tanh
         elif activation == 'swish':
             act = nn.SiLU
+        elif activation == 'ELU':
+            act = nn.ELU
         else:
             act = nn.GELU
 
-        # Build network
+        # Build main network
         layers = []
         input_dim = 6  # [m, zeta, k, t, x0, v0]
 
@@ -37,6 +42,25 @@ class VibrationPINN(nn.Module):
             layers.append(nn.Linear(input_dim, 3))
 
         self.network = nn.Sequential(*layers)
+
+        # Build fine-tune network (if enabled)
+        if self.use_finetune:
+            finetune_layers = []
+            # Input: original 6 inputs + 3 base predictions = 9 features
+            finetune_input_dim = 9  # [m, zeta, k, t, x0, v0, x_base, v_base, a_base]
+
+            for hidden_dim in finetune_hidden_dims:
+                finetune_layers.append(nn.Linear(finetune_input_dim, hidden_dim))
+                finetune_layers.append(act())
+                finetune_input_dim = hidden_dim
+
+            # Output 3 fine-tune corrections: [finetune_x, finetune_v, finetune_a]
+            finetune_layers.append(nn.Linear(finetune_input_dim, 3))
+            finetune_layers.append(nn.Tanh())  # Bounded output in [-1, 1]
+
+            self.finetune_network = nn.Sequential(*finetune_layers)
+        else:
+            self.finetune_network = None
 
         # Initialize weights
         self.apply(self._init_weights)
@@ -71,13 +95,34 @@ class VibrationPINN(nn.Module):
             log_a = output[:, 5:6]
 
             # Transform to real space: sign * 10^log_magnitude
-            x_pred = sign_x * (10 ** log_x)
-            v_pred = sign_v * (10 ** log_v)
-            a_pred = sign_a * (10 ** log_a)
+            x_pred_base = sign_x * (10 ** log_x)
+            v_pred_base = sign_v * (10 ** log_v)
+            a_pred_base = sign_a * (10 ** log_a)
+
+            # Apply fine-tuning if enabled
+            if self.use_finetune:
+                # Concatenate inputs with base predictions
+                base_preds = torch.cat([x_pred_base, v_pred_base, a_pred_base], dim=1)
+                finetune_input = torch.cat([x, base_preds], dim=1)  # [batch_size, 9]
+
+                # Get fine-tune corrections (in [-1, 1] due to tanh)
+                finetune_raw = self.finetune_network(finetune_input)  # [batch_size, 3]
+
+                # Scale corrections (e.g., 0.1 means ±10% max correction)
+                finetune_corrections = self.finetune_scale * finetune_raw
+
+                # Apply multiplicative correction: x_pred = x_base * (1 + finetune)
+                x_pred = x_pred_base * (1 + finetune_corrections[:, 0:1])
+                v_pred = v_pred_base * (1 + finetune_corrections[:, 1:2])
+                a_pred = a_pred_base * (1 + finetune_corrections[:, 2:3])
+            else:
+                x_pred = x_pred_base
+                v_pred = v_pred_base
+                a_pred = a_pred_base
 
             return torch.cat([x_pred, v_pred, a_pred], dim=1)
         else:
-            # Direct output in real space
+            # Direct output in real space (no fine-tuning for non-log output)
             return output  # [batch_size, 3]
 
     @staticmethod
@@ -578,5 +623,170 @@ class PINNLoss(nn.Module):
         loss_dict['total'] = total_loss.item()
 
         return total_loss, loss_dict
+
+
+class PINNLoss_v2(nn.Module):
+    """
+    Dictionary-based PINN Loss with flexible argument passing
+
+    Usage:
+        # Configuration
+        loss_config = {
+            "MSE": {"weight": 0.3},
+            "Residual": {"weight": 0.2, "use_relative": False},
+            "InitialCondition": {"weight": 0.3, "t_threshold": 1e-6},
+            "Consistency": {"weight": 0.2, "t_threshold": 1e-6}
+        }
+
+        # To disable a loss, use any of:
+        # 1. Omit from dict
+        # 2. Set to None: "Consistency": None
+        # 3. Set weight to 0: "Consistency": {"weight": 0}
+
+        # Create loss function
+        loss_fn = PINNLoss_v2(model, loss_config)
+
+        # In training loop, prepare arguments for enabled losses
+        loss_args = {}
+        if loss_fn.has_loss("MSE"):
+            loss_args["MSE"] = (outputs, targets)
+        if loss_fn.has_loss("Residual"):
+            loss_args["Residual"] = (outputs, inputs_real)
+        if loss_fn.has_loss("Consistency"):
+            loss_args["Consistency"] = (inputs, inputs_real, norm_params)
+        if loss_fn.has_loss("InitialCondition"):
+            loss_args["InitialCondition"] = (outputs_t0, inputs_real_t0)
+
+        # Compute loss
+        total_loss, loss_summary = loss_fn(loss_args)
+    """
+
+    def __init__(self, model, loss_config):
+        super().__init__()
+
+        self.model = model
+        self.loss_config = loss_config
+        self.loss_components = {}
+
+        # Initialize MSE loss if requested
+        if self._should_enable("MSE"):
+            self.loss_components["MSE"] = nn.MSELoss()
+
+        # Initialize Residual loss if requested
+        if self._should_enable("Residual"):
+            config = self.loss_config.get("Residual")
+            use_relative = config.get("use_relative", False)
+            weight = config.get("weight", 1.0)
+            self.loss_components["Residual"] = ResidualLoss(weight=weight, use_relative=use_relative)
+
+        # Initialize InitialCondition loss if requested
+        if self._should_enable("InitialCondition"):
+            config = self.loss_config.get("InitialCondition")
+            t_threshold = config.get("t_threshold", 1e-6)
+            weight = config.get("weight", 1.0)
+            self.loss_components["InitialCondition"] = InitialConditionLoss(weight=weight, t_threshold=t_threshold)
+
+        # Initialize Consistency loss if requested
+        if self._should_enable("Consistency"):
+            config = self.loss_config.get("Consistency")
+            t_threshold = config.get("t_threshold", 1e-6)
+            weight = config.get("weight", 1.0)
+            self.loss_components["Consistency"] = ConsistencyLoss_auto_diff(weight=weight, model=model, t_threshold=t_threshold)
+
+        # Print configuration
+        self._print_config()
+
+    def _should_enable(self, loss_name):
+        """Check if a loss should be enabled"""
+        # Use .get() to handle missing keys gracefully
+        config = self.loss_config.get(loss_name, None)
+
+        if config is None:
+            return False
+        if config.get("weight", 0) == 0:
+            return False
+        return True
+
+    def has_loss(self, loss_name):
+        """Check if a loss component is enabled"""
+        return loss_name in self.loss_components
+
+    def forward(self, loss_args):
+        """
+        Compute total loss from arguments dictionary
+
+        Args:
+            loss_args: Dictionary with loss arguments
+                {
+                    "MSE": (outputs, targets),
+                    "Residual": (outputs, inputs_real),
+                    "Consistency": (inputs, inputs_real, norm_params),
+                    "InitialCondition": (outputs_t0, inputs_real_t0)
+                }
+
+        Returns:
+            total_loss: Scalar tensor
+            loss_summary: Dictionary with individual loss values
+        """
+        total_loss = 0.0
+        loss_summary = {}
+
+        # MSE Loss
+        if "MSE" in self.loss_components and "MSE" in loss_args:
+            outputs, targets = loss_args["MSE"]
+            mse_value = self.loss_components["MSE"](outputs, targets)
+            weight = self.loss_config.get("MSE").get("weight", 1.0)
+            weighted_mse = weight * mse_value
+            total_loss += weighted_mse
+            loss_summary["mse_loss"] = weighted_mse.item()
+
+        # Residual Loss
+        if "Residual" in self.loss_components and "Residual" in loss_args:
+            outputs, inputs_real = loss_args["Residual"]
+            # ResidualLoss.forward() handles weighting internally
+            residual_value = self.loss_components["Residual"](
+                outputs, None, None, None, inputs_real
+            )
+            total_loss += residual_value
+            loss_summary["residual_loss"] = residual_value.item()
+
+        # Consistency Loss
+        if "Consistency" in self.loss_components and "Consistency" in loss_args:
+            inputs, inputs_real, norm_params = loss_args["Consistency"]
+            # ConsistencyLoss recomputes outputs internally, so we don't pass them
+            consistency_value = self.loss_components["Consistency"](
+                None, None, inputs, norm_params, inputs_real
+            )
+            total_loss += consistency_value
+            loss_summary["consistency_loss"] = consistency_value.item()
+
+        # Initial Condition Loss
+        if "InitialCondition" in self.loss_components and "InitialCondition" in loss_args:
+            outputs_t0, inputs_real_t0 = loss_args["InitialCondition"]
+            # InitialCondition loss doesn't need normalized inputs
+            initial_value = self.loss_components["InitialCondition"](
+                outputs_t0, None, None, None, inputs_real_t0
+            )
+            total_loss += initial_value
+            loss_summary["initial_loss"] = initial_value.item()
+
+        loss_summary["total"] = total_loss.item()
+
+        return total_loss, loss_summary
+
+    def _print_config(self):
+        """Print loss configuration"""
+        print(f"\n{'='*60}")
+        print("PINN Loss Configuration (Dict-based):")
+        print(f"{'='*60}")
+
+        for loss_name in ["MSE", "Residual", "InitialCondition", "Consistency"]:
+            if loss_name in self.loss_components:
+                weight = self.loss_config.get(loss_name).get("weight", 1.0)
+                print(f"  ✓ {loss_name:20s}: weight={weight:.3f}")
+            else:
+                print(f"  ✗ {loss_name:20s}: disabled")
+
+        print(f"{'='*60}\n")
 
 
