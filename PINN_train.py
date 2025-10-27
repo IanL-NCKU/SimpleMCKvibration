@@ -7,18 +7,18 @@ def main():
 
     device_index = 1
     
-    epochs = 500
+    epochs = 10
     Train_Val_data_source = r'E:\Ian\PINNexample\train_val_vibration_data.npz'
     Test_data_source = r'E:\Ian\PINNexample\test_vibration_data.npz'
     # Load the dataset 
-    train_loader, val_loader, _, normalizer = load_vibration_data(
+    train_loader, val_loader, _, train_val_normalizer = load_vibration_data(
         filepath= Train_Val_data_source,
         batch_size=64,
         normalize=True,
         shuffle_train=True
     )
 
-    test_loader, _, _, normalizer = load_vibration_data(
+    test_loader, _, _, test_normalizer = load_vibration_data(
         filepath= Test_data_source,
         batch_size=64,
         normalize=True,
@@ -38,6 +38,8 @@ def main():
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs//20)
 
     # Training loop
+    # Input data shape: (batch_size, 6) -> [m, zeta, k, t, x0, v0]
+    # Target data shape: (batch_size, 3) -> [x(t), v(t), a(t)]
     for epoch in range(epochs):
         model.train()
         train_loss = 0.0
@@ -48,9 +50,10 @@ def main():
             optimizer.zero_grad()
 
             # Generate t=0 samples for initial condition loss
-            inputs_t0_real = normalizer.denormalize_inputs(inputs).clone()
+            inputs_real = train_val_normalizer.denormalize_inputs(inputs).clone()
+            inputs_t0_real = inputs_real.clone()
             inputs_t0_real[:, 3] = 0.0  # Set real t=0
-            inputs_t0 = torch.FloatTensor(normalizer.normalize_inputs(inputs_t0_real.cpu().numpy())).to(device)
+            inputs_t0 = torch.FloatTensor(train_val_normalizer.normalize_inputs(inputs_t0_real.cpu().numpy())).to(device)
 
             # Stack original and t=0 inputs
             inputs_combined = torch.cat([inputs, inputs_t0], dim=0)
@@ -58,9 +61,10 @@ def main():
 
             # Forward pass
             outputs_combined = model(inputs_combined)
-
+            # print(inputs_combined.size(), outputs_combined.size(), targets_combined.size())
+            # break
             # Denormalize inputs for loss calculation
-            invnorm_inputs_combined = normalizer.denormalize_inputs(inputs_combined)
+            invnorm_inputs_combined = train_val_normalizer.denormalize_inputs(inputs_combined)
 
             loss, loss_dict = loss_fn(outputs_combined, targets_combined, invnorm_inputs_combined)
             loss.backward()
@@ -78,9 +82,9 @@ def main():
                 inputs, targets = inputs.to(device), targets.to(device)
 
                 # Generate t=0 samples for initial condition loss
-                inputs_t0_real = normalizer.denormalize_inputs(inputs).clone()
+                inputs_t0_real = train_val_normalizer.denormalize_inputs(inputs).clone()
                 inputs_t0_real[:, 3] = 0.0  # Set real t=0
-                inputs_t0 = torch.FloatTensor(normalizer.normalize_inputs(inputs_t0_real.cpu().numpy())).to(device)
+                inputs_t0 = torch.FloatTensor(train_val_normalizer.normalize_inputs(inputs_t0_real.cpu().numpy())).to(device)
 
                 # Stack original and t=0 inputs
                 inputs_combined = torch.cat([inputs, inputs_t0], dim=0)
@@ -90,7 +94,7 @@ def main():
                 outputs_combined = model(inputs_combined)
 
                 # Denormalize inputs for loss calculation
-                invnorm_inputs_combined = normalizer.denormalize_inputs(inputs_combined)
+                invnorm_inputs_combined = train_val_normalizer.denormalize_inputs(inputs_combined)
 
                 loss, loss_dict = loss_fn(outputs_combined, targets_combined, invnorm_inputs_combined)
                 val_loss += loss.item() * inputs.size(0)
@@ -111,21 +115,25 @@ def main():
             inputs, targets = inputs.to(device), targets.to(device)
 
             # Generate t=0 samples for initial condition loss
-            inputs_t0_real = normalizer.denormalize_inputs(inputs).clone()
+            inputs_t0_real = test_normalizer.denormalize_inputs(inputs).clone()
             inputs_t0_real[:, 3] = 0.0  # Set real t=0
-            inputs_t0 = torch.FloatTensor(normalizer.normalize_inputs(inputs_t0_real.cpu().numpy())).to(device)
+            inputs_t0 = torch.FloatTensor(test_normalizer.normalize_inputs(inputs_t0_real.cpu().numpy())).to(device)
 
             # Stack original and t=0 inputs
             inputs_combined = torch.cat([inputs, inputs_t0], dim=0)
-            targets_combined = torch.cat([targets, targets], dim=0)
+            # targets_combined = torch.cat([targets, targets], dim=0)
 
             # Forward pass
             outputs_combined = model(inputs_combined)
 
-            # Denormalize inputs for loss calculation
-            invnorm_inputs_combined = normalizer.denormalize_inputs(inputs_combined)
+            # split the outputs_combined to 
+            outputs = outputs_combined[:inputs.size(0)]
+            outputs_t0 = outputs_combined[inputs.size(0):]
 
-            loss, loss_dict = loss_fn(outputs_combined, targets_combined, invnorm_inputs_combined)
+            # Denormalize inputs for loss calculation
+            invnorm_inputs = test_normalizer.denormalize_inputs(inputs)
+
+            loss, loss_dict = loss_fn([outputs, outputs_t0], targets, invnorm_inputs)
             test_loss += loss.item() * inputs.size(0)
     test_loss /= len(test_loader.dataset)
     print(f"Test Loss: {test_loss:.6f}")
