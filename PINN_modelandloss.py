@@ -6,13 +6,13 @@ from abc import ABC, abstractmethod
 class VibrationPINN(nn.Module):
     """Physics-Informed Neural Network for vibration prediction"""
 
-    def __init__(self, hidden_dims=[64, 128, 128, 64], activation='ELU', use_log_output=False,
+    def __init__(self, hidden_dims=[64, 128, 128, 64], activation='tanh', use_log_output=False,
                  use_finetune=False, finetune_hidden_dims=[32, 32], finetune_scale=0.1):
         super().__init__()
 
         self.use_log_output = use_log_output
         self.use_finetune = use_finetune
-        self.finetune_scale = finetune_scale  # Controls max correction (e.g., 0.1 = ±10%)
+        self.finetune_scale = finetune_scale
 
         # Choose activation function
         if activation == 'tanh':
@@ -33,12 +33,10 @@ class VibrationPINN(nn.Module):
             layers.append(act())
             input_dim = hidden_dim
 
-        # Final layer output dimension depends on whether we use log representation
+        # Final layer output dimension
         if use_log_output:
-            # Output 6 values: [sign_x, log_x, sign_v, log_v, sign_a, log_a]
             layers.append(nn.Linear(input_dim, 6))
         else:
-            # Output 3 values: [x, v, a] directly
             layers.append(nn.Linear(input_dim, 3))
 
         self.network = nn.Sequential(*layers)
@@ -46,7 +44,6 @@ class VibrationPINN(nn.Module):
         # Build fine-tune network (if enabled)
         if self.use_finetune:
             finetune_layers = []
-            # Input: original 6 inputs + 3 base predictions = 9 features
             finetune_input_dim = 9  # [m, zeta, k, t, x0, v0, x_base, v_base, a_base]
 
             for hidden_dim in finetune_hidden_dims:
@@ -54,9 +51,8 @@ class VibrationPINN(nn.Module):
                 finetune_layers.append(act())
                 finetune_input_dim = hidden_dim
 
-            # Output 3 fine-tune corrections: [finetune_x, finetune_v, finetune_a]
             finetune_layers.append(nn.Linear(finetune_input_dim, 3))
-            finetune_layers.append(nn.Tanh())  # Bounded output in [-1, 1]
+            finetune_layers.append(nn.Tanh())
 
             self.finetune_network = nn.Sequential(*finetune_layers)
         else:
@@ -82,48 +78,68 @@ class VibrationPINN(nn.Module):
         """
         output = self.network(x)
 
+        # Step 1: Convert network output to real space (base predictions)
         if self.use_log_output:
             # Network outputs: [sign_x, log_x, sign_v, log_v, sign_a, log_a]
-            # Transform to real space: sign * 10^log_magnitude
 
-            # Extract sign and log magnitude for each output
-            sign_x = torch.tanh(output[:, 0:1])  # Soft sign in [-1, 1]
+            # Extract sign and log magnitude
+            sign_x = torch.tanh(output[:, 0:1])
             log_x = output[:, 1:2]
             sign_v = torch.tanh(output[:, 2:3])
             log_v = output[:, 3:4]
             sign_a = torch.tanh(output[:, 4:5])
             log_a = output[:, 5:6]
 
-            # Transform to real space: sign * 10^log_magnitude
-            x_pred_base = sign_x * (10 ** log_x)
-            v_pred_base = sign_v * (10 ** log_v)
-            a_pred_base = sign_a * (10 ** log_a)
-
-            # Apply fine-tuning if enabled
-            if self.use_finetune:
-                # Concatenate inputs with base predictions
-                base_preds = torch.cat([x_pred_base, v_pred_base, a_pred_base], dim=1)
-                finetune_input = torch.cat([x, base_preds], dim=1)  # [batch_size, 9]
-
-                # Get fine-tune corrections (in [-1, 1] due to tanh)
-                finetune_raw = self.finetune_network(finetune_input)  # [batch_size, 3]
-
-                # Scale corrections (e.g., 0.1 means ±10% max correction)
-                finetune_corrections = self.finetune_scale * finetune_raw
-
-                # Apply multiplicative correction: x_pred = x_base * (1 + finetune)
-                x_pred = x_pred_base * (1 + finetune_corrections[:, 0:1])
-                v_pred = v_pred_base * (1 + finetune_corrections[:, 1:2])
-                a_pred = a_pred_base * (1 + finetune_corrections[:, 2:3])
-            else:
-                x_pred = x_pred_base
-                v_pred = v_pred_base
-                a_pred = a_pred_base
-
-            return torch.cat([x_pred, v_pred, a_pred], dim=1)
+            # FIXED: Use np.log(10.0) to avoid device mismatch issues
+            # Transform to real space: x = sign * 10^log = sign * exp(log * ln(10))
+            ln10 = np.log(10.0)  # Python float, PyTorch handles device automatically
+            x_pred_base = sign_x * torch.exp(log_x * ln10)
+            v_pred_base = sign_v * torch.exp(log_v * ln10)
+            a_pred_base = sign_a * torch.exp(log_a * ln10)
         else:
-            # Direct output in real space (no fine-tuning for non-log output)
-            return output  # [batch_size, 3]
+            # Network outputs directly in real space: [x, v, a]
+            x_pred_base = output[:, 0:1]
+            v_pred_base = output[:, 1:2]
+            a_pred_base = output[:, 2:3]
+
+        # Step 2: Apply fine-tuning (independent of log_output setting)
+        if self.use_finetune:
+            # Ensure concatenation doesn't break gradient flow
+            base_preds = torch.cat([x_pred_base, v_pred_base, a_pred_base], dim=1)
+            finetune_input = torch.cat([x, base_preds], dim=1)
+
+            finetune_raw = self.finetune_network(finetune_input)
+            finetune_corrections = self.finetune_scale * finetune_raw
+
+            # Apply multiplicative correction
+            x_pred = x_pred_base * (1 + finetune_corrections[:, 0:1])
+            v_pred = v_pred_base * (1 + finetune_corrections[:, 1:2])
+            a_pred = a_pred_base * (1 + finetune_corrections[:, 2:3])
+        else:
+            x_pred = x_pred_base
+            v_pred = v_pred_base
+            a_pred = a_pred_base
+
+        return torch.cat([x_pred, v_pred, a_pred], dim=1)
+
+    @staticmethod
+    def convert_targets_to_log_space(targets, eps=1e-10):
+        """
+        Convert real-space targets [x, v, a] to log-space
+        """
+        signs = torch.sign(targets)
+        signs = torch.where(signs == 0, torch.ones_like(signs), signs)
+
+        magnitudes = torch.abs(targets) + eps
+        log_magnitudes = torch.log10(magnitudes)
+
+        log_targets = torch.stack([
+            signs[:, 0], log_magnitudes[:, 0],
+            signs[:, 1], log_magnitudes[:, 1],
+            signs[:, 2], log_magnitudes[:, 2],
+        ], dim=1)
+
+        return log_targets
 
     @staticmethod
     def convert_targets_to_log_space(targets, eps=1e-10):
@@ -166,26 +182,11 @@ class BaseLossComponent(ABC, nn.Module):
     
     @abstractmethod
     def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None):
-        """
-        Compute the loss component
-
-        Args:
-            predictions: (batch_size, 3) - [x, v, a] predictions
-            targets: (batch_size, 3) - [x, v, a] targets
-            inputs: (batch_size, 6) - [m, zeta, k, t, x0, v0] normalized
-            norm_params: Dictionary with normalization parameters
-            inputs_real: (batch_size, 6) - [m, zeta, k, t, x0, v0] in real space (optional)
-
-        Returns:
-            loss: Scalar tensor
-        """
         pass
 
     def forward(self, predictions, targets, inputs, norm_params=None, inputs_real=None):
-        """Wrapper that applies weight and checks if enabled"""
         if not self.enabled:
             return torch.tensor(0.0, device=predictions.device)
-
         loss = self.compute(predictions, targets, inputs, norm_params, inputs_real)
         return self.weight * loss
     
@@ -193,6 +194,39 @@ class BaseLossComponent(ABC, nn.Module):
         status = "✓" if self.enabled else "✗"
         return f"{self.name:20s}: weight={self.weight:.3f} {status}"
 
+
+
+class MSELoss(BaseLossComponent):
+    """Mean Squared Error loss between predictions and targets"""
+
+    def __init__(self, weight=1.0, use_relative=False):
+        super().__init__(weight=weight, name="MSE Loss")
+        self.use_relative = use_relative
+
+    def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None):
+        """
+        Compute MSE between predictions and targets
+
+        Args:
+            predictions: (batch_size, 3) - [x, v, a] predictions in real space
+            targets: (batch_size, 3) - [x, v, a] targets in real space
+            inputs: Not used
+            norm_params: Not used
+            inputs_real: Not used
+
+        Returns:
+            loss: Scalar tensor
+        """
+        eps = 1e-10
+
+        if self.use_relative:
+            # Relative MSE: normalized by target magnitude
+            loss = torch.mean(((predictions - targets) ** 2) / (torch.square(targets) + eps))
+        else:
+            # Absolute MSE
+            loss = torch.mean((predictions - targets) ** 2)
+
+        return loss
 
 
 class ResidualLoss(BaseLossComponent):
@@ -233,7 +267,7 @@ class ResidualLoss(BaseLossComponent):
 
         if self.use_relative:
             # Scale-invariant relative residual
-            scale = torch.abs(m * a_pred) + 1e-8
+            scale = torch.abs(m) + 1e-10
             residual = residual / scale
 
         return torch.mean(residual ** 2)
@@ -246,9 +280,10 @@ class InitialConditionLoss(BaseLossComponent):
     Detects which samples have t=0 and enforces initial conditions.
     """
 
-    def __init__(self, weight=1.0, t_threshold=1e-6):
+    def __init__(self, weight=1.0, t_threshold=1e-6, use_relative=False):
         super().__init__(weight=weight, name="Initial Cond Loss")
         self.t_threshold = t_threshold
+        self.use_relative = use_relative
 
     def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None):
         """
@@ -278,117 +313,135 @@ class InitialConditionLoss(BaseLossComponent):
         x0 = inputs_real[:, 4]  # Real x0
         v0 = inputs_real[:, 5]  # Real v0
 
-        # MSE between predicted at t=0 and initial conditions
-        loss_x0 = torch.mean((x_pred_t0 - x0) ** 2)
-        loss_v0 = torch.mean((v_pred_t0 - v0) ** 2)
+        # Add a small epsilon to avoid division by zero, especially if x0 or v0 are zero
+        eps = 1e-10
+
+        if self.use_relative:
+            # Normalized MSE for initial displacement
+            loss_x0 = torch.mean(((x_pred_t0 - x0) ** 2) / (torch.square(x0) + eps))
+
+            # Normalized MSE for initial velocity
+            loss_v0 = torch.mean(((v_pred_t0 - v0) ** 2) / (torch.square(v0) + eps))
+        else:
+            # Absolute MSE for initial displacement
+            loss_x0 = torch.mean((x_pred_t0 - x0) ** 2)
+
+            # Absolute MSE for initial velocity
+            loss_v0 = torch.mean((v_pred_t0 - v0) ** 2)
 
         return loss_x0 + loss_v0
 
 
 class ConsistencyLoss_auto_diff(BaseLossComponent):
-    """Derivative consistency: ensure v=dx/dt, a=dv/dt using automatic differentiation
-
+    """
+    Derivative consistency: ensure v=dx/dt, a=dv/dt using automatic differentiation
+    
+    FIXED VERSION: Improved automatic differentiation stability + preserved chain rule correction
+    
     Handles log-normalized time transformation:
     t_model = (log10(t_real) - mean) / std
-
+    
     Chain rule for derivatives:
     dx/dt_real = dx/dt_model * dt_model/dt_real
     where dt_model/dt_real = 1 / (std * t_real * ln(10))
     """
-
+    
     def __init__(self, weight=1.0, model=None, t_threshold=1e-6):
-        super().__init__(weight=weight, name="Consistency Loss AD")
+        super().__init__(weight=weight, name="Consistency Loss (auto)")
         self.model = model
-        self.t_threshold = t_threshold  # Filter out t≈0 samples
-
+        self.t_threshold = t_threshold
+    
     def set_model(self, model):
         """Set the model reference for gradient computation"""
         self.model = model
-
+    
     def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None):
         """
         Enforces consistency between displacement, velocity, and acceleration
         using automatic differentiation with log-normalized time.
-
+        
         This loss computes:
         - dx/dt_model using autograd (gradient w.r.t. normalized time)
         - dv/dt_model using autograd (gradient w.r.t. normalized time)
-
+        
         Then transforms to real domain using chain rule:
         - dx/dt_real = dx/dt_model / (std * t_real * ln(10))
         - dv/dt_real = dv/dt_model / (std * t_real * ln(10))
-
+        
         Finally enforces:
         - v_pred ≈ dx/dt_real
         - a_pred ≈ dv/dt_real
-
+        
         Args:
             predictions: Not used (we recompute with gradient tracking)
             targets: Not used
             inputs: (batch_size, 6) - [m, zeta, k, t, x0, v0] NORMALIZED
-            norm_params: Dictionary with 'normalizer' key containing Vibration_DataNormalizer instance
+            norm_params: Dictionary with 'normalizer' key containing normalizer instance
             inputs_real: (batch_size, 6) - [m, zeta, k, t, x0, v0] in REAL space
-                        Used to get t_real for chain rule
-
+        
         Returns:
             loss: Scalar tensor measuring consistency error
         """
         if self.model is None:
             raise ValueError("Model not set. Call set_model() before using ConsistencyLoss_auto_diff")
-
+        
         if inputs_real is None:
             raise ValueError("ConsistencyLoss_auto_diff requires inputs_real to be provided")
-
+        
         if norm_params is None or 'normalizer' not in norm_params:
             raise ValueError("norm_params with 'normalizer' must be provided for ConsistencyLoss_auto_diff")
-
+        
         # Get t_real from inputs_real
         t_real = inputs_real[:, 3]
-
+        
         # Filter out samples where t_real ≈ 0 (to avoid division by zero)
         valid_mask = t_real > self.t_threshold
-
+        
         if valid_mask.sum() == 0:
             # No valid samples (all t≈0)
-            return torch.tensor(0.0, device=predictions.device)
-
+            return torch.tensor(0.0, device=inputs.device)
+        
         # Filter to valid samples only
         inputs_valid = inputs[valid_mask]
         t_real_valid = t_real[valid_mask]
-
+        
         # Get the time std from normalizer
         normalizer = norm_params['normalizer']
         t_std = normalizer.log_std['t']  # std of log10(t) values
-
-        # Enable gradient computation for normalized inputs
-        inputs_with_grad = inputs_valid.clone().detach().requires_grad_(True)
-
+        
+        # Fix 1: Don't use .detach() to preserve gradient linkage
+        inputs_with_grad = inputs_valid.clone().requires_grad_(True)
+        
         # Forward pass with gradient tracking
         predictions_with_grad = self.model(inputs_with_grad)
-
+        
         # Extract predictions (these are in REAL space)
         x_pred = predictions_with_grad[:, 0]
         v_pred = predictions_with_grad[:, 1]
         a_pred = predictions_with_grad[:, 2]
-
+        
+        # Fix 2: Use create_graph=True to preserve higher-order gradients
         # Compute dx/dt_model using autograd (gradient w.r.t. t_normalized at index 3)
         dx_dt_model = torch.autograd.grad(
             outputs=x_pred,
             inputs=inputs_with_grad,
             grad_outputs=torch.ones_like(x_pred),
             create_graph=True,
-            retain_graph=True
+            retain_graph=True,
+            allow_unused=True  # Fix 3: Allow unused inputs
         )[0][:, 3]  # Take only the gradient w.r.t. t_normalized (index 3)
-
+        
         # Compute dv/dt_model using autograd
         dv_dt_model = torch.autograd.grad(
             outputs=v_pred,
             inputs=inputs_with_grad,
             grad_outputs=torch.ones_like(v_pred),
             create_graph=True,
-            retain_graph=True
+            retain_graph=True,
+            allow_unused=True
         )[0][:, 3]  # Take only the gradient w.r.t. t_normalized (index 3)
-
+        
+        # IMPORTANT: Preserve the original chain rule correction!
         # Apply chain rule to transform from model domain to real domain
         # Chain rule: dx/dt_real = dx/dt_model * dt_model/dt_real
         #
@@ -398,24 +451,24 @@ class ConsistencyLoss_auto_diff(BaseLossComponent):
         #                  = (1/std) * (1 / (t_real * ln(10)))
         #
         # Therefore: dx/dt_real = dx/dt_model / (std * t_real * ln(10))
-
+        
         ln10 = torch.tensor(np.log(10), device=inputs.device, dtype=inputs.dtype)
         chain_rule_factor = 1.0 / (t_std * t_real_valid * ln10)
-
+        
         # Transform gradients to real domain
         dx_dt_real = dx_dt_model * chain_rule_factor
         dv_dt_real = dv_dt_model * chain_rule_factor
-
+        
         # Compute consistency losses
         # v_pred should equal dx/dt_real
         loss_v_consistency = torch.mean((v_pred - dx_dt_real) ** 2)
-
+        
         # a_pred should equal dv/dt_real
         loss_a_consistency = torch.mean((a_pred - dv_dt_real) ** 2)
-
+        
         # Total consistency loss
         total_loss = loss_v_consistency + loss_a_consistency
-
+        
         return total_loss
     
 
@@ -670,7 +723,10 @@ class PINNLoss_v2(nn.Module):
 
         # Initialize MSE loss if requested
         if self._should_enable("MSE"):
-            self.loss_components["MSE"] = nn.MSELoss()
+            config = self.loss_config.get("MSE")
+            use_relative = config.get("use_relative", False)
+            weight = config.get("weight", 1.0)
+            self.loss_components["MSE"] = MSELoss(weight=weight, use_relative=use_relative)
 
         # Initialize Residual loss if requested
         if self._should_enable("Residual"):
@@ -684,7 +740,8 @@ class PINNLoss_v2(nn.Module):
             config = self.loss_config.get("InitialCondition")
             t_threshold = config.get("t_threshold", 1e-6)
             weight = config.get("weight", 1.0)
-            self.loss_components["InitialCondition"] = InitialConditionLoss(weight=weight, t_threshold=t_threshold)
+            use_relative = config.get("use_relative", False)
+            self.loss_components["InitialCondition"] = InitialConditionLoss(weight=weight, t_threshold=t_threshold, use_relative=use_relative)
 
         # Initialize Consistency loss if requested
         if self._should_enable("Consistency"):
@@ -734,11 +791,12 @@ class PINNLoss_v2(nn.Module):
         # MSE Loss
         if "MSE" in self.loss_components and "MSE" in loss_args:
             outputs, targets = loss_args["MSE"]
-            mse_value = self.loss_components["MSE"](outputs, targets)
-            weight = self.loss_config.get("MSE").get("weight", 1.0)
-            weighted_mse = weight * mse_value
-            total_loss += weighted_mse
-            loss_summary["mse_loss"] = weighted_mse.item()
+            # MSELoss.forward() handles weighting internally
+            mse_value = self.loss_components["MSE"](
+                outputs, targets, None, None, None
+            )
+            total_loss += mse_value
+            loss_summary["mse_loss"] = mse_value.item()
 
         # Residual Loss
         if "Residual" in self.loss_components and "Residual" in loss_args:
@@ -788,5 +846,3 @@ class PINNLoss_v2(nn.Module):
                 print(f"  ✗ {loss_name:20s}: disabled")
 
         print(f"{'='*60}\n")
-
-
