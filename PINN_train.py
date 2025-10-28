@@ -14,14 +14,14 @@ def main():
     # Load the dataset 
     train_loader, val_loader, _, train_val_normalizer = load_vibration_data(
         filepath= Train_Val_data_source,
-        batch_size=512,
+        batch_size=256,
         normalize=True,
         shuffle_train=True
     )
 
     test_loader, _, _, test_normalizer = load_vibration_data(
         filepath= Test_data_source,
-        batch_size=512,
+        batch_size=256,
         normalize=True,
         shuffle_train=False
     )
@@ -44,13 +44,13 @@ def main():
     loss_config = {
         "MSE": {"weight": 0.1, "use_relative": True},
         "Residual": {"weight": 0.2, "use_relative": True},
-        "InitialCondition": {"weight": 0.7, "t_threshold": 1e-8, "use_relative": True},
-        "Consistency": {"weight": 0, "t_threshold": 1e-8}
+        "InitialCondition": {"weight": 0.3, "t_threshold": 1e-8, "use_relative": True},
+        "Consistency": {"weight": 0.4, "t_threshold": 1e-5, "type": "finite", "use_relative": True, "use_log": True}
     }
 
     loss_fn = PINNLoss_v2(model, loss_config)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=np.max([epochs//20,1]))
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=np.max([epochs//10,1]), eta_min=1e-9)
 
     # Prepare norm_params for consistency loss
     norm_params = {'normalizer': train_val_normalizer}
@@ -73,27 +73,60 @@ def main():
 
             optimizer.zero_grad()
 
-            # Generate t=0 samples for initial condition loss
+            # Denormalize inputs for loss calculation
             inputs_real = train_val_normalizer.denormalize_inputs(inputs).clone()
-            inputs_t0_real = inputs_real.clone()
-            inputs_t0_real[:, 3] = 0.0  # Set real t=0
-            inputs_t0 = torch.FloatTensor(train_val_normalizer.normalize_inputs(inputs_t0_real.cpu().numpy())).to(device)
 
-            # Stack original and t=0 inputs
-            inputs_combined = torch.cat([inputs, inputs_t0], dim=0)
+            # Build inputs_combined based on which losses are enabled
+            inputs_list = [inputs]
+            N = inputs.size(0)
+
+            # Generate t=0 samples if InitialCondition loss is enabled
+            if loss_fn.has_loss("InitialCondition"):
+                inputs_t0_real = inputs_real.clone()
+                inputs_t0_real[:, 3] = 0.0  # Set real t=0
+                inputs_t0 = torch.FloatTensor(train_val_normalizer.normalize_inputs(inputs_t0_real.cpu().numpy())).to(device)
+                inputs_list.append(inputs_t0)
+
+            # Generate perturbed time samples if Consistency loss with finite type is enabled
+            if loss_fn.has_loss("Consistency") and loss_config["Consistency"]["type"] == "finite":
+                t_threshold = loss_config["Consistency"]["t_threshold"]
+
+                inputs_t_minus_minus_real = inputs_real.clone()
+                inputs_t_minus_minus_real[:, 3] = inputs_real[:, 3] - 2 * t_threshold
+                inputs_t_minus_minus = torch.FloatTensor(train_val_normalizer.normalize_inputs(inputs_t_minus_minus_real.cpu().numpy())).to(device)
+
+                inputs_t_minus_real = inputs_real.clone()
+                inputs_t_minus_real[:, 3] = inputs_real[:, 3] - t_threshold
+                inputs_t_minus = torch.FloatTensor(train_val_normalizer.normalize_inputs(inputs_t_minus_real.cpu().numpy())).to(device)
+
+                inputs_t_plus_real = inputs_real.clone()
+                inputs_t_plus_real[:, 3] = inputs_real[:, 3] + t_threshold
+                inputs_t_plus = torch.FloatTensor(train_val_normalizer.normalize_inputs(inputs_t_plus_real.cpu().numpy())).to(device)
+
+                inputs_t_plus_plus_real = inputs_real.clone()
+                inputs_t_plus_plus_real[:, 3] = inputs_real[:, 3] + 2 * t_threshold
+                inputs_t_plus_plus = torch.FloatTensor(train_val_normalizer.normalize_inputs(inputs_t_plus_plus_real.cpu().numpy())).to(device)
+
+                inputs_list.extend([inputs_t_minus_minus, inputs_t_minus, inputs_t_plus, inputs_t_plus_plus])
+
+            # Stack all inputs
+            inputs_combined = torch.cat(inputs_list, dim=0)
 
             # Forward pass
             outputs_combined = model(inputs_combined)
-            # print(inputs_combined.size(), outputs_combined.size(), targets.size())
-            # break
 
-            # Split outputs into regular and t=0 samples
-            outputs = outputs_combined[:inputs.size(0)]
-            outputs_t0 = outputs_combined[inputs.size(0):]
+            # Split outputs based on what was stacked
+            outputs = outputs_combined[:N]
+            idx = N
 
-            # Denormalize inputs for loss calculation
-            inputs_real = train_val_normalizer.denormalize_inputs(inputs)
-            inputs_real_t0 = train_val_normalizer.denormalize_inputs(inputs_t0)
+            if loss_fn.has_loss("InitialCondition"):
+                outputs_t0 = outputs_combined[idx:idx+N]
+                inputs_real_t0 = train_val_normalizer.denormalize_inputs(inputs_t0)
+                idx += N
+
+            if loss_fn.has_loss("Consistency") and loss_config["Consistency"]["type"] == "finite":
+                outputs_dt = outputs_combined[idx:idx+4*N]  # 4N samples: [t-2Δt, t-Δt, t+Δt, t+2Δt]
+                idx += 4*N
 
             # Prepare loss arguments
             loss_args = {}
@@ -102,7 +135,14 @@ def main():
             if loss_fn.has_loss("Residual"):
                 loss_args["Residual"] = (outputs, inputs_real)
             if loss_fn.has_loss("Consistency"):
-                loss_args["Consistency"] = (inputs, inputs_real, norm_params)
+                # Check consistency type
+                consistency_type = loss_config["Consistency"]["type"]
+                if consistency_type == "finite":
+                    loss_args["Consistency"] = (outputs, outputs_dt, targets)
+                elif consistency_type == "auto":
+                    loss_args["Consistency"] = (inputs, inputs_real, norm_params)
+                else:
+                    raise ValueError(f"Unknown consistency type: {consistency_type}. Use 'auto' or 'finite'.")
             if loss_fn.has_loss("InitialCondition"):
                 loss_args["InitialCondition"] = (outputs_t0, inputs_real_t0)
 
@@ -144,24 +184,60 @@ def main():
                 # Move data to device
                 inputs, targets = inputs.to(device), targets.to(device)
 
-                # Generate t=0 samples for initial condition loss
-                inputs_t0_real = train_val_normalizer.denormalize_inputs(inputs).clone()
-                inputs_t0_real[:, 3] = 0.0  # Set real t=0
-                inputs_t0 = torch.FloatTensor(train_val_normalizer.normalize_inputs(inputs_t0_real.cpu().numpy())).to(device)
+                # Denormalize inputs for loss calculation
+                inputs_real = train_val_normalizer.denormalize_inputs(inputs).clone()
 
-                # Stack original and t=0 inputs
-                inputs_combined = torch.cat([inputs, inputs_t0], dim=0)
+                # Build inputs_combined based on which losses are enabled
+                inputs_list = [inputs]
+                N = inputs.size(0)
+
+                # Generate t=0 samples if InitialCondition loss is enabled
+                if loss_fn.has_loss("InitialCondition"):
+                    inputs_t0_real = inputs_real.clone()
+                    inputs_t0_real[:, 3] = 0.0  # Set real t=0
+                    inputs_t0 = torch.FloatTensor(train_val_normalizer.normalize_inputs(inputs_t0_real.cpu().numpy())).to(device)
+                    inputs_list.append(inputs_t0)
+
+                # Generate perturbed time samples if Consistency loss with finite type is enabled
+                if loss_fn.has_loss("Consistency") and loss_config["Consistency"]["type"] == "finite":
+                    t_threshold = loss_config["Consistency"]["t_threshold"]
+
+                    inputs_t_minus_minus_real = inputs_real.clone()
+                    inputs_t_minus_minus_real[:, 3] = inputs_real[:, 3] - 2 * t_threshold
+                    inputs_t_minus_minus = torch.FloatTensor(train_val_normalizer.normalize_inputs(inputs_t_minus_minus_real.cpu().numpy())).to(device)
+
+                    inputs_t_minus_real = inputs_real.clone()
+                    inputs_t_minus_real[:, 3] = inputs_real[:, 3] - t_threshold
+                    inputs_t_minus = torch.FloatTensor(train_val_normalizer.normalize_inputs(inputs_t_minus_real.cpu().numpy())).to(device)
+
+                    inputs_t_plus_real = inputs_real.clone()
+                    inputs_t_plus_real[:, 3] = inputs_real[:, 3] + t_threshold
+                    inputs_t_plus = torch.FloatTensor(train_val_normalizer.normalize_inputs(inputs_t_plus_real.cpu().numpy())).to(device)
+
+                    inputs_t_plus_plus_real = inputs_real.clone()
+                    inputs_t_plus_plus_real[:, 3] = inputs_real[:, 3] + 2 * t_threshold
+                    inputs_t_plus_plus = torch.FloatTensor(train_val_normalizer.normalize_inputs(inputs_t_plus_plus_real.cpu().numpy())).to(device)
+
+                    inputs_list.extend([inputs_t_minus_minus, inputs_t_minus, inputs_t_plus, inputs_t_plus_plus])
+
+                # Stack all inputs
+                inputs_combined = torch.cat(inputs_list, dim=0)
 
                 # Forward pass
                 outputs_combined = model(inputs_combined)
 
-                # Split outputs into regular and t=0 samples
-                outputs = outputs_combined[:inputs.size(0)]
-                outputs_t0 = outputs_combined[inputs.size(0):]
+                # Split outputs based on what was stacked
+                outputs = outputs_combined[:N]
+                idx = N
 
-                # Denormalize inputs for loss calculation
-                inputs_real = train_val_normalizer.denormalize_inputs(inputs)
-                inputs_real_t0 = train_val_normalizer.denormalize_inputs(inputs_t0)
+                if loss_fn.has_loss("InitialCondition"):
+                    outputs_t0 = outputs_combined[idx:idx+N]
+                    inputs_real_t0 = train_val_normalizer.denormalize_inputs(inputs_t0)
+                    idx += N
+
+                if loss_fn.has_loss("Consistency") and loss_config["Consistency"]["type"] == "finite":
+                    outputs_dt = outputs_combined[idx:idx+4*N]  # 4N samples: [t-2Δt, t-Δt, t+Δt, t+2Δt]
+                    idx += 4*N
 
                 # Prepare loss arguments
                 loss_args = {}
@@ -170,7 +246,14 @@ def main():
                 if loss_fn.has_loss("Residual"):
                     loss_args["Residual"] = (outputs, inputs_real)
                 if loss_fn.has_loss("Consistency"):
-                    loss_args["Consistency"] = (inputs, inputs_real, norm_params)
+                    # Check consistency type
+                    consistency_type = loss_config["Consistency"]["type"]
+                    if consistency_type == "finite":
+                        loss_args["Consistency"] = (outputs, outputs_dt, targets)
+                    elif consistency_type == "auto":
+                        loss_args["Consistency"] = (inputs, inputs_real, norm_params)
+                    else:
+                        raise ValueError(f"Unknown consistency type: {consistency_type}. Use 'auto' or 'finite'.")
                 if loss_fn.has_loss("InitialCondition"):
                     loss_args["InitialCondition"] = (outputs_t0, inputs_real_t0)
 

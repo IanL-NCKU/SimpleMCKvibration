@@ -234,10 +234,10 @@ def load_vibration_data(filepath='vibration_data_normalized.npz', batch_size=32,
 
     # Split into train (70%), val (15%), test (15%)
     X_train, X_temp, y_train, y_temp = train_test_split(
-        input_data, output_data, test_size=0.2, random_state=42)
+        input_data, output_data, test_size=0.2, shuffle=True)#, random_state=42)
 
     X_val, X_test, y_val, y_test = train_test_split(
-        X_temp, y_temp, test_size=0.8, random_state=42)
+        X_temp, y_temp, test_size=0.2, shuffle=True)#, random_state=42)
 
     # Normalize inputs if requested
     normalizer = None

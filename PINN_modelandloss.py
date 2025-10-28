@@ -346,10 +346,11 @@ class ConsistencyLoss_auto_diff(BaseLossComponent):
     where dt_model/dt_real = 1 / (std * t_real * ln(10))
     """
     
-    def __init__(self, weight=1.0, model=None, t_threshold=1e-6):
+    def __init__(self, weight=1.0, model=None, t_threshold=1e-6, use_log=True):
         super().__init__(weight=weight, name="Consistency Loss (auto)")
         self.model = model
         self.t_threshold = t_threshold
+        self.use_log = use_log
     
     def set_model(self, model):
         """Set the model reference for gradient computation"""
@@ -462,64 +463,145 @@ class ConsistencyLoss_auto_diff(BaseLossComponent):
         # Compute consistency losses
         # v_pred should equal dx/dt_real
         loss_v_consistency = torch.mean((v_pred - dx_dt_real) ** 2)
-        
+
         # a_pred should equal dv/dt_real
         loss_a_consistency = torch.mean((a_pred - dv_dt_real) ** 2)
-        
+
         # Total consistency loss
         total_loss = loss_v_consistency + loss_a_consistency
-        
+
+        # Apply log transformation if enabled
+        if self.use_log:
+            eps = 1e-10
+            total_loss = torch.log(total_loss + eps)
+
         return total_loss
     
 
 
 
 class ConsistencyLoss_finite_diff(BaseLossComponent):
-    """Derivative consistency: ensure v=dx/dt, a=dv/dt"""
-    
-    def __init__(self, weight=1.0, method='finite_diff'):
-        super().__init__(weight=weight, name="Consistency Loss")
-        self.method = method  # 'finite_diff' or 'autodiff'
-    
-    def compute(self, predictions, targets, inputs, norm_params=None):
+    """
+    Derivative consistency using finite differences
+
+    Computes 6 loss components:
+    1. v from x (finite diff) vs v_pred
+    2. a from v (finite diff) vs a_pred
+    3. a from x (finite diff, 2nd derivative) vs a_pred
+    4. v from x (finite diff) vs v_target
+    5. a from v (finite diff) vs a_target
+    6. a from x (finite diff, 2nd derivative) vs a_target
+    """
+
+    def __init__(self, weight=1.0, use_relative=False, t_threshold=1e-6,
+                 use_log=True,
+                 weight_v_x_pred=1.0,
+                 weight_a_v_pred=1.0,
+                 weight_a_x_pred=1.0,
+                 weight_v_x_target=1.0,
+                 weight_a_v_target=1.0,
+                 weight_a_x_target=1.0):
+        super().__init__(weight=weight, name="Consistency Loss (finite)")
+        self.use_relative = use_relative
+        self.t_threshold = t_threshold
+        self.use_log = use_log
+
+        # Individual component weights
+        self.weight_v_x_pred = weight_v_x_pred
+        self.weight_a_v_pred = weight_a_v_pred
+        self.weight_a_x_pred = weight_a_x_pred
+        self.weight_v_x_target = weight_v_x_target
+        self.weight_a_v_target = weight_a_v_target
+        self.weight_a_x_target = weight_a_x_target
+
+    def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None):
         """
-        Ensure derivative consistency
-        
-        Methods:
-        - 'finite_diff': Use finite differences (requires sorted time samples)
-        - 'autodiff': Use automatic differentiation (requires special setup)
-        
-        Note: Finite difference requires multiple samples from same trajectory
-        which is difficult in standard mini-batch training.
-        This is a simplified placeholder.
+        Compute finite difference consistency loss
+
+        Args:
+            predictions: (batch_size, 3) - [x, v, a] at time t
+            targets: (batch_size, 3) - [x, v, a] ground truth at time t
+            inputs: Not used
+            norm_params: Not used
+            inputs_real: (4*batch_size, 3) - predictions at perturbed times
+                        [t-2Δt, t-Δt, t+Δt, t+2Δt] stacked
+
+        Returns:
+            total_loss: Scalar tensor representing the natural log of the total loss.
         """
-        if self.method == 'finite_diff':
-            return self._finite_difference_consistency(predictions, inputs)
-        elif self.method == 'autodiff':
-            return self._autodiff_consistency(predictions, inputs, norm_params)
-        else:
-            raise ValueError(f"Unknown method: {self.method}")
-    
-    def _finite_difference_consistency(self, predictions, inputs):
-        """
-        Finite difference approximation (simplified)
-        
-        In practice, this requires trajectory-aware batching
-        where consecutive samples in batch are from same system at Δt apart
-        """
-        # This is a placeholder - proper implementation requires special batching
-        # For now, return zero (disabled)
-        return torch.tensor(0.0, device=predictions.device)
-    
-    def _autodiff_consistency(self, predictions, inputs, norm_params):
-        """
-        Automatic differentiation consistency
-        
-        Requires model to predict only x(t), then v and a are computed via autodiff
-        This requires different model architecture
-        """
-        # This is a placeholder - requires special model architecture
-        return torch.tensor(0.0, device=predictions.device)
+        if inputs_real is None:
+            raise ValueError("ConsistencyLoss_finite_diff requires inputs_real (outputs_dt) to be provided")
+
+        N = predictions.shape[0]
+        eps = 1e-10
+
+        # Extract predictions at different time points
+        # inputs_real is actually outputs_dt with shape (4N, 3)
+        outputs_dt = inputs_real
+
+        x_t = predictions[:, 0:1]
+        v_t = predictions[:, 1:2]
+        a_t = predictions[:, 2:3]
+
+        x_t_minus_minus = outputs_dt[0:N, 0:1]      # t - 2Δt
+        x_t_minus = outputs_dt[N:2*N, 0:1]          # t - Δt
+        x_t_plus = outputs_dt[2*N:3*N, 0:1]         # t + Δt
+        x_t_plus_plus = outputs_dt[3*N:4*N, 0:1]    # t + 2Δt
+
+        v_t_minus = outputs_dt[N:2*N, 1:2]          # t - Δt
+        v_t_plus = outputs_dt[2*N:3*N, 1:2]         # t + Δt
+
+        # Extract targets
+        x_target = targets[:, 0:1]
+        v_target = targets[:, 1:2]
+        a_target = targets[:, 2:3]
+
+        t_delta = self.t_threshold
+
+        # Compute finite difference derivatives
+        # Component 1 & 4: v from x using central difference
+        v_fd_from_x = (x_t_plus - x_t_minus) / (2 * t_delta)
+
+        # Component 2 & 5: a from v using central difference
+        a_fd_from_v = (v_t_plus - v_t_minus) / (2 * t_delta)
+
+        # Component 3 & 6: a from x using second derivative
+        v_t_plus_temp = (x_t_plus_plus - x_t) / (2 * t_delta)
+        v_t_minus_temp = (x_t - x_t_minus_minus) / (2 * t_delta)
+        a_fd_from_x = (v_t_plus_temp - v_t_minus_temp) / (2 * t_delta)
+
+        # Compute squared differences for all 6 components
+        diff_1 = (v_fd_from_x - v_t) ** 2        # v from x vs v_pred
+        diff_2 = (a_fd_from_v - a_t) ** 2        # a from v vs a_pred
+        diff_3 = (a_fd_from_x - a_t) ** 2        # a from x vs a_pred
+        diff_4 = (v_fd_from_x - v_target) ** 2   # v from x vs v_target
+        diff_5 = (a_fd_from_v - a_target) ** 2   # a from v vs a_target
+        diff_6 = (a_fd_from_x - a_target) ** 2   # a from x vs a_target
+
+        # Apply normalization if use_relative is True
+        if self.use_relative:
+            diff_1 = diff_1 / (v_target ** 2 + eps)
+            diff_2 = diff_2 / (a_target ** 2 + eps)
+            diff_3 = diff_3 / (a_target ** 2 + eps)
+            diff_4 = diff_4 / (v_target ** 2 + eps)
+            diff_5 = diff_5 / (a_target ** 2 + eps)
+            diff_6 = diff_6 / (a_target ** 2 + eps)
+
+        # Compute weighted sum of all components
+        total_loss = (
+            self.weight_v_x_pred * torch.mean(diff_1) +
+            self.weight_a_v_pred * torch.mean(diff_2) +
+            self.weight_a_x_pred * torch.mean(diff_3) +
+            self.weight_v_x_target * torch.mean(diff_4) +
+            self.weight_a_v_target * torch.mean(diff_5) +
+            self.weight_a_x_target * torch.mean(diff_6)
+        )
+
+        # Apply log transformation if enabled
+        if self.use_log:
+            total_loss = torch.log(total_loss + eps)
+
+        return total_loss
 
 
 class PINNLoss(nn.Module):
@@ -748,7 +830,20 @@ class PINNLoss_v2(nn.Module):
             config = self.loss_config.get("Consistency")
             t_threshold = config.get("t_threshold", 1e-6)
             weight = config.get("weight", 1.0)
-            self.loss_components["Consistency"] = ConsistencyLoss_auto_diff(weight=weight, model=model, t_threshold=t_threshold)
+            use_relative = config.get("use_relative", False)
+            use_log = config.get("use_log", True)  # Default to True
+            consistency_type = config.get("type", "auto")  # "auto" or "finite"
+
+            if consistency_type == "auto":
+                self.loss_components["Consistency"] = ConsistencyLoss_auto_diff(
+                    weight=weight, model=model, t_threshold=t_threshold, use_log=use_log
+                )
+            elif consistency_type == "finite":
+                self.loss_components["Consistency"] = ConsistencyLoss_finite_diff(
+                    weight=weight, use_relative=use_relative, t_threshold=t_threshold, use_log=use_log
+                )
+            else:
+                raise ValueError(f"Unknown consistency type: {consistency_type}. Use 'auto' or 'finite'.")
 
         # Print configuration
         self._print_config()
@@ -810,11 +905,24 @@ class PINNLoss_v2(nn.Module):
 
         # Consistency Loss
         if "Consistency" in self.loss_components and "Consistency" in loss_args:
-            inputs, inputs_real, norm_params = loss_args["Consistency"]
-            # ConsistencyLoss recomputes outputs internally, so we don't pass them
-            consistency_value = self.loss_components["Consistency"](
-                None, None, inputs, norm_params, inputs_real
-            )
+            # Check if it's auto or finite based on number of arguments
+            consistency_args = loss_args["Consistency"]
+
+            if isinstance(self.loss_components["Consistency"], ConsistencyLoss_auto_diff):
+                # Auto diff: (inputs, inputs_real, norm_params)
+                inputs, inputs_real, norm_params = consistency_args
+                consistency_value = self.loss_components["Consistency"](
+                    None, None, inputs, norm_params, inputs_real
+                )
+            elif isinstance(self.loss_components["Consistency"], ConsistencyLoss_finite_diff):
+                # Finite diff: (outputs, outputs_dt, targets)
+                outputs, outputs_dt, targets = consistency_args
+                consistency_value = self.loss_components["Consistency"](
+                    outputs, targets, None, None, outputs_dt
+                )
+            else:
+                raise ValueError("Unknown consistency loss type")
+
             total_loss += consistency_value
             loss_summary["consistency_loss"] = consistency_value.item()
 

@@ -92,11 +92,12 @@ def trycalculate_v_a():
     v_t_plus = (x_t_plus_plus - x_t) / (2*t_delta)
     v_t_minus = (x_t - x_t_minus_minus) / (2*t_delta)
     a_t_fd = (v_t_plus - v_t_minus) / (2*t_delta)
+    a_t_fd2 = (x_t_plus - 2 * x_t + x_t_minus) / (t_delta **2)
     # a_t_fd = (x_t_plus_plus - 2 * x_t + x_t_minus_minus) / (t_delta **2)
 
 
     print(f"Analytical: v_t={v_t}, a_t={a_t}")
-    print(f"Finite Diff: v_t={v_t_fd}, a_t={a_t_fd}")
+    print(f"Finite Diff: v_t={v_t_fd}, a_t1={a_t_fd}, a_t2={a_t_fd2}")
     print("Difference:"
           f" v_t_diff={abs(v_t - v_t_fd)}, a_t_diff={abs(a_t - a_t_fd)}")
     
@@ -156,9 +157,6 @@ def function_save_datadistribution(data, output_dir='data_distributions'):
         has_negative = np.any(finite_data < 0)
 
         if has_negative:
-            # Create 3 subfigures
-            fig, axes = plt.subplots(3, 1, figsize=(10, 15))
-
             # Separate positive, negative, zero
             positive_data = finite_data[finite_data > 0]
             negative_data = finite_data[finite_data < 0]
@@ -169,10 +167,12 @@ def function_save_datadistribution(data, output_dir='data_distributions'):
             negative_pct = (len(negative_data) / total_count) * 100
             zero_pct = (len(zero_data) / total_count) * 100
 
-            # Determine if we should use log scale
-            use_log_scale = name in ['x_t', 'v_t', 'a_t']
+            # Determine if we should create both log and linear scale plots
+            create_both_scales = name in ['x_t', 'v_t', 'a_t']
 
-            if use_log_scale:
+            if create_both_scales:
+                # ==== LOG SCALE VERSION ====
+                fig, axes = plt.subplots(3, 1, figsize=(10, 15))
                 # ==== LOG SCALE with outlier filtering ====
                 threshold = 1e-100  # Filter extremely small values
                 
@@ -281,6 +281,8 @@ def function_save_datadistribution(data, output_dir='data_distributions'):
 
             else:
                 # ==== LINEAR SCALE for x0, v0 ====
+                fig, axes = plt.subplots(3, 1, figsize=(10, 15))
+
                 # Use percentiles to avoid extreme outliers
                 all_values = np.concatenate([positive_data, negative_data]) if len(positive_data) > 0 and len(negative_data) > 0 else \
                             positive_data if len(positive_data) > 0 else negative_data
@@ -345,11 +347,88 @@ def function_save_datadistribution(data, output_dir='data_distributions'):
                 axes[2].grid(axis='y', alpha=0.75)
 
             plt.tight_layout()
-            filename = os.path.join(output_dir, f'distribution_{name}.png')
-            plt.savefig(filename, dpi=100)
-            plt.close()
 
-            print(f"  Saved {name}: Pos={positive_pct:.1f}%, Neg={negative_pct:.1f}%, Zero={zero_pct:.1f}%")
+            # Save with appropriate suffix
+            if create_both_scales:
+                filename_log = os.path.join(output_dir, f'distribution_{name}_log.png')
+                plt.savefig(filename_log, dpi=100)
+                plt.close()
+
+                # ==== LINEAR SCALE VERSION ====
+                fig, axes = plt.subplots(3, 1, figsize=(10, 15))
+
+                # Use percentiles to avoid extreme outliers
+                all_values = np.concatenate([positive_data, negative_data]) if len(positive_data) > 0 and len(negative_data) > 0 else \
+                            positive_data if len(positive_data) > 0 else negative_data
+
+                if len(all_values) > 0:
+                    x_min = np.percentile(all_values, 0.5)  # 0.5th percentile
+                    x_max = np.percentile(all_values, 99.5)  # 99.5th percentile
+
+                    # Add 10% padding
+                    range_width = x_max - x_min
+                    x_min -= range_width * 0.1
+                    x_max += range_width * 0.1
+                else:
+                    x_min, x_max = -1, 1
+
+                # Subplot 1: Positive values (linear scale)
+                if len(positive_data) > 0:
+                    axes[0].hist(positive_data, bins=100, range=(x_min, x_max),
+                                density=False, color='green', alpha=0.7, edgecolor='black')
+                    axes[0].set_title(f'Positive {name}\n({positive_pct:.1f}% of data, n={len(positive_data)})')
+                else:
+                    axes[0].text(0.5, 0.5, 'No positive values',
+                               ha='center', va='center', transform=axes[0].transAxes)
+                    axes[0].set_title(f'Positive {name}\n(0.0% of data, n=0)')
+
+                axes[0].set_xlabel(f'{name}')
+                axes[0].set_ylabel('Count')
+                axes[0].set_xlim(x_min, x_max)
+                axes[0].grid(axis='y', alpha=0.75)
+
+                # Subplot 2: Negative values (linear scale)
+                if len(negative_data) > 0:
+                    axes[1].hist(negative_data, bins=100, range=(x_min, x_max),
+                                density=False, color='red', alpha=0.7, edgecolor='black')
+                    axes[1].set_title(f'Negative {name}\n({negative_pct:.1f}% of data, n={len(negative_data)})')
+                else:
+                    axes[1].text(0.5, 0.5, 'No negative values',
+                               ha='center', va='center', transform=axes[1].transAxes)
+                    axes[1].set_title(f'Negative {name}\n(0.0% of data, n=0)')
+
+                axes[1].set_xlabel(f'{name}')
+                axes[1].set_ylabel('Count')
+                axes[1].set_xlim(x_min, x_max)
+                axes[1].grid(axis='y', alpha=0.75)
+
+                # Subplot 3: Combined (linear scale)
+                if len(finite_data) > 0:
+                    axes[2].hist(finite_data, bins=100, range=(x_min, x_max),
+                                density=False, color='blue', alpha=0.7, edgecolor='black')
+                    axes[2].set_title(f'Combined {name}\n(Pos: {positive_pct:.1f}%, Neg: {negative_pct:.1f}%, Zero: {zero_pct:.1f}%, n={len(finite_data)})')
+                else:
+                    axes[2].text(0.5, 0.5, 'All values are zero',
+                               ha='center', va='center', transform=axes[2].transAxes)
+                    axes[2].set_title(f'Combined {name} (n=0)')
+
+                axes[2].set_xlabel(f'{name}')
+                axes[2].set_ylabel('Count')
+                axes[2].set_xlim(x_min, x_max)
+                axes[2].grid(axis='y', alpha=0.75)
+
+                plt.tight_layout()
+                filename_real = os.path.join(output_dir, f'distribution_{name}_real.png')
+                plt.savefig(filename_real, dpi=100)
+                plt.close()
+
+                print(f"  Saved {name}: Pos={positive_pct:.1f}%, Neg={negative_pct:.1f}%, Zero={zero_pct:.1f}% (log and real scale)")
+            else:
+                filename = os.path.join(output_dir, f'distribution_{name}.png')
+                plt.savefig(filename, dpi=100)
+                plt.close()
+
+                print(f"  Saved {name}: Pos={positive_pct:.1f}%, Neg={negative_pct:.1f}%, Zero={zero_pct:.1f}%")
 
         else:
             # All-positive data (log scale for m, zeta, k)
@@ -399,7 +478,7 @@ def function_save_datadistribution(data, output_dir='data_distributions'):
 
 
 def main():
-    n = 400000
+    n = 1000000
     
     # np.random.seed(42)
     
@@ -500,12 +579,12 @@ def main():
     
     # Save as npz file
     np.savez('train_val_vibration_data.npz', data=data)
-    print(f"\nData generation complete! Saved {n} samples to 'test_vibration_data.npz'")
+    print(f"\nData generation complete! Saved {n} samples to 'train_val_vibration_data.npz'")
     print(f"Data shape: {data.shape}")
     print(f"Columns: [m, zeta, k, t, x0, v0, x(t), v(t), a(t)]")
     print(data[:5, :])  # Print first 5 samples
     # Generate and save data distribution plots
-    function_save_datadistribution(data)
+    function_save_datadistribution(data, output_dir='tran_val_data_distributions')
     
     for i in range(n):
         if i % 10000 == 0:
@@ -568,6 +647,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # main()
     # unittest_overflow()
-    # trycalculate_v_a()
+    trycalculate_v_a()
