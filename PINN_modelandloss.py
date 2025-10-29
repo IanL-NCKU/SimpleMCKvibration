@@ -199,9 +199,10 @@ class BaseLossComponent(ABC, nn.Module):
 class MSELoss(BaseLossComponent):
     """Mean Squared Error loss between predictions and targets"""
 
-    def __init__(self, weight=1.0, use_relative=False):
+    def __init__(self, weight=1.0, use_relative=False, use_log=False):
         super().__init__(weight=weight, name="MSE Loss")
         self.use_relative = use_relative
+        self.use_log = use_log
 
     def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None):
         """
@@ -219,12 +220,25 @@ class MSELoss(BaseLossComponent):
         """
         eps = 1e-10
 
-        if self.use_relative:
-            # Relative MSE: normalized by target magnitude
-            loss = torch.mean(((predictions - targets) ** 2) / (torch.square(targets) + eps))
+        if self.use_log:
+            # Log-space MSE
+            log_predictions = torch.log(torch.abs(predictions) + eps)
+            log_targets = torch.log(torch.abs(targets) + eps)
+
+            if self.use_relative:
+                # Relative log-space MSE: normalized by log target magnitude
+                loss = torch.mean(((log_predictions - log_targets) ** 2) / (torch.square(log_targets) + eps))
+            else:
+                # Absolute log-space MSE
+                loss = torch.mean((log_predictions - log_targets) ** 2)
         else:
-            # Absolute MSE
-            loss = torch.mean((predictions - targets) ** 2)
+            # Standard MSE (not log-space)
+            if self.use_relative:
+                # Relative MSE: normalized by target magnitude
+                loss = torch.mean(((predictions - targets) ** 2) / (torch.square(targets) + eps))
+            else:
+                # Absolute MSE
+                loss = torch.mean((predictions - targets) ** 2)
 
         return loss
 
@@ -552,6 +566,10 @@ class ConsistencyLoss_finite_diff(BaseLossComponent):
         v_t_plus = outputs_dt[2*N:3*N, 1:2]         # t + Δt
 
         # Extract targets
+        # Debug: ensure targets is a tensor
+        if not isinstance(targets, torch.Tensor):
+            raise TypeError(f"targets must be a torch.Tensor, got {type(targets)}")
+
         x_target = targets[:, 0:1]
         v_target = targets[:, 1:2]
         a_target = targets[:, 2:3]
