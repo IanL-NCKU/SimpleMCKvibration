@@ -120,7 +120,7 @@ def prediction_performance(data_path, model_pt_path, model, normalizer, device, 
 
 def main():
     device_index = 0
-    epochs = 10
+    epochs = 200
 
     # Data paths
     Train_Val_data_source = r'E:\Ian\PINNexample\exponential_trainval_data.npz'
@@ -148,15 +148,15 @@ def main():
     device = torch.device(f'cuda:{device_index}' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    model_save_path = 'exp_model_test.pt'
-    results_figure_folder = './exp_results_test'
+    model_save_path = 'exp_model_ELU_finetune_ver2.pt'
+    results_figure_folder = './exp_results_ELU_finetune_ver2'
 
     # Create the Exponential PINN model
     model = ExponentialPINN(hidden_dims=[16, 32, 32, 64, 32, 32, 16],
                           activation='ELU',
                           use_log_output=False,
                           use_finetune=True,
-                          finetune_hidden_dims=[16, 32, 32, 32, 16],
+                          finetune_hidden_dims=[16, 32, 32, 64, 32, 32, 16],
                           finetune_scale=1,
                           use_exponential_superposition=False).to(device)
 
@@ -420,23 +420,29 @@ def main():
         # Print epoch summary
         print(f"Epoch [{epoch+1}/{epochs}] - Train Loss: {train_loss:.4e}, Val Loss: {val_loss:.4e}")
 
-        # Print train loss breakdown with ratios
-        print("  Train Loss Breakdown:")
+        # Build train loss breakdown string
         train_total = train_loss_components.get('total', train_loss)
+        train_parts = []
         for key in sorted(train_loss_components.keys()):
             if key != 'total':
                 value = train_loss_components[key]
                 ratio = (value / train_total * 100) if train_total > 0 else 0
-                print(f"    {key:20s}: {value:.4e} ({ratio:5.2f}%)")
+                train_parts.append(f"{key}: {value:.4e} ({ratio:.2f}%)")
 
-        # Print val loss breakdown with ratios
-        print("  Val Loss Breakdown:")
+        # Build val loss breakdown string
         val_total = val_loss_components.get('total', val_loss)
+        val_parts = []
         for key in sorted(val_loss_components.keys()):
             if key != 'total':
                 value = val_loss_components[key]
                 ratio = (value / val_total * 100) if val_total > 0 else 0
-                print(f"    {key:20s}: {value:.4e} ({ratio:5.2f}%)")
+                val_parts.append(f"{key}: {value:.4e} ({ratio:.2f}%)")
+
+        # Print both on 2 lines with aligned spacing
+        train_breakdown = "  |  ".join(train_parts)
+        val_breakdown = "  |  ".join(val_parts)
+        print(f"  Train Loss: {train_breakdown}")
+        print(f"  Val Loss  : {val_breakdown}")
 
         # Save the model if combined loss (train + val) has improved
         combined_loss = train_loss + val_loss
