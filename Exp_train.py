@@ -148,15 +148,15 @@ def main():
     device = torch.device(f'cuda:{device_index}' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    model_save_path = 'exp_model_ELU_finetune_ver2.pt'
-    results_figure_folder = './exp_results_ELU_finetune_ver2'
+    model_save_path = 'exp_model_tanh_finetune_ver4.pt'
+    results_figure_folder = './exp_results_tanh_finetune_ver4'
 
     # Create the Exponential PINN model
     model = ExponentialPINN(hidden_dims=[16, 32, 32, 64, 32, 32, 16],
-                          activation='ELU',
+                          activation='tanh',
                           use_log_output=False,
                           use_finetune=True,
-                          finetune_hidden_dims=[16, 32, 32, 64, 32, 32, 16],
+                          finetune_hidden_dims=[16, 32, 64, 32, 16],
                           finetune_scale=1,
                           use_exponential_superposition=False).to(device)
 

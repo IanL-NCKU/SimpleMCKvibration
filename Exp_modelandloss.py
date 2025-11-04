@@ -139,9 +139,9 @@ class ExponentialPINN(nn.Module):
             finetune_corrections = self.finetune_scale * finetune_raw
 
             # Apply multiplicative correction
-            x_pred = x_pred_base * (1 + finetune_corrections[:, 0:1])
-            v_pred = v_pred_base * (1 + finetune_corrections[:, 1:2])
-            a_pred = a_pred_base * (1 + finetune_corrections[:, 2:3])
+            x_pred = x_pred_base * (finetune_corrections[:, 0:1])
+            v_pred = v_pred_base * (finetune_corrections[:, 1:2])
+            a_pred = a_pred_base * (finetune_corrections[:, 2:3])
         else:
             x_pred = x_pred_base
             v_pred = v_pred_base
@@ -229,12 +229,41 @@ class MSELoss(BaseLossComponent):
             log_predictions = torch.log(torch.abs(predictions) + eps)
             log_targets = torch.log(torch.abs(targets) + eps)
 
+            # Detect sign differences in original space
+            different_signs_original = (torch.sign(predictions) != torch.sign(targets))
+            same_signs_original = ~different_signs_original
+
+            # Detect sign differences in log space
+            different_signs_log = (torch.sign(log_predictions) != torch.sign(log_targets))
+            same_signs_log = ~different_signs_log
+
+            # Case 1: Different sign in original AND same sign in log -> Addition
+            case1 = different_signs_original & same_signs_log
+            # Case 2: Different sign in original AND different sign in log -> Subtraction
+            case2 = different_signs_original & different_signs_log
+            # Case 3: Same sign in original AND same sign in log -> Subtraction
+            case3 = same_signs_original & same_signs_log
+            # Case 4: Same sign in original AND different sign in log -> Subtraction
+            case4 = same_signs_original & different_signs_log
+
             if self.use_relative:
                 # Relative log-space MSE
-                loss = torch.mean(((log_predictions - log_targets) ** 2) / (torch.square(log_targets) + eps))
+                # Addition cases (Case 1)
+                addition_loss = ((log_predictions + log_targets) ** 2) / (torch.square(log_targets) + eps)
+                # Subtraction cases (Case 2, 3, 4)
+                subtraction_loss = ((log_predictions - log_targets) ** 2) / (torch.square(log_targets) + eps)
+
+                # Combine losses based on the 4 cases
+                loss = torch.mean(torch.where(case1, addition_loss, subtraction_loss))
             else:
                 # Absolute log-space MSE
-                loss = torch.mean((log_predictions - log_targets) ** 2)
+                # Addition cases (Case 1)
+                addition_loss = (log_predictions + log_targets) ** 2
+                # Subtraction cases (Case 2, 3, 4)
+                subtraction_loss = (log_predictions - log_targets) ** 2
+
+                # Combine losses based on the 4 cases
+                loss = torch.mean(torch.where(case1, addition_loss, subtraction_loss))
         else:
             # Standard MSE (not log-space)
             if self.use_relative:
