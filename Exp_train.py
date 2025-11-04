@@ -169,8 +169,26 @@ def main():
     }
 
     loss_fn = ExponentialPINNLoss(model, loss_config)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
-    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=np.max([epochs//20,1]), eta_min=1e-12)
+
+    # Dual-optimizer setup for separate magnitude and sign training
+    # Main network optimizer: updates network + finetune_network with magnitude loss
+    main_params = list(model.network.parameters())
+    if model.use_finetune:
+        main_params += list(model.finetune_network.parameters())
+    optimizer_main = torch.optim.Adam(main_params, lr=0.005)
+
+    # Sign network optimizer: updates sign_network with sign loss (only if enabled)
+    if model.use_sign_network:
+        optimizer_sign = torch.optim.Adam(model.sign_network.parameters(), lr=0.005)
+    else:
+        optimizer_sign = None
+
+    # Learning rate schedulers for both optimizers
+    lr_scheduler_main = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_main, T_max=np.max([epochs//20,1]), eta_min=1e-12)
+    if optimizer_sign is not None:
+        lr_scheduler_sign = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_sign, T_max=np.max([epochs//20,1]), eta_min=1e-12)
+    else:
+        lr_scheduler_sign = None
 
     # Prepare norm_params for consistency loss
     norm_params = {'normalizer': train_val_inputs_normalizer}
@@ -190,8 +208,6 @@ def main():
         for inputs, targets in train_pbar:
             # Move data to device
             inputs, targets = inputs.to(device), targets.to(device)
-
-            optimizer.zero_grad()
 
             # Denormalize inputs for loss calculation (if normalizer exists)
             if train_val_inputs_normalizer is not None:
@@ -269,8 +285,78 @@ def main():
 
             # Compute loss
             loss, loss_dict = loss_fn(loss_args)
-            loss.backward()
-            optimizer.step()
+
+            # Dual-optimizer training: separate magnitude and sign updates
+            if 'magnitude_loss_raw' in loss_dict and 'sign_loss_raw' in loss_dict and optimizer_sign is not None:
+                # Dual-optimizer mode with TWO SEPARATE FORWARD PASSES
+                # This avoids in-place operation conflicts in computational graph
+
+                # ===== PASS 1: Update sign network with sign loss =====
+                optimizer_sign.zero_grad()
+                sign_loss_weighted = loss_dict['sign_loss_raw'] * loss_fn.loss_components["MSE"].weight
+                sign_loss_weighted.backward()
+                optimizer_sign.step()
+
+                # ===== PASS 2: Fresh forward pass for main network =====
+                # After sign network update, we do a fresh forward pass for main network
+                optimizer_main.zero_grad()
+
+                # Fresh forward pass with updated sign network
+                outputs_combined_fresh = model(inputs_combined)
+                outputs_fresh = outputs_combined_fresh[:N]
+
+                if loss_fn.has_loss("Consistency") and loss_config["Consistency"]["type"] == "finite":
+                    outputs_dt_fresh = outputs_combined_fresh[N:N+4*N]
+                else:
+                    outputs_dt_fresh = None
+
+                # Recompute magnitude loss with fresh outputs
+                loss_args_fresh = {}
+                if loss_fn.has_loss("MSE"):
+                    loss_args_fresh["MSE"] = (outputs_fresh, targets)
+                if loss_fn.has_loss("Residual"):
+                    loss_args_fresh["Residual"] = (outputs_fresh, inputs_real)
+                if loss_fn.has_loss("Consistency"):
+                    consistency_type = loss_config["Consistency"]["type"]
+                    if consistency_type == "finite":
+                        loss_args_fresh["Consistency"] = (outputs_fresh, outputs_dt_fresh, targets)
+                    elif consistency_type == "auto":
+                        loss_args_fresh["Consistency"] = (inputs, inputs_real, norm_params)
+
+                _, loss_dict_fresh = loss_fn(loss_args_fresh)
+
+                # Build magnitude loss for main network
+                magnitude_loss_weighted = loss_dict_fresh['magnitude_loss_raw'] * loss_fn.loss_components["MSE"].weight
+
+                # Add physics losses (they affect main network parameters)
+                if loss_fn.has_loss("Residual"):
+                    residual_tensor = loss_fn.loss_components["Residual"].compute(
+                        outputs_fresh, None, None, None, inputs_real
+                    ) * loss_fn.loss_components["Residual"].weight
+                    magnitude_loss_weighted = magnitude_loss_weighted + residual_tensor
+
+                if loss_fn.has_loss("Consistency"):
+                    consistency_type = loss_config["Consistency"]["type"]
+                    if consistency_type == "auto":
+                        consistency_tensor = loss_fn.loss_components["Consistency"].compute(
+                            None, None, inputs, norm_params, inputs_real
+                        ) * loss_fn.loss_components["Consistency"].weight
+                    elif consistency_type == "finite":
+                        consistency_tensor = loss_fn.loss_components["Consistency"].compute(
+                            outputs_fresh, targets, None, None, outputs_dt_fresh
+                        ) * loss_fn.loss_components["Consistency"].weight
+                    else:
+                        consistency_tensor = torch.tensor(0.0, device=outputs_fresh.device)
+                    magnitude_loss_weighted = magnitude_loss_weighted + consistency_tensor
+
+                magnitude_loss_weighted.backward()
+                optimizer_main.step()
+            else:
+                # Standard single-optimizer mode (fallback for when use_log=False or no sign network)
+                optimizer_main.zero_grad()
+                loss.backward()
+                optimizer_main.step()
+
             train_loss += loss.item() * inputs.size(0)
 
             # Accumulate loss components
@@ -416,7 +502,10 @@ def main():
         for key in val_loss_components:
             val_loss_components[key] /= len(val_loader.dataset)
 
-        lr_scheduler.step()
+        # Update learning rate schedulers for both optimizers
+        lr_scheduler_main.step()
+        if lr_scheduler_sign is not None:
+            lr_scheduler_sign.step()
 
         # Print epoch summary
         print(f"Epoch [{epoch+1}/{epochs}] -Model name: {os.path.basename(model_save_path)}  Train Loss: {train_loss:.4e}, Val Loss: {val_loss:.4e}")
