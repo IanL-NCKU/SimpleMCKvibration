@@ -398,10 +398,10 @@ def load_exponential_data(filepath='exponential_trainval_data.npz', batch_size=3
 
     # Split into train (80%), val (16%), test (4%)
     X_train, X_temp, y_train, y_temp = train_test_split(
-        input_data, output_data, test_size=0.2)
+        input_data, output_data, test_size=0.2, random_state=32)
 
     X_val, X_test, y_val, y_test = train_test_split(
-        X_temp, y_temp, test_size=0.2)
+        X_temp, y_temp, test_size=0.2, random_state=32)
 
     # Normalize inputs and outputs if requested
     inputs_normalizer = None

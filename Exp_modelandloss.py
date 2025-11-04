@@ -8,13 +8,13 @@ class ExponentialPINN(nn.Module):
 
     def __init__(self, hidden_dims=[64, 128, 128, 64], activation='tanh', use_log_output=False,
                  use_finetune=False, finetune_hidden_dims=[32, 32], finetune_scale=0.1,
-                 use_exponential_superposition=False):
+                 use_sign_network=False, sign_network_hidden_dims=[32, 32]):
         super().__init__()
 
         self.use_log_output = use_log_output
         self.use_finetune = use_finetune
         self.finetune_scale = finetune_scale
-        self.use_exponential_superposition = use_exponential_superposition
+        self.use_sign_network = use_sign_network
 
         # Choose activation function
         if activation == 'tanh':
@@ -38,12 +38,14 @@ class ExponentialPINN(nn.Module):
             input_dim = hidden_dim
 
         # Final layer output dimension
-        if use_exponential_superposition:
-            layers.append(nn.Linear(input_dim, 12))  # [m_x1, n_x1, m_x2, n_x2, m_v1, n_v1, m_v2, n_v2, m_a1, n_a1, m_a2, n_a2]
-        elif use_log_output:
+        if use_log_output:
             layers.append(nn.Linear(input_dim, 6))  # [sign_x, log_x, sign_v, log_v, sign_a, log_a]
         else:
             layers.append(nn.Linear(input_dim, 3))  # [x_t, v_t, a_t]
+
+        # Add softplus if sign network is enabled (to ensure positive outputs)
+        if self.use_sign_network:
+            layers.append(nn.Softplus())
 
         self.network = nn.Sequential(*layers)
 
@@ -63,6 +65,23 @@ class ExponentialPINN(nn.Module):
             self.finetune_network = nn.Sequential(*finetune_layers)
         else:
             self.finetune_network = None
+
+        # Build sign network (if enabled)
+        if self.use_sign_network:
+            sign_layers = []
+            sign_input_dim = 6  # [a, b, t, x, v, a]
+
+            for hidden_dim in sign_network_hidden_dims:
+                sign_layers.append(nn.Linear(sign_input_dim, hidden_dim))
+                sign_layers.append(act())
+                sign_input_dim = hidden_dim
+
+            sign_layers.append(nn.Linear(sign_input_dim, 3))  # [sign_x, sign_v, sign_a]
+            sign_layers.append(nn.Tanh())  # Constrain to [-1, 1]
+
+            self.sign_network = nn.Sequential(*sign_layers)
+        else:
+            self.sign_network = None
 
         # Initialize weights
         self.apply(self._init_weights)
@@ -85,29 +104,7 @@ class ExponentialPINN(nn.Module):
         output = self.network(x)
 
         # Step 1: Convert network output to real space (base predictions)
-        if self.use_exponential_superposition:
-            # Network outputs: [m_x1, n_x1, m_x2, n_x2, m_v1, n_v1, m_v2, n_v2, m_a1, n_a1, m_a2, n_a2]
-            m_x1 = output[:, 0:1]
-            n_x1 = output[:, 1:2]
-            m_x2 = output[:, 2:3]
-            n_x2 = output[:, 3:4]
-
-            m_v1 = output[:, 4:5]
-            n_v1 = output[:, 5:6]
-            m_v2 = output[:, 6:7]
-            n_v2 = output[:, 7:8]
-
-            m_a1 = output[:, 8:9]
-            n_a1 = output[:, 9:10]
-            m_a2 = output[:, 10:11]
-            n_a2 = output[:, 11:12]
-
-            # Exponential superposition: x_t = m_x1*exp(n_x1) + m_x2*exp(n_x2)
-            x_pred_base = m_x1 * torch.exp(n_x1) + m_x2 * torch.exp(n_x2)
-            v_pred_base = m_v1 * torch.exp(n_v1) + m_v2 * torch.exp(n_v2)
-            a_pred_base = m_a1 * torch.exp(n_a1) + m_a2 * torch.exp(n_a2)
-
-        elif self.use_log_output:
+        if self.use_log_output:
             # Network outputs: [sign_x, log_x, sign_v, log_v, sign_a, log_a]
 
             # Extract sign and log magnitude
@@ -139,13 +136,29 @@ class ExponentialPINN(nn.Module):
             finetune_corrections = self.finetune_scale * finetune_raw
 
             # Apply multiplicative correction
-            x_pred = x_pred_base * (finetune_corrections[:, 0:1])
-            v_pred = v_pred_base * (finetune_corrections[:, 1:2])
-            a_pred = a_pred_base * (finetune_corrections[:, 2:3])
+            x_pred = x_pred_base * (1 + finetune_corrections[:, 0:1])
+            v_pred = v_pred_base * (1 + finetune_corrections[:, 1:2])
+            a_pred = a_pred_base * (1 + finetune_corrections[:, 2:3])
         else:
             x_pred = x_pred_base
             v_pred = v_pred_base
             a_pred = a_pred_base
+
+        # Step 3: Apply sign network (if enabled) - FINAL STEP
+        if self.use_sign_network:
+            # Prepare input: concatenate [a, b, t] + current predictions
+            current_preds = torch.cat([x_pred, v_pred, a_pred], dim=1)
+            sign_input = torch.cat([x, current_preds], dim=1)
+
+            # Get sign predictions from network
+            sign_output = self.sign_network(sign_input)
+            predicted_signs = sign_output  # Keep soft signs in [-1, 1] for gradient flow
+
+            # Apply sign corrections: predictions are already positive (from softplus)
+            # So we can directly multiply by predicted signs
+            x_pred = x_pred * predicted_signs[:, 0:1]
+            v_pred = v_pred * predicted_signs[:, 1:2]
+            a_pred = a_pred * predicted_signs[:, 2:3]
 
         return torch.cat([x_pred, v_pred, a_pred], dim=1)
 
@@ -225,45 +238,25 @@ class MSELoss(BaseLossComponent):
         eps = 1e-10
 
         if self.use_log:
-            # Log-space MSE
+            # Compute magnitude loss (log-space MSE)
             log_predictions = torch.log(torch.abs(predictions) + eps)
             log_targets = torch.log(torch.abs(targets) + eps)
 
-            # Detect sign differences in original space
-            different_signs_original = (torch.sign(predictions) != torch.sign(targets))
-            same_signs_original = ~different_signs_original
-
-            # Detect sign differences in log space
-            different_signs_log = (torch.sign(log_predictions) != torch.sign(log_targets))
-            same_signs_log = ~different_signs_log
-
-            # Case 1: Different sign in original AND same sign in log -> Addition
-            case1 = different_signs_original & same_signs_log
-            # Case 2: Different sign in original AND different sign in log -> Subtraction
-            case2 = different_signs_original & different_signs_log
-            # Case 3: Same sign in original AND same sign in log -> Subtraction
-            case3 = same_signs_original & same_signs_log
-            # Case 4: Same sign in original AND different sign in log -> Subtraction
-            case4 = same_signs_original & different_signs_log
-
             if self.use_relative:
-                # Relative log-space MSE
-                # Addition cases (Case 1)
-                addition_loss = ((log_predictions + log_targets) ** 2) / (torch.square(log_targets) + eps)
-                # Subtraction cases (Case 2, 3, 4)
-                subtraction_loss = ((log_predictions - log_targets) ** 2) / (torch.square(log_targets) + eps)
-
-                # Combine losses based on the 4 cases
-                loss = torch.mean(torch.where(case1, addition_loss, subtraction_loss))
+                # Relative log-space MSE for magnitudes
+                magnitude_loss = torch.mean(((log_predictions - log_targets) ** 2) / (torch.square(log_targets) + eps))
             else:
-                # Absolute log-space MSE
-                # Addition cases (Case 1)
-                addition_loss = (log_predictions + log_targets) ** 2
-                # Subtraction cases (Case 2, 3, 4)
-                subtraction_loss = (log_predictions - log_targets) ** 2
+                # Absolute log-space MSE for magnitudes
+                magnitude_loss = torch.mean((log_predictions - log_targets) ** 2)
 
-                # Combine losses based on the 4 cases
-                loss = torch.mean(torch.where(case1, addition_loss, subtraction_loss))
+            # Compute sign MSE loss (compatible with soft signs)
+            # Normalize predictions to get sign direction
+            target_signs = torch.sign(targets).float()  # Shape: [batch, 3], values: -1, 0, +1
+            pred_signs = predictions / (torch.abs(predictions) + eps)  # Normalize to [-1, 1]
+            sign_mse_loss = torch.mean((pred_signs - target_signs) ** 2)
+
+            # Combine magnitude and sign losses
+            loss = magnitude_loss #+ sign_mse_loss
         else:
             # Standard MSE (not log-space)
             if self.use_relative:

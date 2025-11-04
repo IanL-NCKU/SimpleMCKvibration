@@ -148,17 +148,18 @@ def main():
     device = torch.device(f'cuda:{device_index}' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    model_save_path = 'exp_model_tanh_finetune_ver4.pt'
-    results_figure_folder = './exp_results_tanh_finetune_ver4'
+    model_save_path = 'exp_model_relu_signmodel.pt'
+    results_figure_folder = './exp_results_relu_signmodel'
 
     # Create the Exponential PINN model
     model = ExponentialPINN(hidden_dims=[16, 32, 32, 64, 32, 32, 16],
-                          activation='tanh',
+                          activation='relu',
                           use_log_output=False,
                           use_finetune=True,
                           finetune_hidden_dims=[16, 32, 64, 32, 16],
                           finetune_scale=1,
-                          use_exponential_superposition=False).to(device)
+                          use_sign_network=True,
+                          sign_network_hidden_dims=[16, 32, 32, 16]).to(device)
 
     # Configure losses
     loss_config = {
@@ -168,7 +169,7 @@ def main():
     }
 
     loss_fn = ExponentialPINNLoss(model, loss_config)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=np.max([epochs//20,1]), eta_min=1e-12)
 
     # Prepare norm_params for consistency loss
@@ -418,7 +419,7 @@ def main():
         lr_scheduler.step()
 
         # Print epoch summary
-        print(f"Epoch [{epoch+1}/{epochs}] - Train Loss: {train_loss:.4e}, Val Loss: {val_loss:.4e}")
+        print(f"Epoch [{epoch+1}/{epochs}] -Model name: {os.path.basename(model_save_path)}  Train Loss: {train_loss:.4e}, Val Loss: {val_loss:.4e}")
 
         # Build train loss breakdown string
         train_total = train_loss_components.get('total', train_loss)
