@@ -78,8 +78,21 @@ def prediction_performance(data_path, model_pt_path, model, normalizer, device, 
 
     with torch.no_grad():
         for inputs, targets in test_loader:
-            inputs = inputs.to(device)
-            outputs = model(inputs)
+            # Move data to device
+            inputs, targets = inputs.to(device), targets.to(device)
+
+            # Generate random noise for this batch: r ~ Uniform[-1, 1]
+            N = inputs.size(0)
+            r = torch.rand(N, 3, device=device) * 2 - 1  # Shape: (batch_size, 3)
+
+            # Compute noisy magnitudes: (1 + 0.05*r) * abs(targets)
+            noisy_magnitudes = (1 + 0.05 * r) * torch.abs(targets)  # Shape: (batch_size, 3)
+
+            # Modify inputs: concatenate [a, b, t] with noisy magnitudes
+            inputs_modified = torch.cat([inputs, noisy_magnitudes], dim=1)  # Shape: (batch_size, 6)
+
+            # Forward pass
+            outputs = model(inputs_modified)
             all_predictions.append(outputs.cpu().numpy())
             all_targets.append(targets.numpy())
 
@@ -161,11 +174,11 @@ def main():
     device = torch.device(f'cuda:{device_index}' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    model_save_path = 'exp_model_signnn.pt'
-    results_figure_folder = './exp_results_signnn'
+    model_save_path = 'exp_model_signnn_88_lr005.pt'
+    results_figure_folder = './exp_results_signnn_88_lr005'
 
     # Create the Exponential Sign NN model
-    model = ExponentialSignNN(hidden_dims=[64, 128, 128, 64],
+    model = ExponentialSignNN(hidden_dims=[8,8],
                               activation='tanh').to(device)
 
     # Configure losses - only SignMSE
@@ -181,7 +194,7 @@ def main():
 
     loss_fn = ExponentialPINNLoss(model, loss_config)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
-    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=np.max([epochs//20,1]), eta_min=1e-12)
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=np.max([epochs//20,1]), eta_min=1e-9)
 
     # Training loop for Sign Classification Network
     # Input data shape: (batch_size, 6) -> [a, b, t, noisy_mag_x, noisy_mag_v, noisy_mag_a]
@@ -208,7 +221,7 @@ def main():
             r = torch.rand(N, 3, device=device) * 2 - 1  # Shape: (batch_size, 3)
 
             # Compute noisy magnitudes: (1 + 0.05*r) * abs(targets)
-            noisy_magnitudes = (1 + 0.05 * r) * torch.abs(targets)  # Shape: (batch_size, 3)
+            noisy_magnitudes = (1 + 0.05 * r) *torch.abs(targets)  # Shape: (batch_size, 3)
 
             # Modify inputs: concatenate [a, b, t] with noisy magnitudes
             inputs_modified = torch.cat([inputs, noisy_magnitudes], dim=1)  # Shape: (batch_size, 6)

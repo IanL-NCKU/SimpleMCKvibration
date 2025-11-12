@@ -50,7 +50,7 @@ class ExponentialSignNN(nn.Module):
 
         for hidden_dim in hidden_dims:
             layers.append(nn.Linear(input_dim, hidden_dim))
-            layers.append(act())
+            # layers.append(act())
             input_dim = hidden_dim
 
         # Final layer: output 3 sign values constrained to [-1, 1]
@@ -141,7 +141,7 @@ class SignMSELoss(BaseLossComponent):
         pred_signs = predictions / (torch.abs(predictions) + eps)  # Normalize to [-1, 1]
 
         # Compute sign MSE loss
-        sign_mse_loss = torch.mean((pred_signs - target_signs) ** 2)
+        sign_mse_loss =torch.sqrt(torch.mean((pred_signs - target_signs) ** 2))
 
         return sign_mse_loss
 
