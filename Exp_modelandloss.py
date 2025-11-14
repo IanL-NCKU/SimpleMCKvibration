@@ -44,9 +44,9 @@ class ExponentialPINN(nn.Module):
             layers.append(nn.Linear(input_dim, 3))  # [x_t, v_t, a_t]
 
         # Add softplus if sign network is enabled (to ensure positive outputs)
-        if self.use_sign_network:
-            layers.append(nn.Softplus())
-
+        # if self.use_sign_network:
+        #     layers.append(nn.Softplus())
+        layers.append(nn.Softplus())
         self.network = nn.Sequential(*layers)
 
         # Build fine-tune network (if enabled)
@@ -60,12 +60,12 @@ class ExponentialPINN(nn.Module):
                 finetune_input_dim = hidden_dim
 
             finetune_layers.append(nn.Linear(finetune_input_dim, 3))
-            finetune_layers.append(nn.Tanh())
+            finetune_layers.append(nn.Softplus())
 
             self.finetune_network = nn.Sequential(*finetune_layers)
         else:
             self.finetune_network = None
-
+        
         # Build sign network (if enabled)
         if self.use_sign_network:
             sign_layers = []
@@ -233,8 +233,7 @@ class MSELoss(BaseLossComponent):
             targets: (batch_size, 3) - [x_t, v_t, a_t] targets in real space
 
         Returns:
-            If use_log=True: Dictionary with {'magnitude': magnitude_loss, 'sign': sign_mse_loss}
-            Otherwise: Scalar tensor (standard MSE)
+            loss: Scalar tensor
         """
         eps = 1e-10
 
@@ -252,12 +251,15 @@ class MSELoss(BaseLossComponent):
 
             # Compute sign MSE loss (compatible with soft signs)
             # Normalize predictions to get sign direction
-            target_signs = torch.sign(targets).float()  # Shape: [batch, 3], values: -1, 0, +1
-            pred_signs = predictions / (torch.abs(predictions) + eps)  # Normalize to [-1, 1]
-            sign_mse_loss = torch.mean((pred_signs - target_signs) ** 2)
+            # target_signs = torch.sign(targets).float()  # Shape: [batch, 3], values: -1, 0, +1
+            # pred_signs = predictions / (torch.abs(predictions) + eps)  # Normalize to [-1, 1]
+            # sign_mse_loss = torch.mean((pred_signs - target_signs) ** 2)
 
-            # Return both losses separately for dual-optimizer training
-            return {'magnitude': magnitude_loss, 'sign': sign_mse_loss}
+            # Combine magnitude and sign losses
+            relative_meanloss =torch.log10(torch.mean(((predictions - torch.abs(targets)) ** 2) / (torch.abs(targets)**2 + eps)))
+            if relative_meanloss<0:
+                relative_meanloss= 1/(torch.abs(relative_meanloss) + eps)
+            loss = magnitude_loss #+ relative_meanloss#+ sign_mse_loss
         else:
             # Standard MSE (not log-space)
             if self.use_relative:
@@ -267,7 +269,7 @@ class MSELoss(BaseLossComponent):
                 # Absolute MSE
                 loss = torch.mean((predictions - targets) ** 2)
 
-            return loss
+        return loss
 
 
 class ExponentialResidualLoss(BaseLossComponent):
@@ -682,9 +684,8 @@ class ExponentialPINNLoss(nn.Module):
                 }
 
         Returns:
-            total_loss: Scalar tensor (for backward compatibility)
+            total_loss: Scalar tensor
             loss_summary: Dictionary with individual loss values
-                         When use_log=True for MSE: includes 'magnitude_loss_raw' and 'sign_loss_raw' (unweighted tensors)
         """
         total_loss = 0.0
         loss_summary = {}
@@ -692,30 +693,9 @@ class ExponentialPINNLoss(nn.Module):
         # MSE Loss
         if "MSE" in self.loss_components and "MSE" in loss_args:
             outputs, targets = loss_args["MSE"]
-            mse_result = self.loss_components["MSE"].compute(
+            mse_value = self.loss_components["MSE"](
                 outputs, targets, None, None, None
             )
-
-            # Check if we got separate losses (dictionary) or a single loss (tensor)
-            if isinstance(mse_result, dict):
-                # use_log=True: store separate losses for dual-optimizer access
-                magnitude_loss = mse_result['magnitude'] * self.loss_components["MSE"].weight
-                sign_loss = mse_result['sign'] * self.loss_components["MSE"].weight
-
-                # Store raw loss tensors (unweighted) for dual-optimizer backward pass
-                loss_summary["magnitude_loss_raw"] = mse_result['magnitude']
-                loss_summary["sign_loss_raw"] = mse_result['sign']
-
-                # Store weighted losses for logging
-                loss_summary["magnitude_loss"] = magnitude_loss.item()
-                loss_summary["sign_loss"] = sign_loss.item()
-
-                # For backward compatibility, add both to total loss
-                mse_value = magnitude_loss + sign_loss
-            else:
-                # use_log=False: standard single MSE loss
-                mse_value = mse_result * self.loss_components["MSE"].weight
-
             total_loss += mse_value
             loss_summary["mse_loss"] = mse_value.item()
 
@@ -751,7 +731,7 @@ class ExponentialPINNLoss(nn.Module):
             total_loss += consistency_value
             loss_summary["consistency_loss"] = consistency_value.item()
 
-        loss_summary["total"] = total_loss.item() if torch.is_tensor(total_loss) else total_loss
+        loss_summary["total"] = total_loss.item()
 
         return total_loss, loss_summary
 
