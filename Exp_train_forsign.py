@@ -94,7 +94,7 @@ def prediction_performance(data_path, model_pt_path, model, normalizer, device, 
             # Forward pass
             outputs = model(inputs_modified)
             all_predictions.append(outputs.cpu().numpy())
-            all_targets.append(targets.numpy())
+            all_targets.append(targets.cpu().numpy())
 
     all_predictions = np.concatenate(all_predictions, axis=0)
     all_targets = np.concatenate(all_targets, axis=0)
@@ -174,23 +174,25 @@ def main():
     device = torch.device(f'cuda:{device_index}' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    model_save_path = 'exp_model_signnn_88_lr005.pt'
-    results_figure_folder = './exp_results_signnn_88_lr005'
+    model_save_path = 'exp_model_signnn_classres_64_32_16.pt'
+    results_figure_folder = './exp_results_signnn_classres_64_32_16'
 
     # Create the Exponential Sign NN model
-    model = ExponentialSignNN(hidden_dims=[8,8],
-                              activation='tanh').to(device)
+    # model = ExponentialSignNN_ver2(hidden_dims=[64, 32, 16],
+    #                                activation='relu').to(device)
+    model = ExponentialSignNN_ver3(hidden_dims=[64, 32, 16],
+                                   activation='relu').to(device)
 
-    # Configure losses - only SignMSE
+    # Configure losses - only SignBCE
     loss_config = {
-        "SignMSE": {"weight": 1.0}
+        "SignBCE": {"weight": 1.0}
     }
 
-    # Safety check: Ensure only SignMSE is configured
-    allowed_losses = {"SignMSE"}
+    # Safety check: Ensure only SignMSE or SignBCE is configured
+    allowed_losses = {"SignMSE", "SignBCE"}
     configured_losses = set(loss_config.keys())
     if not configured_losses.issubset(allowed_losses):
-        raise ValueError(f"Only SignMSE loss is supported. Found: {configured_losses}")
+        raise ValueError(f"Only SignMSE or SignBCE loss is supported. Found: {configured_losses}")
 
     loss_fn = ExponentialPINNLoss(model, loss_config)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
@@ -236,6 +238,10 @@ def main():
             loss_args = {}
             if loss_fn.has_loss("SignMSE"):
                 loss_args["SignMSE"] = (outputs, targets_modified)
+            if loss_fn.has_loss("SignBCE"):
+                # Get sigmoid probabilities stored by model
+                sigmoid_probs = model.last_sign_probs
+                loss_args["SignBCE"] = (sigmoid_probs, targets_modified)
 
             # Compute loss
             loss, loss_dict = loss_fn(loss_args)
@@ -313,6 +319,10 @@ def main():
                 loss_args = {}
                 if loss_fn.has_loss("SignMSE"):
                     loss_args["SignMSE"] = (outputs, targets_modified)
+                if loss_fn.has_loss("SignBCE"):
+                    # Get sigmoid probabilities stored by model
+                    sigmoid_probs = model.last_sign_probs
+                    loss_args["SignBCE"] = (sigmoid_probs, targets_modified)
 
                 # Compute loss
                 loss, loss_dict = loss_fn(loss_args)
@@ -390,6 +400,10 @@ def main():
             loss_args = {}
             if loss_fn.has_loss("SignMSE"):
                 loss_args["SignMSE"] = (outputs, targets_modified)
+            if loss_fn.has_loss("SignBCE"):
+                # Get sigmoid probabilities stored by model
+                sigmoid_probs = model.last_sign_probs
+                loss_args["SignBCE"] = (sigmoid_probs, targets_modified)
 
             # Compute loss
             loss, loss_dict = loss_fn(loss_args)
