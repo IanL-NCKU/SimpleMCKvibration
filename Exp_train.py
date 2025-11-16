@@ -66,7 +66,10 @@ def prediction_performance(data_path, model_pt_path, model, normalizer, device, 
     with torch.no_grad():
         for inputs, targets in test_loader:
             inputs = inputs.to(device)
-            outputs = model(inputs)
+            # Forward pass - returns (mag_preds, sign_pred) tuple
+            mag_preds, sign_pred = model(inputs)
+            # Reconstruct signed outputs
+            outputs = (mag_preds * sign_pred).detach()
             all_predictions.append(outputs.cpu().numpy())
             all_targets.append(targets.numpy())
 
@@ -249,21 +252,30 @@ def main():
             # Stack all inputs
             inputs_combined = torch.cat(inputs_list, dim=0)
 
-            # Forward pass
-            outputs_combined = model(inputs_combined)
+            # Forward pass - returns (mag_preds, sign_pred) tuple
+            mag_preds_combined, sign_pred_combined = model(inputs_combined)
 
             # Split outputs based on what was stacked
-            outputs = outputs_combined[:N]
+            mag_preds = mag_preds_combined[:N]
+            sign_pred = sign_pred_combined[:N]
+
+            # Reconstruct signed outputs for display/other losses
+            # DETACH to prevent gradient blending between magnitude and sign
+            outputs = (mag_preds * sign_pred).detach()
             idx = N
 
             if loss_fn.has_loss("Consistency") and loss_config["Consistency"]["type"] == "finite":
-                outputs_dt = outputs_combined[idx:idx+4*N]  # 4N samples: [t-2Δt, t-Δt, t+Δt, t+2Δt]
+                mag_preds_dt = mag_preds_combined[idx:idx+4*N]
+                sign_pred_dt = sign_pred_combined[idx:idx+4*N]
+                outputs_dt = (mag_preds_dt * sign_pred_dt).detach()
                 idx += 4*N
 
             # Prepare loss arguments
             loss_args = {}
             if loss_fn.has_loss("MSE"):
-                loss_args["MSE"] = (outputs, targets)
+                # Pass mag_preds, targets, and sigmoid_probs
+                sigmoid_probs = model.last_sign_probs
+                loss_args["MSE"] = (mag_preds, targets, sigmoid_probs)
             if loss_fn.has_loss("Residual"):
                 loss_args["Residual"] = (outputs, inputs_real)
             if loss_fn.has_loss("Consistency"):
@@ -292,7 +304,7 @@ def main():
             train_pbar.set_postfix({'loss': f'{loss.item():.4e}'})
 
         # Print the last output and last ground truth of the inputs and targets
-        print("Last batch outputs v.s targets:", outputs[-1].detach().cpu().numpy(), targets[-1].detach().cpu().numpy())
+        print("Last batch outputs v.s targets:", (mag_preds * sign_pred)[-1].detach().cpu().numpy(), targets[-1].detach().cpu().numpy())
 
         train_loss /= len(train_loader.dataset)
 
@@ -379,21 +391,29 @@ def main():
                 # Stack all inputs
                 inputs_combined = torch.cat(inputs_list, dim=0)
 
-                # Forward pass
-                outputs_combined = model(inputs_combined)
+                # Forward pass - returns (mag_preds, sign_pred) tuple
+                mag_preds_combined, sign_pred_combined = model(inputs_combined)
 
                 # Split outputs based on what was stacked
-                outputs = outputs_combined[:N]
+                mag_preds = mag_preds_combined[:N]
+                sign_pred = sign_pred_combined[:N]
+
+                # Reconstruct signed outputs - DETACH to prevent gradient blending
+                outputs = (mag_preds * sign_pred).detach()
                 idx = N
 
                 if loss_fn.has_loss("Consistency") and loss_config["Consistency"]["type"] == "finite":
-                    outputs_dt = outputs_combined[idx:idx+4*N]  # 4N samples: [t-2Δt, t-Δt, t+Δt, t+2Δt]
+                    mag_preds_dt = mag_preds_combined[idx:idx+4*N]
+                    sign_pred_dt = sign_pred_combined[idx:idx+4*N]
+                    outputs_dt = (mag_preds_dt * sign_pred_dt).detach()
                     idx += 4*N
 
                 # Prepare loss arguments
                 loss_args = {}
                 if loss_fn.has_loss("MSE"):
-                    loss_args["MSE"] = (outputs, targets)
+                    # Pass mag_preds, targets, and sigmoid_probs
+                    sigmoid_probs = model.last_sign_probs
+                    loss_args["MSE"] = (mag_preds, targets, sigmoid_probs)
                 if loss_fn.has_loss("Residual"):
                     loss_args["Residual"] = (outputs, inputs_real)
                 if loss_fn.has_loss("Consistency"):
@@ -533,15 +553,22 @@ def main():
             # Stack all inputs
             inputs_combined = torch.cat(inputs_list, dim=0)
 
-            # Forward pass
-            outputs_combined = model(inputs_combined)
+            # Forward pass - returns (mag_preds, sign_pred) tuple
+            mag_preds_combined, sign_pred_combined = model(inputs_combined)
 
             # Split outputs based on what was stacked
-            outputs = outputs_combined[:N]
+            mag_preds = mag_preds_combined[:N]
+            sign_pred = sign_pred_combined[:N]
+
+            # Reconstruct signed outputs for display/other losses
+            # DETACH to prevent gradient blending between magnitude and sign
+            outputs = (mag_preds * sign_pred).detach()
             idx = N
 
             if loss_fn.has_loss("Consistency") and loss_config["Consistency"]["type"] == "finite":
-                outputs_dt = outputs_combined[idx:idx+4*N]  # 4N samples: [t-2Δt, t-Δt, t+Δt, t+2Δt]
+                mag_preds_dt = mag_preds_combined[idx:idx+4*N]
+                sign_pred_dt = sign_pred_combined[idx:idx+4*N]
+                outputs_dt = (mag_preds_dt * sign_pred_dt).detach()  # 4N samples: [t-2Δt, t-Δt, t+Δt, t+2Δt]
                 idx += 4*N
 
             # Prepare norm_params for test (use test_inputs_normalizer)
@@ -550,7 +577,9 @@ def main():
             # Prepare loss arguments
             loss_args = {}
             if loss_fn.has_loss("MSE"):
-                loss_args["MSE"] = (outputs, targets)
+                # Pass mag_preds, targets, and sigmoid_probs
+                sigmoid_probs = model.last_sign_probs
+                loss_args["MSE"] = (mag_preds, targets, sigmoid_probs)
             if loss_fn.has_loss("Residual"):
                 loss_args["Residual"] = (outputs, inputs_real)
             if loss_fn.has_loss("Consistency"):

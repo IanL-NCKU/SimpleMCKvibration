@@ -477,18 +477,17 @@ class ExponentialPINN_ver2(nn.Module):
 
         # Step 3: Apply sign network - FINAL STEP (always enabled)
         # Prepare input: concatenate [a, b, t] + current magnitude predictions
-        current_preds = torch.cat([x_pred, v_pred, a_pred], dim=1)
-        sign_input = torch.cat([x, current_preds.detach()], dim=1)  # Shape: [batch, 6]
+        mag_preds = torch.cat([x_pred, v_pred, a_pred], dim=1)
+        sign_input = torch.cat([x, mag_preds.detach()], dim=1)  # Shape: [batch, 6]
 
-        # Get signed predictions from ExponentialSignNN_ver3
-        signed_output =current_preds *self.sign_network(sign_input)
-        # signed_output =current_preds #*self.sign_network(sign_input)
-        # signed_output = self.sign_network(sign_input)
+        # Get sign predictions from ExponentialSignNN_ver3
+        sign_pred = self.sign_network(sign_input)
 
         # Store sigmoid probabilities for BCE loss computation
         self.last_sign_probs = self.sign_network.last_sign_probs
 
-        return signed_output
+        # Return magnitude and sign predictions separately
+        return mag_preds, sign_pred
 
 
 
@@ -541,6 +540,7 @@ class MSELoss(BaseLossComponent):
 
         if self.use_log:
             # Compute magnitude loss (log-space MSE)
+            # predictions are already mag_preds (positive magnitudes, no abs needed)
             log_predictions = torch.log(torch.abs(predictions) + eps)
             log_targets = torch.log(torch.abs(targets) + eps)
 
@@ -552,13 +552,14 @@ class MSELoss(BaseLossComponent):
                 magnitude_loss = torch.mean((log_predictions - log_targets) ** 2)
 
             # Compute sign BCE loss using SignBCELoss class
+            # inputs contains sigmoid_probs (model.last_sign_probs)
             sign_bce_value = 0.0
             if self.sign_bce_loss is not None and inputs is not None:
-                # Use SignBCELoss class to compute the loss
-                sign_bce_value = self.sign_bce_loss(predictions, targets, inputs, norm_params, inputs_real)
+                sigmoid_probs = inputs  # This is last_sign_probs passed from training loop
+                sign_bce_value = self.sign_bce_loss(None, targets, sigmoid_probs, None, None)
 
             # Combine magnitude and sign losses
-            loss =  sign_bce_value  +magnitude_loss
+            loss = sign_bce_value + magnitude_loss
         else:
             # Standard MSE (not log-space)
             if self.use_relative:
@@ -939,7 +940,9 @@ class ExponentialPINNLoss(nn.Module):
         # In training loop, prepare arguments for enabled losses
         loss_args = {}
         if loss_fn.has_loss("MSE"):
-            loss_args["MSE"] = (outputs, targets)
+            # Pass mag_preds, targets, and sigmoid_probs
+            sigmoid_probs = model.last_sign_probs
+            loss_args["MSE"] = (mag_preds, targets, sigmoid_probs)
         if loss_fn.has_loss("Residual"):
             loss_args["Residual"] = (outputs, inputs_real)
         if loss_fn.has_loss("Consistency"):
@@ -1015,7 +1018,7 @@ class ExponentialPINNLoss(nn.Module):
         Args:
             loss_args: Dictionary with loss arguments
                 {
-                    "MSE": (outputs, targets),
+                    "MSE": (mag_preds, targets, sigmoid_probs),
                     "Residual": (outputs, inputs_real),
                     "Consistency": (inputs, inputs_real, norm_params)
                 }
@@ -1029,11 +1032,10 @@ class ExponentialPINNLoss(nn.Module):
 
         # MSE Loss
         if "MSE" in self.loss_components and "MSE" in loss_args:
-            outputs, targets = loss_args["MSE"]
-            # Get sigmoid probabilities from model for sign BCE loss
-            sigmoid_probs = self.model.last_sign_probs if hasattr(self.model, 'last_sign_probs') else None
+            # Unpack 3 arguments: (mag_preds, targets, sigmoid_probs)
+            mag_preds, targets, sigmoid_probs = loss_args["MSE"]
             mse_value = self.loss_components["MSE"](
-                outputs, targets, sigmoid_probs, None, None
+                mag_preds, targets, sigmoid_probs, None, None
             )
             total_loss += mse_value
             loss_summary["mse_loss"] = mse_value.item()
