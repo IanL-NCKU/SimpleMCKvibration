@@ -3,6 +3,189 @@ import torch.nn as nn
 import numpy as np
 from abc import ABC, abstractmethod
 
+
+class ResidualBlock(nn.Module):
+    """Residual block with two linear layers and skip connection
+
+    Architecture: x → fc1 → act → BN → dropout → fc2 → BN → dropout → (+shortcut) → act
+    """
+
+    def __init__(self, in_dim, mid_dim, out_dim, activation, dropout=0.3):
+        super().__init__()
+
+        # First layer: in_dim → mid_dim
+        self.fc1 = nn.Linear(in_dim, mid_dim)
+        self.act1 = activation()
+        self.bn1 = nn.BatchNorm1d(mid_dim)
+        self.dropout1 = nn.Dropout(dropout)
+
+        # Second layer: mid_dim → out_dim
+        self.fc2 = nn.Linear(mid_dim, out_dim)
+        self.bn2 = nn.BatchNorm1d(out_dim)
+        self.dropout2 = nn.Dropout(dropout)
+
+        # Shortcut connection: in_dim → out_dim
+        if in_dim != out_dim:
+            self.shortcut = nn.Linear(in_dim, out_dim)
+        else:
+            self.shortcut = nn.Identity()
+
+        # Activation after residual addition
+        self.act2 = activation()
+
+    def forward(self, x):
+        # Main path
+        out = self.fc1(x)
+        out = self.act1(out)
+        out = self.bn1(out)
+        out = self.dropout1(out)
+
+        out = self.fc2(out)
+        out = self.bn2(out)
+        out = self.dropout2(out)
+
+        # Shortcut path
+        shortcut = self.shortcut(x)
+
+        # Residual addition
+        out = out + shortcut
+        out = self.act2(out)
+
+        return out
+
+
+class ExponentialSignNN_ver3(nn.Module):
+    """Binary Classification Network with Residual Connections
+
+    Adds residual blocks to ExponentialSignNN_ver2 architecture.
+    - If hidden_dims has <= 2 layers: No residual connections (simple sequential)
+    - If hidden_dims has > 2 layers: Group layers in pairs for residual blocks
+
+    Uses sigmoid outputs and BCE loss for sign classification.
+    """
+
+    def __init__(self, hidden_dims=[128, 64, 32], activation='relu', dropout=0.3):
+        super().__init__()
+
+        # Choose activation function
+        if activation == 'tanh':
+            act = nn.Tanh
+        elif activation == 'elu':
+            act = nn.ELU
+        elif activation == 'relu':
+            act = nn.ReLU
+        else:
+            act = nn.ReLU
+
+        input_dim = 6  # [a, b, t, noisy_mag_x, noisy_mag_v, noisy_mag_a]
+
+        # Decide whether to use residual blocks
+        if len(hidden_dims) <= 2:
+            # Simple sequential layers (no residual)
+            self.use_residual = False
+            layers = []
+            for hidden_dim in hidden_dims:
+                layers.append(nn.Linear(input_dim, hidden_dim))
+                layers.append(act())
+                layers.append(nn.BatchNorm1d(hidden_dim))
+                layers.append(nn.Dropout(dropout))
+                input_dim = hidden_dim
+            self.shared_layers = nn.Sequential(*layers)
+        else:
+            # Build residual blocks
+            self.use_residual = True
+            self.blocks = nn.ModuleList()
+
+            # Pair up hidden_dims for residual blocks
+            # Example: [128, 64, 32] → pairs: [(6,128,64)], remaining: [32]
+            # Example: [128, 64, 32, 16] → pairs: [(6,128,64), (64,32,16)]
+            dims = [input_dim] + hidden_dims
+            i = 0
+            while i + 2 < len(dims):
+                # Create residual block for dims[i] → dims[i+1] → dims[i+2]
+                block = ResidualBlock(dims[i], dims[i+1], dims[i+2], act, dropout)
+                self.blocks.append(block)
+                i += 2
+
+            # Handle remaining layer if odd number
+            if i + 1 < len(dims):
+                # Add simple layer: dims[i] → dims[i+1]
+                remaining_layer = nn.Sequential(
+                    nn.Linear(dims[i], dims[i+1]),
+                    act(),
+                    nn.BatchNorm1d(dims[i+1]),
+                    nn.Dropout(dropout)
+                )
+                self.blocks.append(remaining_layer)
+                input_dim = dims[i+1]
+            else:
+                input_dim = dims[i]
+
+        # Output heads (one for each of the 3 outputs)
+        num_outputs = 3
+        self.output_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(input_dim, 16),
+                act(),
+                nn.Linear(16, 1),
+                nn.Sigmoid()
+            )
+            for _ in range(num_outputs)
+        ])
+
+        # Initialize weights
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_normal_(m.weight)
+            nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (batch_size, 6)
+               [a, b, t, (1+0.05*r)*abs(x_t), (1+0.05*r)*abs(v_t), (1+0.05*r)*abs(a_t)]
+
+        Returns:
+            predictions: Output tensor of shape (batch_size, 3)
+                        Reconstructed signed values: sign_from_probs * input_magnitudes
+        """
+        # Save original input to extract magnitudes later
+        original_input = x
+
+        # Shared feature extraction
+        if self.use_residual:
+            # Pass through residual blocks
+            for block in self.blocks:
+                x = block(x)
+            shared_features = x
+        else:
+            # Pass through sequential layers
+            shared_features = self.shared_layers(x)
+
+        # Three independent binary classifiers (sigmoid outputs in [0, 1])
+        outputs = [head(shared_features) for head in self.output_heads]
+
+        # Concatenate to [batch_size, 3]
+        probs = torch.cat(outputs, dim=1)
+
+        # Store probabilities for loss computation
+        self.last_sign_probs = probs
+
+        # Convert probabilities to signs: [0, 1] -> [-1, 1]
+        signs = 2 * probs - 1
+
+        # Extract input magnitudes from original input (last 3 features)
+        input_magnitudes = original_input[:, 3:]  # Shape: (batch_size, 3)
+
+
+        predictions = signs #* input_magnitudes
+        
+        return predictions
+
+
+
 class ExponentialPINN(nn.Module):
     """Physics-Informed Neural Network for exponential function: x(t) = b * exp(a*t)"""
 
@@ -162,34 +345,151 @@ class ExponentialPINN(nn.Module):
 
         return torch.cat([x_pred, v_pred, a_pred], dim=1)
 
-    @staticmethod
-    def convert_targets_to_log_space(targets, eps=1e-10):
-        """
-        Convert real-space targets [x, v, a] to log-space [sign_x, log_x, sign_v, log_v, sign_a, log_a]
 
+class ExponentialPINN_ver2(nn.Module):
+    """Physics-Informed Neural Network for exponential function: x(t) = b * exp(a*t)"""
+
+    def __init__(self, hidden_dims=[64, 128, 128, 64], activation='tanh', use_log_output=False,
+                 use_finetune=False, finetune_hidden_dims=[32, 32], finetune_scale=0.1,
+                 sign_network_hidden_dims=[128, 64, 32], sign_network_dropout=0.3):
+        super().__init__()
+
+        self.use_log_output = use_log_output
+        self.use_finetune = use_finetune
+        self.finetune_scale = finetune_scale
+        self.last_sign_probs = None
+
+        # Choose activation function
+        if activation == 'tanh':
+            act = nn.Tanh
+        elif activation == 'swish':
+            act = nn.SiLU
+        elif activation == 'ELU':
+            act = nn.ELU
+        elif activation == 'relu':
+            act = nn.ReLU
+        else:
+            act = nn.GELU
+
+        # Build main network
+        layers = []
+        input_dim = 3  # [a, b, t]
+
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(input_dim, hidden_dim))
+            layers.append(act())
+            input_dim = hidden_dim
+
+        # Final layer output dimension
+        if use_log_output:
+            layers.append(nn.Linear(input_dim, 6))  # [sign_x, log_x, sign_v, log_v, sign_a, log_a]
+        else:
+            layers.append(nn.Linear(input_dim, 3))  # [x_t, v_t, a_t]
+
+        # Add softplus to ensure positive outputs (magnitudes)
+        layers.append(nn.Softplus())
+        self.network = nn.Sequential(*layers)
+
+        # Build fine-tune network (if enabled)
+        if self.use_finetune:
+            finetune_layers = []
+            finetune_input_dim = 6  # [a, b, t, x_base, v_base, a_base]
+
+            for hidden_dim in finetune_hidden_dims:
+                finetune_layers.append(nn.Linear(finetune_input_dim, hidden_dim))
+                finetune_layers.append(act())
+                finetune_input_dim = hidden_dim
+
+            finetune_layers.append(nn.Linear(finetune_input_dim, 3))
+            finetune_layers.append(nn.Softplus())
+
+            self.finetune_network = nn.Sequential(*finetune_layers)
+        else:
+            self.finetune_network = None
+
+        # Build sign network (always enabled with ExponentialSignNN_ver3)
+        self.sign_network = ExponentialSignNN_ver3(
+            hidden_dims=sign_network_hidden_dims,
+            activation=activation,
+            dropout=sign_network_dropout
+        )
+
+        # Initialize weights
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_normal_(m.weight)
+            nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        """
         Args:
-            targets: (batch_size, 3) - [x, v, a] in real space
-            eps: Small value to avoid log(0)
+            x: Input tensor of shape (batch_size, 3)
+               [a, b, t]
 
         Returns:
-            log_targets: (batch_size, 6) - [sign_x, log_x, sign_v, log_v, sign_a, log_a]
+            predictions: Output tensor of shape (batch_size, 3)
+                        [x_t, v_t, a_t] in real space
         """
-        # Extract signs (convert to -1 or +1)
-        signs = torch.sign(targets)
-        signs = torch.where(signs == 0, torch.ones_like(signs), signs)  # Replace 0 with 1
+        output = self.network(x)
 
-        # Compute log magnitudes
-        magnitudes = torch.abs(targets) + eps
-        log_magnitudes = torch.log10(magnitudes)
+        # Step 1: Convert network output to real space (base predictions)
+        if self.use_log_output:
+            # Network outputs: [sign_x, log_x, sign_v, log_v, sign_a, log_a]
 
-        # Interleave signs and log magnitudes
-        log_targets = torch.stack([
-            signs[:, 0], log_magnitudes[:, 0],  # x
-            signs[:, 1], log_magnitudes[:, 1],  # v
-            signs[:, 2], log_magnitudes[:, 2],  # a
-        ], dim=1)
+            # Extract sign and log magnitude
+            sign_x = torch.tanh(output[:, 0:1])
+            log_x = output[:, 1:2]
+            sign_v = torch.tanh(output[:, 2:3])
+            log_v = output[:, 3:4]
+            sign_a = torch.tanh(output[:, 4:5])
+            log_a = output[:, 5:6]
 
-        return log_targets
+            # Transform to real space: x = sign * 10^log = sign * exp(log * ln(10))
+            ln10 = np.log(10.0)  # Python float, PyTorch handles device automatically
+            x_pred_base = sign_x * torch.exp(log_x * ln10)
+            v_pred_base = sign_v * torch.exp(log_v * ln10)
+            a_pred_base = sign_a * torch.exp(log_a * ln10)
+        else:
+            # Network outputs directly in real space: [x_t, v_t, a_t]
+            x_pred_base = output[:, 0:1]
+            v_pred_base = output[:, 1:2]
+            a_pred_base = output[:, 2:3]
+
+        # Step 2: Apply fine-tuning (independent of log_output setting)
+        if self.use_finetune:
+            # Ensure concatenation doesn't break gradient flow
+            base_preds = torch.cat([x_pred_base, v_pred_base, a_pred_base], dim=1)
+            finetune_input = torch.cat([x, base_preds], dim=1)
+
+            finetune_raw = self.finetune_network(finetune_input)
+            finetune_corrections = self.finetune_scale * finetune_raw
+
+            # Apply multiplicative correction
+            x_pred = x_pred_base * (1 + finetune_corrections[:, 0:1])
+            v_pred = v_pred_base * (1 + finetune_corrections[:, 1:2])
+            a_pred = a_pred_base * (1 + finetune_corrections[:, 2:3])
+        else:
+            x_pred = x_pred_base
+            v_pred = v_pred_base
+            a_pred = a_pred_base
+
+        # Step 3: Apply sign network - FINAL STEP (always enabled)
+        # Prepare input: concatenate [a, b, t] + current magnitude predictions
+        current_preds = torch.cat([x_pred, v_pred, a_pred], dim=1)
+        sign_input = torch.cat([x, current_preds.detach()], dim=1)  # Shape: [batch, 6]
+
+        # Get signed predictions from ExponentialSignNN_ver3
+        signed_output =current_preds *self.sign_network(sign_input)
+        # signed_output =current_preds #*self.sign_network(sign_input)
+        # signed_output = self.sign_network(sign_input)
+
+        # Store sigmoid probabilities for BCE loss computation
+        self.last_sign_probs = self.sign_network.last_sign_probs
+
+        return signed_output
+
 
 
 class BaseLossComponent(ABC, nn.Module):
@@ -219,10 +519,12 @@ class BaseLossComponent(ABC, nn.Module):
 class MSELoss(BaseLossComponent):
     """Mean Squared Error loss between predictions and targets"""
 
-    def __init__(self, weight=1.0, use_relative=False, use_log=False):
+    def __init__(self, weight=1.0, use_relative=False, use_log=False, sign_bce_weight=1.0):
         super().__init__(weight=weight, name="MSE Loss")
         self.use_relative = use_relative
         self.use_log = use_log
+        # Create SignBCELoss instance for sign loss computation
+        self.sign_bce_loss = SignBCELoss(weight=sign_bce_weight) if sign_bce_weight > 0 else None
 
     def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None):
         """
@@ -249,17 +551,14 @@ class MSELoss(BaseLossComponent):
                 # Absolute log-space MSE for magnitudes
                 magnitude_loss = torch.mean((log_predictions - log_targets) ** 2)
 
-            # Compute sign MSE loss (compatible with soft signs)
-            # Normalize predictions to get sign direction
-            # target_signs = torch.sign(targets).float()  # Shape: [batch, 3], values: -1, 0, +1
-            # pred_signs = predictions / (torch.abs(predictions) + eps)  # Normalize to [-1, 1]
-            # sign_mse_loss = torch.mean((pred_signs - target_signs) ** 2)
+            # Compute sign BCE loss using SignBCELoss class
+            sign_bce_value = 0.0
+            if self.sign_bce_loss is not None and inputs is not None:
+                # Use SignBCELoss class to compute the loss
+                sign_bce_value = self.sign_bce_loss(predictions, targets, inputs, norm_params, inputs_real)
 
             # Combine magnitude and sign losses
-            relative_meanloss =torch.log10(torch.mean(((predictions - torch.abs(targets)) ** 2) / (torch.abs(targets)**2 + eps)))
-            if relative_meanloss<0:
-                relative_meanloss= 1/(torch.abs(relative_meanloss) + eps)
-            loss = magnitude_loss #+ relative_meanloss#+ sign_mse_loss
+            loss =  sign_bce_value  +magnitude_loss
         else:
             # Standard MSE (not log-space)
             if self.use_relative:
@@ -270,6 +569,43 @@ class MSELoss(BaseLossComponent):
                 loss = torch.mean((predictions - targets) ** 2)
 
         return loss
+
+
+class SignBCELoss(BaseLossComponent):
+    """Sign BCE loss - uses binary cross entropy for sign classification"""
+
+    def __init__(self, weight=1.0):
+        super().__init__(weight=weight, name="Sign BCE Loss")
+        self.criterion = nn.BCELoss()
+
+    def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None):
+        """
+        Compute sign BCE between sigmoid probabilities and target signs
+
+        Args:
+            predictions: Not used (placeholder for signature compatibility)
+            targets: (batch_size, num_outputs) - Target signed values
+            inputs: (batch_size, num_outputs) - Sigmoid probabilities from model.last_sign_probs
+
+        Returns:
+            loss: Scalar tensor - Sum of BCE losses for all outputs
+        """
+        # Get sigmoid probabilities (stored by model during forward pass)
+        sigmoid_probs = inputs  # Shape: [batch, num_outputs], values in [0, 1]
+
+        # Convert target signs to binary labels: {-1, +1} -> {0, 1}
+        # Zeros are treated as positive (label=1.0)
+        target_signs = torch.sign(targets).float()  # Shape: [batch, num_outputs], values: -1, 0, +1
+        labels = (target_signs >= 0).float()  # Shape: [batch, num_outputs], values: 0 or 1
+
+        # Compute BCE for each output and sum
+        num_outputs = sigmoid_probs.shape[1]
+        total_bce_loss = sum(
+            self.criterion(sigmoid_probs[:, i], labels[:, i])
+            for i in range(num_outputs)
+        )
+
+        return total_bce_loss
 
 
 class ExponentialResidualLoss(BaseLossComponent):
@@ -626,7 +962,8 @@ class ExponentialPINNLoss(nn.Module):
             use_relative = config.get("use_relative", False)
             use_log = config.get("use_log", False)
             weight = config.get("weight", 1.0)
-            self.loss_components["MSE"] = MSELoss(weight=weight, use_relative=use_relative, use_log=use_log)
+            sign_bce_weight = config.get("sign_bce_weight", 1.0)
+            self.loss_components["MSE"] = MSELoss(weight=weight, use_relative=use_relative, use_log=use_log, sign_bce_weight=sign_bce_weight)
 
         # Initialize Residual loss if requested
         if self._should_enable("Residual"):
@@ -693,8 +1030,10 @@ class ExponentialPINNLoss(nn.Module):
         # MSE Loss
         if "MSE" in self.loss_components and "MSE" in loss_args:
             outputs, targets = loss_args["MSE"]
+            # Get sigmoid probabilities from model for sign BCE loss
+            sigmoid_probs = self.model.last_sign_probs if hasattr(self.model, 'last_sign_probs') else None
             mse_value = self.loss_components["MSE"](
-                outputs, targets, None, None, None
+                outputs, targets, sigmoid_probs, None, None
             )
             total_loss += mse_value
             loss_summary["mse_loss"] = mse_value.item()

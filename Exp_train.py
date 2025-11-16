@@ -148,22 +148,31 @@ def main():
     device = torch.device(f'cuda:{device_index}' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    model_save_path = 'exp_model_relu_signmodel4.pt'
-    results_figure_folder = './exp_results_relu_signmodel4'
+    model_save_path = 'exp_model_relu_newsignmodel.pt'
+    results_figure_folder = './exp_results_relu_newsignmodel'
 
     # Create the Exponential PINN model
-    model = ExponentialPINN(hidden_dims=[16, 32, 32, 64, 32, 32, 16],
+    model = ExponentialPINN_ver2(hidden_dims=[16, 32, 32, 64, 32, 32, 16],
                           activation='relu',
                           use_log_output=False,
                           use_finetune=True,
                           finetune_hidden_dims=[16, 32, 64, 32, 16],
                           finetune_scale=1,
-                          use_sign_network=False,
-                          sign_network_hidden_dims=[16, 32, 32, 16]).to(device)
+                          sign_network_hidden_dims=[64, 32, 16],
+                          sign_network_dropout=0.3).to(device)
+
+    # model = ExponentialPINN(hidden_dims=[16, 32, 32, 64, 32, 32, 16],
+    #                       activation='relu',
+    #                       use_log_output=False,
+    #                       use_finetune=True,
+    #                       finetune_hidden_dims=[16, 32, 64, 32, 16],
+    #                       finetune_scale=1,
+    #                       use_sign_network=False,
+    #                       sign_network_hidden_dims=[16, 32, 32, 16]).to(device)
 
     # Configure losses
     loss_config = {
-        "MSE": {"weight": 1.0, "use_relative": False, "use_log": True},
+        "MSE": {"weight": 1.0, "use_relative": False, "use_log": True, "sign_bce_weight": 1.0},
         "Residual": {"weight": 0.0, "use_relative": True},
         "Consistency": {"weight": 0.0, "t_threshold": 1e-5, "type": "auto", "use_relative": True, "use_log": False}
     }
