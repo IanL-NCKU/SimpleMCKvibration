@@ -38,7 +38,7 @@ def log_training_results(log_dict, results_folder='./results', filename='trainin
     return log_path
 
 
-def prediction_performance(data_path, model_pt_path, model, normalizer, device, data_sampling_step=1, figure_folder='./figures'):
+def prediction_performance(data_path, model_pt_path, model, normalizer, device, dtype=torch.float32, data_sampling_step=1, figure_folder='./figures'):
     """Generate prediction performance scatter plots."""
     print(f"\n{'='*60}")
     print("Generating Prediction Performance Plots")
@@ -65,7 +65,7 @@ def prediction_performance(data_path, model_pt_path, model, normalizer, device, 
 
     with torch.no_grad():
         for inputs, targets in test_loader:
-            inputs = inputs.to(device)
+            inputs = inputs.to(device, dtype=dtype)
             # Forward pass - returns (mag_preds, sign_pred) tuple
             mag_preds, sign_pred = model(inputs)
             # Reconstruct signed outputs
@@ -123,6 +123,7 @@ def prediction_performance(data_path, model_pt_path, model, normalizer, device, 
 
 def main():
     device_index = 0
+    train_in_64 = True
     epochs = 200
 
     # Data paths
@@ -151,17 +152,26 @@ def main():
     device = torch.device(f'cuda:{device_index}' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    model_save_path = 'exp_model_relu_newsignmodel.pt'
-    results_figure_folder = './exp_results_relu_newsignmodel'
+    # Setup float64 training if requested
+    if train_in_64:
+        torch.set_default_dtype(torch.float64)
+        dtype = torch.float64
+        print("Training in float64 (double precision) mode")
+    else:
+        dtype = torch.float32
+        print("Training in float32 (single precision) mode")
+
+    model_save_path = 'exp_model_elu_newsignmodel64.pt'
+    results_figure_folder = './exp_results_elu_newsignmodel64'
 
     # Create the Exponential PINN model
-    model = ExponentialPINN_ver2(hidden_dims=[16, 32, 32, 64, 32, 32, 16],
-                          activation='relu',
+    model = ExponentialPINN_ver2(hidden_dims=[16, 32, 64, 128, 64, 32, 16],
+                          activation='elu',
                           use_log_output=False,
                           use_finetune=True,
-                          finetune_hidden_dims=[16, 32, 64, 32, 16],
+                          finetune_hidden_dims=[16, 32, 32, 16],
                           finetune_scale=1,
-                          sign_network_hidden_dims=[64, 32, 16],
+                          sign_network_hidden_dims=[128, 64, 32, 16],
                           sign_network_dropout=0.3).to(device)
 
     # model = ExponentialPINN(hidden_dims=[16, 32, 32, 64, 32, 32, 16],
@@ -182,7 +192,7 @@ def main():
 
     loss_fn = ExponentialPINNLoss(model, loss_config)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
-    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=np.max([epochs//20,1]), eta_min=1e-12)
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=np.max([epochs//10,1]), eta_min=1e-12)
 
     # Prepare norm_params for consistency loss
     norm_params = {'normalizer': train_val_inputs_normalizer}
@@ -200,8 +210,8 @@ def main():
         # Training progress bar
         train_pbar = tqdm(train_loader, desc=f"Training", leave=False)
         for inputs, targets in train_pbar:
-            # Move data to device
-            inputs, targets = inputs.to(device), targets.to(device)
+            # Move data to device and convert to proper dtype
+            inputs, targets = inputs.to(device, dtype=dtype), targets.to(device, dtype=dtype)
 
             optimizer.zero_grad()
 
@@ -222,28 +232,28 @@ def main():
                 inputs_t_minus_minus_real = inputs_real.clone()
                 inputs_t_minus_minus_real[:, 2] = inputs_real[:, 2] - 2 * t_threshold
                 if train_val_inputs_normalizer is not None:
-                    inputs_t_minus_minus = torch.FloatTensor(train_val_inputs_normalizer.normalize_inputs(inputs_t_minus_minus_real.cpu().numpy())).to(device)
+                    inputs_t_minus_minus = torch.tensor(train_val_inputs_normalizer.normalize_inputs(inputs_t_minus_minus_real.cpu().numpy()), dtype=dtype, device=device)
                 else:
                     inputs_t_minus_minus = inputs_t_minus_minus_real
 
                 inputs_t_minus_real = inputs_real.clone()
                 inputs_t_minus_real[:, 2] = inputs_real[:, 2] - t_threshold
                 if train_val_inputs_normalizer is not None:
-                    inputs_t_minus = torch.FloatTensor(train_val_inputs_normalizer.normalize_inputs(inputs_t_minus_real.cpu().numpy())).to(device)
+                    inputs_t_minus = torch.tensor(train_val_inputs_normalizer.normalize_inputs(inputs_t_minus_real.cpu().numpy()), dtype=dtype, device=device)
                 else:
                     inputs_t_minus = inputs_t_minus_real
 
                 inputs_t_plus_real = inputs_real.clone()
                 inputs_t_plus_real[:, 2] = inputs_real[:, 2] + t_threshold
                 if train_val_inputs_normalizer is not None:
-                    inputs_t_plus = torch.FloatTensor(train_val_inputs_normalizer.normalize_inputs(inputs_t_plus_real.cpu().numpy())).to(device)
+                    inputs_t_plus = torch.tensor(train_val_inputs_normalizer.normalize_inputs(inputs_t_plus_real.cpu().numpy()), dtype=dtype, device=device)
                 else:
                     inputs_t_plus = inputs_t_plus_real
 
                 inputs_t_plus_plus_real = inputs_real.clone()
                 inputs_t_plus_plus_real[:, 2] = inputs_real[:, 2] + 2 * t_threshold
                 if train_val_inputs_normalizer is not None:
-                    inputs_t_plus_plus = torch.FloatTensor(train_val_inputs_normalizer.normalize_inputs(inputs_t_plus_plus_real.cpu().numpy())).to(device)
+                    inputs_t_plus_plus = torch.tensor(train_val_inputs_normalizer.normalize_inputs(inputs_t_plus_plus_real.cpu().numpy()), dtype=dtype, device=device)
                 else:
                     inputs_t_plus_plus = inputs_t_plus_plus_real
 
@@ -341,8 +351,8 @@ def main():
             # Validation progress bar
             val_pbar = tqdm(val_loader, desc=f"Validation", leave=False)
             for inputs, targets in val_pbar:
-                # Move data to device
-                inputs, targets = inputs.to(device), targets.to(device)
+                # Move data to device and convert to proper dtype
+                inputs, targets = inputs.to(device, dtype=dtype), targets.to(device, dtype=dtype)
 
                 # Denormalize inputs for loss calculation (if normalizer exists)
                 if train_val_inputs_normalizer is not None:
@@ -361,28 +371,28 @@ def main():
                     inputs_t_minus_minus_real = inputs_real.clone()
                     inputs_t_minus_minus_real[:, 2] = inputs_real[:, 2] - 2 * t_threshold
                     if train_val_inputs_normalizer is not None:
-                        inputs_t_minus_minus = torch.FloatTensor(train_val_inputs_normalizer.normalize_inputs(inputs_t_minus_minus_real.cpu().numpy())).to(device)
+                        inputs_t_minus_minus = torch.tensor(train_val_inputs_normalizer.normalize_inputs(inputs_t_minus_minus_real.cpu().numpy()), dtype=dtype, device=device)
                     else:
                         inputs_t_minus_minus = inputs_t_minus_minus_real
 
                     inputs_t_minus_real = inputs_real.clone()
                     inputs_t_minus_real[:, 2] = inputs_real[:, 2] - t_threshold
                     if train_val_inputs_normalizer is not None:
-                        inputs_t_minus = torch.FloatTensor(train_val_inputs_normalizer.normalize_inputs(inputs_t_minus_real.cpu().numpy())).to(device)
+                        inputs_t_minus = torch.tensor(train_val_inputs_normalizer.normalize_inputs(inputs_t_minus_real.cpu().numpy()), dtype=dtype, device=device)
                     else:
                         inputs_t_minus = inputs_t_minus_real
 
                     inputs_t_plus_real = inputs_real.clone()
                     inputs_t_plus_real[:, 2] = inputs_real[:, 2] + t_threshold
                     if train_val_inputs_normalizer is not None:
-                        inputs_t_plus = torch.FloatTensor(train_val_inputs_normalizer.normalize_inputs(inputs_t_plus_real.cpu().numpy())).to(device)
+                        inputs_t_plus = torch.tensor(train_val_inputs_normalizer.normalize_inputs(inputs_t_plus_real.cpu().numpy()), dtype=dtype, device=device)
                     else:
                         inputs_t_plus = inputs_t_plus_real
 
                     inputs_t_plus_plus_real = inputs_real.clone()
                     inputs_t_plus_plus_real[:, 2] = inputs_real[:, 2] + 2 * t_threshold
                     if train_val_inputs_normalizer is not None:
-                        inputs_t_plus_plus = torch.FloatTensor(train_val_inputs_normalizer.normalize_inputs(inputs_t_plus_plus_real.cpu().numpy())).to(device)
+                        inputs_t_plus_plus = torch.tensor(train_val_inputs_normalizer.normalize_inputs(inputs_t_plus_plus_real.cpu().numpy()), dtype=dtype, device=device)
                     else:
                         inputs_t_plus_plus = inputs_t_plus_plus_real
 
@@ -450,20 +460,68 @@ def main():
         # Print epoch summary
         print(f"Epoch [{epoch+1}/{epochs}] -Model name: {os.path.basename(model_save_path)}  Train Loss: {train_loss:.4e}, Val Loss: {val_loss:.4e}")
 
-        # Build train loss breakdown string
+        # Build train loss breakdown string with MSE components grouped
         train_total = train_loss_components.get('total', train_loss)
         train_parts = []
+
+        # Handle MSE loss and its components specially
+        if 'mse_loss' in train_loss_components:
+            mse_value = train_loss_components['mse_loss']
+            mse_ratio = (mse_value / train_total * 100) if train_total > 0 else 0
+            mse_str = f"mse_loss: {mse_value:.4e} ({mse_ratio:.2f}%)"
+
+            # Check if we have magnitude and sign components
+            mse_components = []
+            if 'magnitude_loss' in train_loss_components:
+                mag_value = train_loss_components['magnitude_loss']
+                mag_ratio = (mag_value / mse_value * 100) if mse_value > 0 else 0
+                mse_components.append(f"magnitude_loss: {mag_value:.4e} ({mag_ratio:.2f}%)")
+            if 'sign_bce_loss' in train_loss_components:
+                sign_value = train_loss_components['sign_bce_loss']
+                sign_ratio = (sign_value / mse_value * 100) if mse_value > 0 else 0
+                mse_components.append(f"sign_bce_loss: {sign_value:.4e} ({sign_ratio:.2f}%)")
+
+            # Add MSE with components in brackets if they exist
+            if mse_components:
+                mse_str += f" [{' | '.join(mse_components)}]"
+            train_parts.append(mse_str)
+
+        # Add other losses (excluding mse_loss, magnitude_loss, sign_bce_loss, total)
         for key in sorted(train_loss_components.keys()):
-            if key != 'total':
+            if key not in ['total', 'mse_loss', 'magnitude_loss', 'sign_bce_loss']:
                 value = train_loss_components[key]
                 ratio = (value / train_total * 100) if train_total > 0 else 0
                 train_parts.append(f"{key}: {value:.4e} ({ratio:.2f}%)")
 
-        # Build val loss breakdown string
+        # Build val loss breakdown string with MSE components grouped
         val_total = val_loss_components.get('total', val_loss)
         val_parts = []
+
+        # Handle MSE loss and its components specially
+        if 'mse_loss' in val_loss_components:
+            mse_value = val_loss_components['mse_loss']
+            mse_ratio = (mse_value / val_total * 100) if val_total > 0 else 0
+            mse_str = f"mse_loss: {mse_value:.4e} ({mse_ratio:.2f}%)"
+
+            # Check if we have magnitude and sign components
+            mse_components = []
+            if 'magnitude_loss' in val_loss_components:
+                mag_value = val_loss_components['magnitude_loss']
+                mag_ratio = (mag_value / mse_value * 100) if mse_value > 0 else 0
+                mse_components.append(f"magnitude_loss: {mag_value:.4e} ({mag_ratio:.2f}%)")
+            if 'sign_bce_loss' in val_loss_components:
+                sign_value = val_loss_components['sign_bce_loss']
+                sign_ratio = (sign_value / mse_value * 100) if mse_value > 0 else 0
+                mse_components.append(f"sign_bce_loss: {sign_value:.4e} ({sign_ratio:.2f}%)")
+
+            # Add MSE with components in brackets if they exist
+            if mse_components:
+                mse_str += f" [{' | '.join(mse_components)}]"
+            val_parts.append(mse_str)
+
+        # Add other losses (excluding mse_loss, magnitude_loss, sign_bce_loss, total)
         for key in sorted(val_loss_components.keys()):
-            if key != 'total':
+            if key not in ['total', 'mse_loss', 'magnitude_loss', 'sign_bce_loss']:
                 value = val_loss_components[key]
                 ratio = (value / val_total * 100) if val_total > 0 else 0
                 val_parts.append(f"{key}: {value:.4e} ({ratio:.2f}%)")
@@ -503,8 +561,8 @@ def main():
         # Test progress bar
         test_pbar = tqdm(test_loader, desc="Testing", leave=True)
         for inputs, targets in test_pbar:
-            # Move data to device
-            inputs, targets = inputs.to(device), targets.to(device)
+            # Move data to device and convert to proper dtype
+            inputs, targets = inputs.to(device, dtype=dtype), targets.to(device, dtype=dtype)
 
             # Denormalize inputs for loss calculation (if normalizer exists)
             if test_inputs_normalizer is not None:
@@ -523,28 +581,28 @@ def main():
                 inputs_t_minus_minus_real = inputs_real.clone()
                 inputs_t_minus_minus_real[:, 2] = inputs_real[:, 2] - 2 * t_threshold
                 if test_inputs_normalizer is not None:
-                    inputs_t_minus_minus = torch.FloatTensor(test_inputs_normalizer.normalize_inputs(inputs_t_minus_minus_real.cpu().numpy())).to(device)
+                    inputs_t_minus_minus = torch.tensor(test_inputs_normalizer.normalize_inputs(inputs_t_minus_minus_real.cpu().numpy()), dtype=dtype, device=device)
                 else:
                     inputs_t_minus_minus = inputs_t_minus_minus_real
 
                 inputs_t_minus_real = inputs_real.clone()
                 inputs_t_minus_real[:, 2] = inputs_real[:, 2] - t_threshold
                 if test_inputs_normalizer is not None:
-                    inputs_t_minus = torch.FloatTensor(test_inputs_normalizer.normalize_inputs(inputs_t_minus_real.cpu().numpy())).to(device)
+                    inputs_t_minus = torch.tensor(test_inputs_normalizer.normalize_inputs(inputs_t_minus_real.cpu().numpy()), dtype=dtype, device=device)
                 else:
                     inputs_t_minus = inputs_t_minus_real
 
                 inputs_t_plus_real = inputs_real.clone()
                 inputs_t_plus_real[:, 2] = inputs_real[:, 2] + t_threshold
                 if test_inputs_normalizer is not None:
-                    inputs_t_plus = torch.FloatTensor(test_inputs_normalizer.normalize_inputs(inputs_t_plus_real.cpu().numpy())).to(device)
+                    inputs_t_plus = torch.tensor(test_inputs_normalizer.normalize_inputs(inputs_t_plus_real.cpu().numpy()), dtype=dtype, device=device)
                 else:
                     inputs_t_plus = inputs_t_plus_real
 
                 inputs_t_plus_plus_real = inputs_real.clone()
                 inputs_t_plus_plus_real[:, 2] = inputs_real[:, 2] + 2 * t_threshold
                 if test_inputs_normalizer is not None:
-                    inputs_t_plus_plus = torch.FloatTensor(test_inputs_normalizer.normalize_inputs(inputs_t_plus_plus_real.cpu().numpy())).to(device)
+                    inputs_t_plus_plus = torch.tensor(test_inputs_normalizer.normalize_inputs(inputs_t_plus_plus_real.cpu().numpy()), dtype=dtype, device=device)
                 else:
                     inputs_t_plus_plus = inputs_t_plus_plus_real
 
@@ -609,6 +667,7 @@ def main():
         model=model,
         normalizer=train_val_inputs_normalizer,
         device=device,
+        dtype=dtype,
         data_sampling_step=100,
         figure_folder=results_figure_folder
     )

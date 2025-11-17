@@ -551,12 +551,17 @@ class MSELoss(BaseLossComponent):
                 # Absolute log-space MSE for magnitudes
                 magnitude_loss = torch.mean((log_predictions - log_targets) ** 2)
 
+            # magnitude_loss+= torch.log(1+ (torch.mean(((predictions - targets) ** 2) / (torch.square(targets) + eps))))
             # Compute sign BCE loss using SignBCELoss class
             # inputs contains sigmoid_probs (model.last_sign_probs)
             sign_bce_value = 0.0
             if self.sign_bce_loss is not None and inputs is not None:
                 sigmoid_probs = inputs  # This is last_sign_probs passed from training loop
                 sign_bce_value = self.sign_bce_loss(None, targets, sigmoid_probs, None, None)
+
+            # Store component losses for detailed reporting
+            self.last_magnitude_loss = magnitude_loss.item()
+            self.last_sign_bce_loss = sign_bce_value.item() if isinstance(sign_bce_value, torch.Tensor) else sign_bce_value
 
             # Combine magnitude and sign losses
             loss = sign_bce_value + magnitude_loss
@@ -596,8 +601,9 @@ class SignBCELoss(BaseLossComponent):
 
         # Convert target signs to binary labels: {-1, +1} -> {0, 1}
         # Zeros are treated as positive (label=1.0)
-        target_signs = torch.sign(targets).float()  # Shape: [batch, num_outputs], values: -1, 0, +1
-        labels = (target_signs >= 0).float()  # Shape: [batch, num_outputs], values: 0 or 1
+        # Use targets.dtype to match the dtype (float32 or float64)
+        target_signs = torch.sign(targets).to(dtype=targets.dtype)  # Shape: [batch, num_outputs], values: -1, 0, +1
+        labels = (target_signs >= 0).to(dtype=targets.dtype)  # Shape: [batch, num_outputs], values: 0 or 1
 
         # Compute BCE for each output and sum
         num_outputs = sigmoid_probs.shape[1]
@@ -1039,6 +1045,12 @@ class ExponentialPINNLoss(nn.Module):
             )
             total_loss += mse_value
             loss_summary["mse_loss"] = mse_value.item()
+
+            # Add magnitude and sign loss components for detailed reporting
+            if hasattr(self.loss_components["MSE"], 'last_magnitude_loss'):
+                loss_summary["magnitude_loss"] = self.loss_components["MSE"].last_magnitude_loss
+            if hasattr(self.loss_components["MSE"], 'last_sign_bce_loss'):
+                loss_summary["sign_bce_loss"] = self.loss_components["MSE"].last_sign_bce_loss
 
         # Residual Loss
         if "Residual" in self.loss_components and "Residual" in loss_args:
