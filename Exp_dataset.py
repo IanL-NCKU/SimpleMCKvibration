@@ -2,6 +2,9 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
+from expdatagenerator import analytical_solution_exp
+import matplotlib.pyplot as plt
+import os
 
 
 class Exponential_DataNormalizer:
@@ -56,6 +59,7 @@ class Exponential_DataNormalizer:
                 # Clamp very small values (including 0) to small positive value
                 values = np.where(values < t_zero_threshold, t_zero_threshold, values)
 
+            sign_values = np.sign(values)
             log_values = np.log10(values)
             normalized[feat] = (log_values - self.log_mean[feat]) / self.log_std[feat]
 
@@ -221,28 +225,37 @@ class Exponential_OutputNormalizer:
             data_dict: Dictionary with feature arrays
 
         Returns:
-            Dictionary with normalized features
+            If use_log_normalization=True: Tuple of (normalized_dict, sign_dict)
+                - normalized_dict: Dictionary with normalized log-absolute features
+                - sign_dict: Dictionary with sign arrays
+            If use_log_normalization=False: Tuple of (normalized_dict, None)
+                - normalized_dict: Dictionary with normalized features
         """
         normalized = {}
 
         if self.use_log_normalization:
+            signs = {}
             for feat in self.log_features:
                 values = data_dict[feat]
-                # Assume all values are positive
+                # Extract signs
+                signs[feat] = np.sign(values)
+                # Apply log transform to absolute values
                 log_values = np.log10(np.abs(values) + eps)
                 normalized[feat] = (log_values - self.log_mean[feat]) / self.log_std[feat]
+            return normalized, signs
         else:
             for feat in self.linear_features:
                 normalized[feat] = (data_dict[feat] - self.linear_mean[feat]) / self.linear_std[feat]
+            return normalized, None
 
-        return normalized
-
-    def inverse_transform(self, normalized_dict, eps=1e-10):
+    def inverse_transform(self, normalized_dict, signs_dict=None, eps=1e-10):
         """
         Denormalize data
 
         Args:
             normalized_dict: Dictionary with normalized feature arrays
+            signs_dict: Optional dictionary with sign arrays (only used when use_log_normalization=True)
+            eps: Small epsilon value for numerical stability
 
         Returns:
             Dictionary with original features
@@ -251,9 +264,18 @@ class Exponential_OutputNormalizer:
 
         if self.use_log_normalization:
             for feat in self.log_features:
+                # Recover log values and then magnitudes
                 log_values = normalized_dict[feat] * self.log_std[feat] + self.log_mean[feat]
-                original[feat] = 10 ** log_values
+                mags = 10 ** log_values
+
+                # Apply signs if provided
+                if signs_dict is not None:
+                    original[feat] = mags * signs_dict[feat]
+                else:
+                    # Backward compatibility: return unsigned magnitudes
+                    original[feat] = mags
         else:
+            # Linear normalization - signs are preserved automatically
             for feat in self.linear_features:
                 original[feat] = normalized_dict[feat] * self.linear_std[feat] + self.linear_mean[feat]
 
@@ -267,7 +289,9 @@ class Exponential_OutputNormalizer:
             Y: numpy array or tensor of shape (N, 3) with columns [x_t, v_t, a_t]
 
         Returns:
-            Normalized array of same shape and type
+            If use_log_normalization=True: Array of shape (N, 6) with columns
+                [sign_x, sign_v, sign_a, logabs_x, logabs_v, logabs_a]
+            If use_log_normalization=False: Array of shape (N, 3) with normalized values
         """
         is_tensor = torch.is_tensor(Y)
         if is_tensor:
@@ -282,18 +306,40 @@ class Exponential_OutputNormalizer:
         }
 
         # Normalize using transform
-        normalized_dict = self.transform(data_dict)
+        normalized_dict, sign_dict = self.transform(data_dict)
 
-        # Convert back to array
-        Y_norm = np.stack([
-            normalized_dict['x'],
-            normalized_dict['v'],
-            normalized_dict['a']
-        ], axis=1)
+        if self.use_log_normalization:
+            # Create sign array
+            signs_array = np.stack([
+                sign_dict['x'],
+                sign_dict['v'],
+                sign_dict['a']
+            ], axis=1)
 
-        print(f"Min/Max of Y_norm 'x': {np.min(Y_norm[:, 0])}, {np.max(Y_norm[:, 0])}")
-        print(f"Min/Max of Y_norm 'v': {np.min(Y_norm[:, 1])}, {np.max(Y_norm[:, 1])}")
-        print(f"Min/Max of Y_norm 'a': {np.min(Y_norm[:, 2])}, {np.max(Y_norm[:, 2])}")
+            # Create normalized log-absolute array
+            logabs_array = np.stack([
+                normalized_dict['x'],
+                normalized_dict['v'],
+                normalized_dict['a']
+            ], axis=1)
+
+            # Concatenate: [sign_x, sign_v, sign_a, logabs_x, logabs_v, logabs_a]
+            Y_norm = np.concatenate([signs_array, logabs_array], axis=1)
+
+            print(f"Min/Max of Y_norm logabs 'x': {np.min(Y_norm[:, 3])}, {np.max(Y_norm[:, 3])}")
+            print(f"Min/Max of Y_norm logabs 'v': {np.min(Y_norm[:, 4])}, {np.max(Y_norm[:, 4])}")
+            print(f"Min/Max of Y_norm logabs 'a': {np.min(Y_norm[:, 5])}, {np.max(Y_norm[:, 5])}")
+        else:
+            # Linear normalization - just stack the normalized values
+            Y_norm = np.stack([
+                normalized_dict['x'],
+                normalized_dict['v'],
+                normalized_dict['a']
+            ], axis=1)
+
+            print(f"Min/Max of Y_norm 'x': {np.min(Y_norm[:, 0])}, {np.max(Y_norm[:, 0])}")
+            print(f"Min/Max of Y_norm 'v': {np.min(Y_norm[:, 1])}, {np.max(Y_norm[:, 1])}")
+            print(f"Min/Max of Y_norm 'a': {np.min(Y_norm[:, 2])}, {np.max(Y_norm[:, 2])}")
 
         if is_tensor:
             Y_norm = torch.FloatTensor(Y_norm).to(device)
@@ -305,25 +351,53 @@ class Exponential_OutputNormalizer:
         Denormalize output array [x_t, v_t, a_t]
 
         Args:
-            Y_norm: tensor or numpy array of shape (N, 3) with normalized [x_t, v_t, a_t]
+            Y_norm: tensor or numpy array
+                If use_log_normalization=True: shape (N, 6) with [sign_x, sign_v, sign_a, logabs_x, logabs_v, logabs_a]
+                                               or shape (N, 3) for backward compatibility
+                If use_log_normalization=False: shape (N, 3) with normalized [x_t, v_t, a_t]
 
         Returns:
-            Denormalized array of same shape and type
+            Denormalized array of shape (N, 3) with [x_t, v_t, a_t]
         """
         is_tensor = torch.is_tensor(Y_norm)
         if is_tensor:
             device = Y_norm.device
             Y_norm = Y_norm.detach().cpu().numpy()
 
-        # Convert array to dictionary
-        normalized_dict = {
-            'x': Y_norm[:, 0],
-            'v': Y_norm[:, 1],
-            'a': Y_norm[:, 2]
-        }
-
-        # Denormalize using inverse_transform
-        original_dict = self.inverse_transform(normalized_dict)
+        if self.use_log_normalization:
+            # Check if input has signs included
+            if Y_norm.shape[1] == 6:
+                # Split into signs and logabs values
+                sign_dict = {
+                    'x': Y_norm[:, 0],
+                    'v': Y_norm[:, 1],
+                    'a': Y_norm[:, 2]
+                }
+                normalized_dict = {
+                    'x': Y_norm[:, 3],
+                    'v': Y_norm[:, 4],
+                    'a': Y_norm[:, 5]
+                }
+                # Denormalize with signs
+                original_dict = self.inverse_transform(normalized_dict, signs_dict=sign_dict)
+            else:
+                # Backward compatibility: shape (N, 3) without signs
+                normalized_dict = {
+                    'x': Y_norm[:, 0],
+                    'v': Y_norm[:, 1],
+                    'a': Y_norm[:, 2]
+                }
+                # Denormalize without signs (returns unsigned magnitudes)
+                original_dict = self.inverse_transform(normalized_dict, signs_dict=None)
+        else:
+            # Linear normalization
+            normalized_dict = {
+                'x': Y_norm[:, 0],
+                'v': Y_norm[:, 1],
+                'a': Y_norm[:, 2]
+            }
+            # Denormalize (signs preserved automatically)
+            original_dict = self.inverse_transform(normalized_dict)
 
         # Convert back to array
         Y = np.stack([
@@ -464,4 +538,286 @@ def load_exponential_data(filepath='exponential_trainval_data.npz', batch_size=3
         num_workers=0
     )
 
+    # results = check_all_datasets(
+    #     train_loader, val_loader, test_loader,
+    #     inputs_normalizer, outputs_normalizer,
+    #     error_threshold=0.10,  # 10% threshold
+    #     verbose=False,  # Set True to see 5 sample errors per dataset
+    #     plot_io_relation=True,
+    #     plot_sample_rate=10
+    # )
+
     return train_loader, val_loader, test_loader, inputs_normalizer, outputs_normalizer
+
+
+def check_dataset_consistency(dataset, inputs_normalizer, outputs_normalizer,
+                              dataset_name="Dataset", error_threshold=0.10, verbose=False,
+                              plot_io_relation=False, save_dir=None, plot_sample_rate=1):
+    """
+    Check if normalized dataset is consistent with analytical solution.
+
+    This function:
+    1. Denormalizes the inputs [a, b, t]
+    2. Computes analytical solution from denormalized inputs
+    3. Compares log10(abs(analytical_solution)) with the normalized targets
+    4. Reports percentage of samples with error > threshold
+    5. Optionally plots input-output relationships (9 scatter plots: 3 inputs × 3 outputs)
+
+    Args:
+        dataset: PyTorch Dataset with (inputs, outputs)
+        inputs_normalizer: Exponential_DataNormalizer instance
+        outputs_normalizer: Exponential_OutputNormalizer instance
+        dataset_name: Name for reporting (e.g., "Train", "Val", "Test")
+        error_threshold: Relative error threshold (default 0.10 = 10%)
+        verbose: If True, show detailed sample errors (default False)
+        plot_io_relation: If True, plot input vs output scatter plots (default False)
+        save_dir: Directory to save plots. If None, uses './IOrelation' (default None)
+        plot_sample_rate: Plot every Nth sample (e.g., 10 means plot 1 out of 10 samples) (default 1)
+
+    Returns:
+        dict: Statistics including error counts and samples
+    """
+    print(f"\n{'='*70}")
+    print(f"Checking {dataset_name} Dataset ({len(dataset)} samples)")
+    print(f"{'='*70}")
+
+    # Get all data from dataset
+    n_samples = len(dataset)
+    all_inputs = []
+    all_targets = []
+
+    # Collect all data
+    for i in range(n_samples):
+        inputs, targets = dataset[i]
+        all_inputs.append(inputs.numpy())
+        all_targets.append(targets.numpy())
+
+    all_inputs = np.array(all_inputs)  # Shape: (N, 3)
+    all_targets = np.array(all_targets)  # Shape: (N, 3)
+
+    # Step 1: Denormalize inputs to get original [a, b, t]
+    denorm_inputs = inputs_normalizer.denormalize_inputs(all_inputs)
+
+    a_values = denorm_inputs[:, 0]
+    b_values = denorm_inputs[:, 1]
+    t_values = denorm_inputs[:, 2]
+
+    # Step 2: Compute analytical solution
+    analytical_outputs = np.zeros((n_samples, 3))
+    invalid_count = 0
+
+    for i in range(n_samples):
+        a, b, t = a_values[i], b_values[i], t_values[i]
+        x_t, v_t, acc_t = analytical_solution_exp(a, b, t)
+
+        if np.isnan(x_t) or np.isnan(v_t) or np.isnan(acc_t):
+            invalid_count += 1
+            analytical_outputs[i] = [np.nan, np.nan, np.nan]
+        else:
+            analytical_outputs[i] = [x_t, v_t, acc_t]
+
+    if invalid_count > 0:
+        print(f"WARNING: {invalid_count} samples produced NaN values!")
+
+    # Step 3 & 4: Normalize the analytical outputs manually: (log10(abs(x)) - mean) / std
+    eps = 1e-10
+
+    # Compute log10(abs(analytical_outputs))
+    log_analytical = np.log10(np.abs(analytical_outputs) + eps)
+
+    # Apply z-score normalization: (log_values - mean) / std
+    normalized_analytical_array = np.zeros_like(log_analytical)
+
+    feature_names = ['x', 'v', 'a']
+    for i, feat in enumerate(feature_names):
+        log_values = log_analytical[:, i]
+        normalized_analytical_array[:, i] = (log_values - outputs_normalizer.log_mean[feat]) / outputs_normalizer.log_std[feat]
+
+    # Step 5: Compare with actual targets
+    # Compute absolute and relative errors
+    abs_errors = np.abs(all_targets - normalized_analytical_array)
+
+    # For relative error, avoid division by zero
+    denom = np.abs(normalized_analytical_array) + 1e-10
+    rel_errors = abs_errors / denom
+
+    # Count samples exceeding threshold
+    high_error_mask = rel_errors > error_threshold
+    high_error_count_per_sample = np.any(high_error_mask, axis=1).sum()
+
+    # Statistics per output
+    print(f"\n{'Feature':<10} {'Mean Abs':<12} {'Max Abs':<12} {'Mean Rel':<12} {'Count >{:.0%}'.format(error_threshold):<15}")
+    print("-" * 70)
+
+    feature_names = ['x_t', 'v_t', 'a_t']
+
+    for i, name in enumerate(feature_names):
+        mean_abs = np.nanmean(abs_errors[:, i])
+        max_abs = np.nanmax(abs_errors[:, i])
+        mean_rel = np.nanmean(rel_errors[:, i])
+        high_err_cnt = high_error_mask[:, i].sum()
+
+        print(f"{name:<10} {mean_abs:<12.4e} {max_abs:<12.4e} {mean_rel:<12.4e} {high_err_cnt:<15}")
+
+    print("-" * 70)
+    print(f"Total samples with ANY feature error > {error_threshold*100:.0f}%: "
+          f"{high_error_count_per_sample} / {n_samples} "
+          f"({high_error_count_per_sample/n_samples*100:.2f}%)")
+
+    # Optionally show sample high-error cases
+    if verbose and high_error_count_per_sample > 0:
+        print(f"\nShowing 5 sample high-error cases:")
+        high_err_sample_indices = np.where(np.any(high_error_mask, axis=1))[0][:5]
+
+        for idx in high_err_sample_indices:
+            print(f"\n  Sample #{idx}:")
+            print(f"    Input (a, b, t): [{a_values[idx]:.3f}, {b_values[idx]:.3f}, {t_values[idx]:.6f}]")
+            for j, name in enumerate(feature_names):
+                if high_error_mask[idx, j]:
+                    print(f"    {name}: target={all_targets[idx, j]:.4f}, "
+                          f"expected={normalized_analytical_array[idx, j]:.4f}, "
+                          f"rel_err={rel_errors[idx, j]*100:.2f}%")
+
+    # Plot input-output relationships if requested
+    if plot_io_relation:
+        if save_dir is None:
+            save_dir = './IOrelation'
+
+        # Create directory if it doesn't exist
+        os.makedirs(save_dir, exist_ok=True)
+
+        # Apply sampling
+        if plot_sample_rate > 1:
+            sample_indices = np.arange(0, n_samples, plot_sample_rate)
+            sampled_inputs = denorm_inputs[sample_indices]
+            sampled_targets = all_targets[sample_indices]
+            n_plot_samples = len(sample_indices)
+        else:
+            sampled_inputs = denorm_inputs
+            sampled_targets = all_targets
+            n_plot_samples = n_samples
+
+        print(f"\nGenerating input-output relationship plots...")
+        print(f"Plotting {n_plot_samples} / {n_samples} samples (sample rate: 1/{plot_sample_rate})")
+        print(f"Saving to: {save_dir}")
+
+        input_names = ['a', 'b', 't']
+        output_names = ['x_t', 'v_t', 'a_t']
+
+        # Create 9 plots (3 inputs × 3 outputs)
+        for i, input_name in enumerate(input_names):
+            for j, output_name in enumerate(output_names):
+                plt.figure(figsize=(8, 6))
+
+                # Get sampled input and output data
+                input_data = sampled_inputs[:, i]
+                output_data = sampled_targets[:, j]  # Normalized targets
+
+                # Scatter plot with small alpha for large datasets
+                alpha = min(0.5, 5000.0 / n_plot_samples) if n_plot_samples > 0 else 0.5
+                plt.scatter(input_data, output_data, alpha=alpha, s=2, c='blue', edgecolors='none')
+
+                plt.xlabel(f'{input_name}', fontsize=12)
+                plt.ylabel(f'{output_name} (normalized)', fontsize=12)
+                plt.title(f'{dataset_name}: {input_name} vs {output_name}\n({n_plot_samples} samples)', fontsize=14)
+                plt.grid(True, alpha=0.3)
+
+                # Save figure
+                filename = f'{dataset_name.lower()}_{input_name}_vs_{output_name}.png'
+                filepath = os.path.join(save_dir, filename)
+                plt.savefig(filepath, dpi=100, bbox_inches='tight')
+                plt.close()
+
+        print(f"Saved 9 plots to {save_dir}")
+
+    # Return statistics
+    return {
+        'n_samples': n_samples,
+        'invalid_count': invalid_count,
+        'high_error_count': high_error_count_per_sample,
+        'high_error_percentage': high_error_count_per_sample / n_samples * 100,
+        'mean_abs_errors': np.nanmean(abs_errors, axis=0),
+        'max_abs_errors': np.nanmax(abs_errors, axis=0),
+        'mean_rel_errors': np.nanmean(rel_errors, axis=0),
+        'high_error_counts_per_feature': high_error_mask.sum(axis=0)
+    }
+
+
+def check_all_datasets(train_loader, val_loader, test_loader,
+                      inputs_normalizer, outputs_normalizer,
+                      error_threshold=0.10, verbose=False,
+                      plot_io_relation=False, save_dir=None, plot_sample_rate=1):
+    """
+    Check consistency for all datasets (train, val, test).
+
+    Args:
+        train_loader: DataLoader for training set
+        val_loader: DataLoader for validation set
+        test_loader: DataLoader for test set
+        inputs_normalizer: Fitted Exponential_DataNormalizer
+        outputs_normalizer: Fitted Exponential_OutputNormalizer
+        error_threshold: Relative error threshold (default 0.10 = 10%)
+        verbose: If True, show detailed sample errors (default False)
+        plot_io_relation: If True, plot input vs output scatter plots (default False)
+        save_dir: Directory to save plots. If None, uses './IOrelation' (default None)
+        plot_sample_rate: Plot every Nth sample (e.g., 10 means plot 1 out of 10 samples) (default 1)
+
+    Returns:
+        dict: Statistics for all datasets
+    """
+    results = {}
+
+    # Check train dataset
+    results['train'] = check_dataset_consistency(
+        train_loader.dataset,
+        inputs_normalizer,
+        outputs_normalizer,
+        dataset_name="Training",
+        error_threshold=error_threshold,
+        verbose=verbose,
+        plot_io_relation=plot_io_relation,
+        save_dir=save_dir,
+        plot_sample_rate=plot_sample_rate
+    )
+
+    # Check validation dataset
+    results['val'] = check_dataset_consistency(
+        val_loader.dataset,
+        inputs_normalizer,
+        outputs_normalizer,
+        dataset_name="Validation",
+        error_threshold=error_threshold,
+        verbose=verbose,
+        plot_io_relation=plot_io_relation,
+        save_dir=save_dir,
+        plot_sample_rate=plot_sample_rate
+    )
+
+    # Check test dataset
+    results['test'] = check_dataset_consistency(
+        test_loader.dataset,
+        inputs_normalizer,
+        outputs_normalizer,
+        dataset_name="Test",
+        error_threshold=error_threshold,
+        verbose=verbose,
+        plot_io_relation=plot_io_relation,
+        save_dir=save_dir,
+        plot_sample_rate=plot_sample_rate
+    )
+
+    # Print overall summary
+    print(f"\n{'='*70}")
+    print(f"OVERALL SUMMARY (Error threshold: {error_threshold*100:.0f}%)")
+    print(f"{'='*70}")
+    print(f"{'Dataset':<12} {'Samples':<10} {'High Err':<12} {'% High Err':<12}")
+    print("-" * 70)
+
+    for dataset_name in ['train', 'val', 'test']:
+        stats = results[dataset_name]
+        print(f"{dataset_name.capitalize():<12} {stats['n_samples']:<10} "
+              f"{stats['high_error_count']:<12} {stats['high_error_percentage']:<12.2f}%")
+
+    print("="*70)
+
+    return results

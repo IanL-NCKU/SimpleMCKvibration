@@ -66,12 +66,19 @@ def prediction_performance(data_path, model_pt_path, model, normalizer, device, 
     with torch.no_grad():
         for inputs, targets in test_loader:
             inputs = inputs.to(device, dtype=dtype)
+
+            # Extract log-absolute targets for comparison with predictions
+            if targets.shape[1] == 6:  # Log normalization mode with signs
+                logabs_targets = targets[:, 3:]  # [logabs_x, logabs_v, logabs_a]
+            else:  # Linear normalization mode
+                logabs_targets = targets  # Already (N, 3)
+
             # Forward pass - returns (mag_preds, sign_pred) tuple
             mag_preds, sign_pred = model(inputs)
             # Reconstruct signed outputs
             outputs = (mag_preds * sign_pred).detach()
             all_predictions.append(outputs.cpu().numpy())
-            all_targets.append(targets.numpy())
+            all_targets.append(logabs_targets.numpy())
 
     all_predictions = np.concatenate(all_predictions, axis=0)
     all_targets = np.concatenate(all_targets, axis=0)
@@ -123,7 +130,7 @@ def prediction_performance(data_path, model_pt_path, model, normalizer, device, 
 
 def main():
     device_index = 0
-    train_in_64 = True
+    train_in_64 = False
     epochs = 200
 
     # Data paths
@@ -161,8 +168,8 @@ def main():
         dtype = torch.float32
         print("Training in float32 (single precision) mode")
 
-    model_save_path = 'exp_model_elu_newsignmodel64.pt'
-    results_figure_folder = './exp_results_elu_newsignmodel64'
+    model_save_path = 'expwithsign_model_elu_newsignmodel32.pt'
+    results_figure_folder = './expwithsign_results_elu_newsignmodel32'
 
     # Create the Exponential PINN model
     model = ExponentialPINN_ver2(hidden_dims=[16, 32, 64, 128, 64, 32, 16],
@@ -211,7 +218,14 @@ def main():
         train_pbar = tqdm(train_loader, desc=f"Training", leave=False)
         for inputs, targets in train_pbar:
             # Move data to device and convert to proper dtype
-            inputs, targets = inputs.to(device, dtype=dtype), targets.to(device, dtype=dtype)
+            inputs = inputs.to(device, dtype=dtype)
+            targets = targets.to(device, dtype=dtype)
+
+            # Extract log-absolute targets (columns 3-5) for training
+            if targets.shape[1] == 6:  # Log normalization mode with signs
+                logabs_targets = targets[:, 3:]  # [logabs_x, logabs_v, logabs_a]
+            else:  # Linear normalization mode
+                logabs_targets = targets  # Already (N, 3)
 
             optimizer.zero_grad()
 
@@ -283,9 +297,9 @@ def main():
             # Prepare loss arguments
             loss_args = {}
             if loss_fn.has_loss("MSE"):
-                # Pass mag_preds, targets, and sigmoid_probs
+                # Pass mag_preds, logabs_targets, and sigmoid_probs
                 sigmoid_probs = model.last_sign_probs
-                loss_args["MSE"] = (mag_preds, targets, sigmoid_probs)
+                loss_args["MSE"] = (mag_preds, logabs_targets, sigmoid_probs)
             if loss_fn.has_loss("Residual"):
                 loss_args["Residual"] = (outputs, inputs_real)
             if loss_fn.has_loss("Consistency"):
@@ -314,7 +328,7 @@ def main():
             train_pbar.set_postfix({'loss': f'{loss.item():.4e}'})
 
         # Print the last output and last ground truth of the inputs and targets
-        print("Last batch outputs v.s targets:", (mag_preds * sign_pred)[-1].detach().cpu().numpy(), targets[-1].detach().cpu().numpy())
+        print("Last batch mag_preds v.s logabs_targets:", mag_preds[-1].detach().cpu().numpy(), logabs_targets[-1].detach().cpu().numpy())
 
         train_loss /= len(train_loader.dataset)
 
@@ -326,7 +340,7 @@ def main():
         log_dict = {
             'epoch': epoch + 1,
             'outputs': outputs[-1],  # Last batch last sample
-            'targets': targets[-1],
+            'targets': logabs_targets[-1],
             'train_loss': train_loss
         }
         log_training_results(log_dict, results_folder=results_figure_folder, filename='training_explog.txt')
@@ -352,7 +366,14 @@ def main():
             val_pbar = tqdm(val_loader, desc=f"Validation", leave=False)
             for inputs, targets in val_pbar:
                 # Move data to device and convert to proper dtype
-                inputs, targets = inputs.to(device, dtype=dtype), targets.to(device, dtype=dtype)
+                inputs = inputs.to(device, dtype=dtype)
+                targets = targets.to(device, dtype=dtype)
+
+                # Extract log-absolute targets (columns 3-5) for validation
+                if targets.shape[1] == 6:  # Log normalization mode with signs
+                    logabs_targets = targets[:, 3:]  # [logabs_x, logabs_v, logabs_a]
+                else:  # Linear normalization mode
+                    logabs_targets = targets  # Already (N, 3)
 
                 # Denormalize inputs for loss calculation (if normalizer exists)
                 if train_val_inputs_normalizer is not None:
@@ -421,9 +442,9 @@ def main():
                 # Prepare loss arguments
                 loss_args = {}
                 if loss_fn.has_loss("MSE"):
-                    # Pass mag_preds, targets, and sigmoid_probs
+                    # Pass mag_preds, logabs_targets, and sigmoid_probs
                     sigmoid_probs = model.last_sign_probs
-                    loss_args["MSE"] = (mag_preds, targets, sigmoid_probs)
+                    loss_args["MSE"] = (mag_preds, logabs_targets, sigmoid_probs)
                 if loss_fn.has_loss("Residual"):
                     loss_args["Residual"] = (outputs, inputs_real)
                 if loss_fn.has_loss("Consistency"):
@@ -562,7 +583,14 @@ def main():
         test_pbar = tqdm(test_loader, desc="Testing", leave=True)
         for inputs, targets in test_pbar:
             # Move data to device and convert to proper dtype
-            inputs, targets = inputs.to(device, dtype=dtype), targets.to(device, dtype=dtype)
+            inputs = inputs.to(device, dtype=dtype)
+            targets = targets.to(device, dtype=dtype)
+
+            # Extract log-absolute targets (columns 3-5) for testing
+            if targets.shape[1] == 6:  # Log normalization mode with signs
+                logabs_targets = targets[:, 3:]  # [logabs_x, logabs_v, logabs_a]
+            else:  # Linear normalization mode
+                logabs_targets = targets  # Already (N, 3)
 
             # Denormalize inputs for loss calculation (if normalizer exists)
             if test_inputs_normalizer is not None:
@@ -635,9 +663,9 @@ def main():
             # Prepare loss arguments
             loss_args = {}
             if loss_fn.has_loss("MSE"):
-                # Pass mag_preds, targets, and sigmoid_probs
+                # Pass mag_preds, logabs_targets, and sigmoid_probs
                 sigmoid_probs = model.last_sign_probs
-                loss_args["MSE"] = (mag_preds, targets, sigmoid_probs)
+                loss_args["MSE"] = (mag_preds, logabs_targets, sigmoid_probs)
             if loss_fn.has_loss("Residual"):
                 loss_args["Residual"] = (outputs, inputs_real)
             if loss_fn.has_loss("Consistency"):
