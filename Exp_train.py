@@ -64,38 +64,46 @@ def prediction_performance(data_path, model_pt_path, model, normalizer, device, 
     all_targets = []
 
     with torch.no_grad():
-        for inputs, targets in test_loader:
+        for inputs, targets in tqdm(test_loader, desc="Evaluating"):
             inputs = inputs.to(device, dtype=dtype)
+            targets = targets.to(device, dtype=dtype)
 
-            # Extract log-absolute targets for comparison with predictions
-            if targets.shape[1] == 6:  # Log normalization mode with signs
-                logabs_targets = targets[:, 3:]  # [logabs_x, logabs_v, logabs_a]
-            else:  # Linear normalization mode
-                logabs_targets = targets  # Already (N, 3)
+            # Forward pass - returns (mag_preds, logabs_sign_pred, real_sign_pred) tuple
+            mag_preds, logabs_sign_pred, real_sign_pred = model(inputs)
 
-            # Forward pass - returns (mag_preds, sign_pred) tuple
-            mag_preds, sign_pred = model(inputs)
-            # Reconstruct signed outputs
-            outputs = (mag_preds * sign_pred).detach()
+            # The model's mag_preds are the predicted log-absolute values.
+            # These are directly comparable to the log-absolute part of the targets.
+            predictions = mag_preds.detach()
+
+            # Extract log-absolute targets for comparison
+            # Targets shape: (batch, 6) -> [real_signs (0-2), logabs_values (3-5)]
+            logabs_targets = targets[:, 3:]
+            outputs = (mag_preds * logabs_sign_pred).detach()
             all_predictions.append(outputs.cpu().numpy())
-            all_targets.append(logabs_targets.numpy())
+            all_targets.append(logabs_targets.cpu().numpy())
 
     all_predictions = np.concatenate(all_predictions, axis=0)
     all_targets = np.concatenate(all_targets, axis=0)
 
     print(f"Total data points: {len(all_predictions)}")
 
-    sampled_indices = np.arange(0, len(all_predictions), data_sampling_step)
-    predictions_sampled = all_predictions[sampled_indices]
-    targets_sampled = all_targets[sampled_indices]
+    # Sample data for plotting to avoid overly dense plots
+    if data_sampling_step > 1 and len(all_predictions) > data_sampling_step:
+        sampled_indices = np.arange(0, len(all_predictions), data_sampling_step)
+        predictions_sampled = all_predictions[sampled_indices]
+        targets_sampled = all_targets[sampled_indices]
+        print(f"Sampled data points for plotting (step={data_sampling_step}): {len(predictions_sampled)}")
+    else:
+        predictions_sampled = all_predictions
+        targets_sampled = all_targets
+        print("Using all data points for plotting.")
 
-    print(f"Sampled data points (step={data_sampling_step}): {len(predictions_sampled)}")
 
-    output_names = ['x', 'v', 'a']
+    output_names = ['logabs_x', 'logabs_v', 'logabs_a']
     output_titles = [
-        'Position Prediction Performance',
-        'Velocity Prediction Performance',
-        'Acceleration Prediction Performance'
+        'Log-Absolute Position Prediction Performance',
+        'Log-Absolute Velocity Prediction Performance',
+        'Log-Absolute Acceleration Prediction Performance'
     ]
 
     for idx, (name, title) in enumerate(zip(output_names, output_titles)):
@@ -129,9 +137,9 @@ def prediction_performance(data_path, model_pt_path, model, normalizer, device, 
 
 
 def main():
-    device_index = 0
+    device_index = 1
     train_in_64 = False
-    epochs = 200
+    epochs = 20
 
     # Data paths
     Train_Val_data_source = r'E:\Ian\PINNexample\exponential_trainval_data.npz'
@@ -141,14 +149,14 @@ def main():
     # Load the dataset
     train_loader, val_loader, _, train_val_inputs_normalizer, train_val_targets_normalizer = load_exponential_data(
         filepath=Train_Val_data_source,
-        batch_size=512,
+        batch_size=1024,
         normalize=data_normalize,
         shuffle_train=True
     )
 
     test_loader, _, _, test_inputs_normalizer, test_targets_normalizer = load_exponential_data(
         filepath=Test_data_source,
-        batch_size=512,
+        batch_size=1024,
         normalize=data_normalize,
         shuffle_train=False
     )
@@ -168,18 +176,20 @@ def main():
         dtype = torch.float32
         print("Training in float32 (single precision) mode")
 
-    model_save_path = 'expwithsign_model_elu_newsignmodel32.pt'
-    results_figure_folder = './expwithsign_results_elu_newsignmodel32'
+    model_save_path = 'expwithsign_model_tanh_nofinetune_newsignmodel_realtest.pt'
+    results_figure_folder = './expwithsign_results_tanh_nofinetune_newsignmodel_realtest'
 
     # Create the Exponential PINN model
-    model = ExponentialPINN_ver2(hidden_dims=[16, 32, 64, 128, 64, 32, 16],
-                          activation='elu',
+    model = ExponentialPINN_ver3(hidden_dims=[16, 32, 64, 64, 32, 16],
+                          activation='tanh',
                           use_log_output=False,
-                          use_finetune=True,
+                          use_finetune=False,
                           finetune_hidden_dims=[16, 32, 32, 16],
                           finetune_scale=1,
-                          sign_network_hidden_dims=[128, 64, 32, 16],
-                          sign_network_dropout=0.3).to(device)
+                          logabs_sign_network_hidden_dims=[64, 64, 32, 16],
+                          logabs_sign_network_dropout=0.3,
+                          real_sign_network_hidden_dims=[64, 64, 32, 16],
+                          real_sign_network_dropout=0.3).to(device)
 
     # model = ExponentialPINN(hidden_dims=[16, 32, 32, 64, 32, 32, 16],
     #                       activation='relu',
@@ -192,7 +202,7 @@ def main():
 
     # Configure losses
     loss_config = {
-        "MSE": {"weight": 1.0, "use_relative": False, "use_log": True, "sign_bce_weight": 1.0},
+        "MSE": {"weight": 1.0, "use_relative": False, "use_log": True, "sign_bce_weight": 1.0, "real_sign_bce_weight": 1.0},
         "Residual": {"weight": 0.0, "use_relative": True},
         "Consistency": {"weight": 0.0, "t_threshold": 1e-5, "type": "auto", "use_relative": True, "use_log": False}
     }
@@ -221,11 +231,8 @@ def main():
             inputs = inputs.to(device, dtype=dtype)
             targets = targets.to(device, dtype=dtype)
 
-            # Extract log-absolute targets (columns 3-5) for training
-            if targets.shape[1] == 6:  # Log normalization mode with signs
-                logabs_targets = targets[:, 3:]  # [logabs_x, logabs_v, logabs_a]
-            else:  # Linear normalization mode
-                logabs_targets = targets  # Already (N, 3)
+            # Keep full targets (batch, 6) - [real_signs (0-2), logabs_values (3-5)]
+            # No extraction needed anymore
 
             optimizer.zero_grad()
 
@@ -276,30 +283,33 @@ def main():
             # Stack all inputs
             inputs_combined = torch.cat(inputs_list, dim=0)
 
-            # Forward pass - returns (mag_preds, sign_pred) tuple
-            mag_preds_combined, sign_pred_combined = model(inputs_combined)
+            # Forward pass - returns (mag_preds, logabs_sign_pred, real_sign_pred) tuple
+            mag_preds_combined, logabs_sign_pred_combined, real_sign_pred_combined = model(inputs_combined)
 
             # Split outputs based on what was stacked
             mag_preds = mag_preds_combined[:N]
-            sign_pred = sign_pred_combined[:N]
+            logabs_sign_pred = logabs_sign_pred_combined[:N]
+            real_sign_pred = real_sign_pred_combined[:N]
 
-            # Reconstruct signed outputs for display/other losses
+            # Reconstruct signed log-space outputs for display/other losses
+            # Use logabs_sign_pred (not real_sign_pred) because outputs represent signed log-abs values
             # DETACH to prevent gradient blending between magnitude and sign
-            outputs = (mag_preds * sign_pred).detach()
+            outputs = (mag_preds * logabs_sign_pred).detach()
             idx = N
 
             if loss_fn.has_loss("Consistency") and loss_config["Consistency"]["type"] == "finite":
                 mag_preds_dt = mag_preds_combined[idx:idx+4*N]
-                sign_pred_dt = sign_pred_combined[idx:idx+4*N]
-                outputs_dt = (mag_preds_dt * sign_pred_dt).detach()
+                logabs_sign_pred_dt = logabs_sign_pred_combined[idx:idx+4*N]
+                outputs_dt = (mag_preds_dt * logabs_sign_pred_dt).detach()
                 idx += 4*N
 
             # Prepare loss arguments
             loss_args = {}
             if loss_fn.has_loss("MSE"):
-                # Pass mag_preds, logabs_targets, and sigmoid_probs
-                sigmoid_probs = model.last_sign_probs
-                loss_args["MSE"] = (mag_preds, logabs_targets, sigmoid_probs)
+                # Pass mag_preds, targets (full 6 columns), logabs_sign_probs, and real_sign_probs
+                logabs_sign_probs = model.logabs_last_sign_probs
+                real_sign_probs = model.real_last_sign_probs
+                loss_args["MSE"] = (mag_preds, targets, logabs_sign_probs, None, None, real_sign_probs)
             if loss_fn.has_loss("Residual"):
                 loss_args["Residual"] = (outputs, inputs_real)
             if loss_fn.has_loss("Consistency"):
@@ -328,7 +338,14 @@ def main():
             train_pbar.set_postfix({'loss': f'{loss.item():.4e}'})
 
         # Print the last output and last ground truth of the inputs and targets
+        logabs_targets = targets[:, 3:]  # Extract for printing
         print("Last batch mag_preds v.s logabs_targets:", mag_preds[-1].detach().cpu().numpy(), logabs_targets[-1].detach().cpu().numpy())
+
+        # Print real value predictions vs ground truth
+        pred_normalized = torch.cat([real_sign_pred, outputs], dim=1).detach()
+        real_value_pred = train_val_targets_normalizer.denormalize_outputs(pred_normalized[-1:].cpu().numpy())[0]
+        real_value_gt = train_val_targets_normalizer.denormalize_outputs(targets.detach().cpu().numpy())[-1]
+        print("Last batch pred_real_value v.s targets_real_value:", real_value_pred, real_value_gt)
 
         train_loss /= len(train_loader.dataset)
 
@@ -369,11 +386,8 @@ def main():
                 inputs = inputs.to(device, dtype=dtype)
                 targets = targets.to(device, dtype=dtype)
 
-                # Extract log-absolute targets (columns 3-5) for validation
-                if targets.shape[1] == 6:  # Log normalization mode with signs
-                    logabs_targets = targets[:, 3:]  # [logabs_x, logabs_v, logabs_a]
-                else:  # Linear normalization mode
-                    logabs_targets = targets  # Already (N, 3)
+                # Keep full targets (batch, 6) - [real_signs (0-2), logabs_values (3-5)]
+                # No extraction needed anymore
 
                 # Denormalize inputs for loss calculation (if normalizer exists)
                 if train_val_inputs_normalizer is not None:
@@ -422,29 +436,32 @@ def main():
                 # Stack all inputs
                 inputs_combined = torch.cat(inputs_list, dim=0)
 
-                # Forward pass - returns (mag_preds, sign_pred) tuple
-                mag_preds_combined, sign_pred_combined = model(inputs_combined)
+                # Forward pass - returns (mag_preds, logabs_sign_pred, real_sign_pred) tuple
+                mag_preds_combined, logabs_sign_pred_combined, real_sign_pred_combined = model(inputs_combined)
 
                 # Split outputs based on what was stacked
                 mag_preds = mag_preds_combined[:N]
-                sign_pred = sign_pred_combined[:N]
+                logabs_sign_pred = logabs_sign_pred_combined[:N]
+                real_sign_pred = real_sign_pred_combined[:N]
 
-                # Reconstruct signed outputs - DETACH to prevent gradient blending
-                outputs = (mag_preds * sign_pred).detach()
+                # Reconstruct signed log-space outputs - DETACH to prevent gradient blending
+                # Use logabs_sign_pred because outputs represent signed log-abs values
+                outputs = (mag_preds * logabs_sign_pred).detach()
                 idx = N
 
                 if loss_fn.has_loss("Consistency") and loss_config["Consistency"]["type"] == "finite":
                     mag_preds_dt = mag_preds_combined[idx:idx+4*N]
-                    sign_pred_dt = sign_pred_combined[idx:idx+4*N]
-                    outputs_dt = (mag_preds_dt * sign_pred_dt).detach()
+                    logabs_sign_pred_dt = logabs_sign_pred_combined[idx:idx+4*N]
+                    outputs_dt = (mag_preds_dt * logabs_sign_pred_dt).detach()
                     idx += 4*N
 
                 # Prepare loss arguments
                 loss_args = {}
                 if loss_fn.has_loss("MSE"):
-                    # Pass mag_preds, logabs_targets, and sigmoid_probs
-                    sigmoid_probs = model.last_sign_probs
-                    loss_args["MSE"] = (mag_preds, logabs_targets, sigmoid_probs)
+                    # Pass mag_preds, targets (full 6 columns), logabs_sign_probs, and real_sign_probs
+                    logabs_sign_probs = model.logabs_last_sign_probs
+                    real_sign_probs = model.real_last_sign_probs
+                    loss_args["MSE"] = (mag_preds, targets, logabs_sign_probs, None, None, real_sign_probs)
                 if loss_fn.has_loss("Residual"):
                     loss_args["Residual"] = (outputs, inputs_real)
                 if loss_fn.has_loss("Consistency"):
@@ -566,6 +583,7 @@ def main():
     model.load_state_dict(torch.load(model_save_path))
     model.eval()
     test_loss = 0.0
+    test_loss_components = {}
 
     # Determine if we need gradients for consistency loss (auto-diff type)
     use_no_grad_test = True
@@ -585,12 +603,6 @@ def main():
             # Move data to device and convert to proper dtype
             inputs = inputs.to(device, dtype=dtype)
             targets = targets.to(device, dtype=dtype)
-
-            # Extract log-absolute targets (columns 3-5) for testing
-            if targets.shape[1] == 6:  # Log normalization mode with signs
-                logabs_targets = targets[:, 3:]  # [logabs_x, logabs_v, logabs_a]
-            else:  # Linear normalization mode
-                logabs_targets = targets  # Already (N, 3)
 
             # Denormalize inputs for loss calculation (if normalizer exists)
             if test_inputs_normalizer is not None:
@@ -639,22 +651,22 @@ def main():
             # Stack all inputs
             inputs_combined = torch.cat(inputs_list, dim=0)
 
-            # Forward pass - returns (mag_preds, sign_pred) tuple
-            mag_preds_combined, sign_pred_combined = model(inputs_combined)
+            # Forward pass - returns (mag_preds, logabs_sign_pred, real_sign_pred) tuple
+            mag_preds_combined, logabs_sign_pred_combined, real_sign_pred_combined = model(inputs_combined)
 
             # Split outputs based on what was stacked
             mag_preds = mag_preds_combined[:N]
-            sign_pred = sign_pred_combined[:N]
+            logabs_sign_pred = logabs_sign_pred_combined[:N]
+            real_sign_pred = real_sign_pred_combined[:N]
 
-            # Reconstruct signed outputs for display/other losses
-            # DETACH to prevent gradient blending between magnitude and sign
-            outputs = (mag_preds * sign_pred).detach()
+            # Reconstruct signed log-space outputs - DETACH to prevent gradient blending
+            outputs = (mag_preds * logabs_sign_pred).detach()
             idx = N
 
             if loss_fn.has_loss("Consistency") and loss_config["Consistency"]["type"] == "finite":
                 mag_preds_dt = mag_preds_combined[idx:idx+4*N]
-                sign_pred_dt = sign_pred_combined[idx:idx+4*N]
-                outputs_dt = (mag_preds_dt * sign_pred_dt).detach()  # 4N samples: [t-2Δt, t-Δt, t+Δt, t+2Δt]
+                logabs_sign_pred_dt = logabs_sign_pred_combined[idx:idx+4*N]
+                outputs_dt = (mag_preds_dt * logabs_sign_pred_dt).detach()
                 idx += 4*N
 
             # Prepare norm_params for test (use test_inputs_normalizer)
@@ -663,13 +675,12 @@ def main():
             # Prepare loss arguments
             loss_args = {}
             if loss_fn.has_loss("MSE"):
-                # Pass mag_preds, logabs_targets, and sigmoid_probs
-                sigmoid_probs = model.last_sign_probs
-                loss_args["MSE"] = (mag_preds, logabs_targets, sigmoid_probs)
+                logabs_sign_probs = model.logabs_last_sign_probs
+                real_sign_probs = model.real_last_sign_probs
+                loss_args["MSE"] = (mag_preds, targets, logabs_sign_probs, None, None, real_sign_probs)
             if loss_fn.has_loss("Residual"):
                 loss_args["Residual"] = (outputs, inputs_real)
             if loss_fn.has_loss("Consistency"):
-                # Check consistency type
                 consistency_type = loss_config["Consistency"]["type"]
                 if consistency_type == "finite":
                     loss_args["Consistency"] = (outputs, outputs_dt, targets)
@@ -681,6 +692,12 @@ def main():
             # Compute loss
             loss, loss_dict = loss_fn(loss_args)
             test_loss += loss.item() * inputs.size(0)
+
+            # Accumulate loss components
+            for key, value in loss_dict.items():
+                if key not in test_loss_components:
+                    test_loss_components[key] = 0.0
+                test_loss_components[key] += value * inputs.size(0)
 
             # Update progress bar with current loss
             test_pbar.set_postfix({'loss': f'{loss.item():.4e}'})
