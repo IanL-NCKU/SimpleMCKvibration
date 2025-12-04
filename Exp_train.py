@@ -166,16 +166,25 @@ def calculate_calibration_improvement(outputs_before, outputs_after, targets):
 
     return closer_rate, mean_improvement
 
+def testcudaavailable():
+    if torch.cuda.is_available():
+        print("CUDA is available. Device count:", torch.cuda.device_count())
+        for i in range(torch.cuda.device_count()):
+            print(f"Device {i}: {torch.cuda.get_device_name(i)}")
+    else:
+        print("CUDA is not available. Using CPU.")
+    
+    
 
 def main():
     device_index = 0
     train_in_64 = True
-    epochs = 1000
+    epochs = 40
 
     # Data paths
-    Train_Val_data_source = r'E:\Ian\PINNexample\exponential_trainval_data.npz'
-    Test_data_source = r'E:\Ian\PINNexample\exponential_test_data.npz'
-    Plot_data_source = r'E:\Ian\PINNexample\exponential_test_data.npz'
+    Train_Val_data_source = r'H:\Postgraudate\Research\Test\SimpleMCKvibration\exponential_trainval_data.npz'
+    Test_data_source = r'H:\Postgraudate\Research\Test\SimpleMCKvibration\exponential_test_data.npz'
+    Plot_data_source = r'H:\Postgraudate\Research\Test\SimpleMCKvibration\exponential_test_data.npz'
     data_normalize = True
     # Load the dataset
     train_loader, val_loader, _, train_val_inputs_normalizer, train_val_targets_normalizer = load_exponential_data(
@@ -207,8 +216,8 @@ def main():
         dtype = torch.float32
         print("Training in float32 (single precision) mode")
 
-    model_save_path = 'expwithsign_model_elu_newsignmodel_realtest64_finetunene6.pt'
-    results_figure_folder = './expwithsign_results_elu_newsignmodel_realtest64_finetunene6'
+    model_save_path = 'expwithsign_model_elu_newsignmodel_realtest64_finetunene7_1.pt'
+    results_figure_folder = './expwithsign_results_elu_newsignmodel_realtest64_finetunene7_1'
 
     # Create the Exponential PINN model
     model = ExponentialPINN_ver3(hidden_dims=[16, 32, 64, 64, 32, 16],
@@ -240,7 +249,7 @@ def main():
 
     loss_fn = ExponentialPINNLoss(model, loss_config)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
-    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=np.max([epochs//20,1]), eta_min=1e-13)
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=np.max([epochs//10,1]), eta_min=1e-13)
 
     # Prepare norm_params for consistency loss
     norm_params = {'normalizer': train_val_inputs_normalizer}
@@ -249,7 +258,7 @@ def main():
     # Input data shape: (batch_size, 3) -> [a, b, t]
     # Target data shape: (batch_size, 3) -> [x_t, v_t, a_t]
     best_combined_loss = float('inf')
-    finetune_activation_epoch = int(epochs * 0.5)  # Activate finetune network after 25% of epochs
+    finetune_activation_epoch = int(epochs * 0.6)  # Activate finetune network after 60% of epochs
 
     for epoch in range(epochs):
         # Two-phase training logic
@@ -816,3 +825,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # testcudaavailable()
