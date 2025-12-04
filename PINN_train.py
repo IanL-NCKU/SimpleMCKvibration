@@ -6,6 +6,60 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import os
 
+def log_training_results(log_dict, results_folder='./results', filename='training_log.txt', delimiter=', '):
+    """
+    Log training results to a delimited text file.
+
+    Args:
+        log_dict: Dictionary containing training information with keys:
+                  - 'epoch': int, current epoch number
+                  - 'outputs': numpy array or tensor, last batch predictions [x, v, a]
+                  - 'targets': numpy array or tensor, last batch ground truth [x, v, a]
+                  - 'train_loss': float, training loss for this epoch
+        results_folder: str, folder path to save the log file
+        filename: str, name of the log file
+        delimiter: str, delimiter to use between values (default: ', ')
+                   Examples: ', ' for CSV, ' ' for space-separated, '\t' for tab-separated
+
+    The function creates a delimited file with columns:
+    epoch, output_x, output_v, output_a, target_x, target_v, target_a, train_loss
+    """
+    # Create results folder if it doesn't exist
+    if not os.path.exists(results_folder):
+        os.makedirs(results_folder)
+
+    log_path = os.path.join(results_folder, filename)
+
+    # Extract data from dict
+    epoch = log_dict['epoch']
+    outputs = log_dict['outputs']
+    targets = log_dict['targets']
+    train_loss = log_dict['train_loss']
+
+    # Convert tensors to numpy if needed
+    if torch.is_tensor(outputs):
+        outputs = outputs.detach().cpu().numpy()
+    if torch.is_tensor(targets):
+        targets = targets.detach().cpu().numpy()
+
+    # Check if file exists to determine if we need to write header
+    file_exists = os.path.isfile(log_path)
+
+    # Write to file
+    with open(log_path, 'a') as f:
+        if not file_exists:
+            # Write header
+            header_fields = ["epoch", "output_x", "output_v", "output_a",
+                           "target_x", "target_v", "target_a", "train_loss"]
+            f.write(delimiter.join(header_fields) + "\n")
+
+        # Write data row
+        data_fields = [f"{epoch}", f"{outputs[0]:.6e}", f"{outputs[1]:.6e}", f"{outputs[2]:.6e}",
+                      f"{targets[0]:.6e}", f"{targets[1]:.6e}", f"{targets[2]:.6e}", f"{train_loss:.6e}"]
+        f.write(delimiter.join(data_fields) + "\n")
+
+    return log_path
+
 def prediction_performance(data_path, model_pt_path, model, normalizer, device, data_sampling_step=1, figure_folder='./figures'):
     """
     Generate prediction performance scatter plots comparing ground truth vs predictions.
@@ -121,9 +175,9 @@ def main():
 
     device_index = 0
     
-    epochs = 100
-    Train_Val_data_source = r'E:\Ian\PINNexample\train_val_vibration_data.npz'
-    Test_data_source = r'E:\Ian\PINNexample\test_vibration_data.npz'
+    epochs = 10
+    Train_Val_data_source = r'E:\Ian\PINNexample\small_scale_trainval_vibration_data.npz'
+    Test_data_source = r'E:\Ian\PINNexample\small_scale_test_vibration_data.npz'
     Plot_data_source = r'E:\Ian\PINNexample\new_test_vibration_data.npz'
     # Load the dataset 
     train_loader, val_loader, _, train_val_normalizer = load_vibration_data(
@@ -145,26 +199,28 @@ def main():
     # Setup device
     device = torch.device(f'cuda:{device_index}' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    model_save_path = 'test_new.pt'#'best_model_tanh_withlog_withfinetune.pt'
+    model_save_path = 'test_3.pt'#'best_model_tanh_withlog_withfinetune.pt'
+    results_figure_folder = './test_3_results'#'./prediction_figures_3' #'./prediction_figures_tanh_withlog_withfinetune'
     # Create the PINN model with log-space output
-    model = VibrationPINN(hidden_dims=[32, 128, 512, 2048, 512, 128, 32], 
-                          activation='ELU',
-                          use_log_output=False, 
-                          use_finetune=True, 
-                          finetune_hidden_dims=[128, 128], 
-                          finetune_scale= 1).to(device)
+    model = VibrationPINN(hidden_dims=[32, 64, 128, 256, 256, 128, 64, 32],
+                          activation='tanh',
+                          use_log_output=True,
+                          use_finetune=False,
+                          finetune_hidden_dims=[128, 128],
+                          finetune_scale= 1,
+                          use_exponential_superposition=False).to(device)
 
     # Configure losses using dict-based interface
     loss_config = {
-        "MSE": {"weight": 0.7, "use_relative": True, "use_log": True},
-        "Residual": {"weight": 0.1, "use_relative": True},
-        "InitialCondition": {"weight": 0.1, "t_threshold": 1e-8, "use_relative": True},
-        "Consistency": {"weight": 0.1, "t_threshold": 1e-5, "type": "auto", "use_relative": True, "use_log": False}
+        "MSE": {"weight": 1 , "use_relative": True, "use_log": False},
+        "Residual": {"weight": 0, "use_relative": True},
+        "InitialCondition": {"weight": 0, "t_threshold": 1e-8, "use_relative": True},
+        "Consistency": {"weight": 0, "t_threshold": 1e-5, "type": "auto", "use_relative": True, "use_log": False}
     }
 
     loss_fn = PINNLoss_v2(model, loss_config)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
-    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=np.max([epochs//10,1]), eta_min=1e-9)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=np.max([epochs//10,1]), eta_min=1e-12)
 
     # Prepare norm_params for consistency loss
     norm_params = {'normalizer': train_val_normalizer}
@@ -184,7 +240,25 @@ def main():
         for inputs, targets in train_pbar:
             # Move data to device
             inputs, targets = inputs.to(device), targets.to(device)
+            
+            #================test the model=======================
+            # if the sum of inputs <0 the target = targets*0-4592.4452
+            # if the sum of inputs >=0 the target = targets*0+4592.4452
+            # Calculate sum for each row (sample) in the batch
+            # row_sums = torch.sum(inputs, dim=1, keepdim=True)
+            
+            # # Create a boolean mask where the condition is met
+            # # The mask will have shape [batch_size, 1]
+            # mask = row_sums < 0
+            
+            # # Apply the condition to modify the targets tensor
+            # # Where mask is True (row_sum < 0), set target to 4592.4452
+            # # Where mask is False (row_sum >= 0), set target to -4592.4452
+            # targets = torch.where(mask, 
+            #                       torch.full_like(targets, 5250.545), 
+            #                       torch.full_like(targets, -500.2))
 
+            #================================================
             optimizer.zero_grad()
 
             # Denormalize inputs for loss calculation
@@ -288,6 +362,15 @@ def main():
         # Calculate average loss components
         for key in train_loss_components:
             train_loss_components[key] /= len(train_loader.dataset)
+
+        # Log training results to file (before validation)
+        log_dict = {
+            'epoch': epoch + 1,
+            'outputs': outputs[-1],  # Last batch last sample
+            'targets': targets[-1],
+            'train_loss': train_loss
+        }
+        log_training_results(log_dict, results_folder=results_figure_folder, filename='training_log.txt')
 
         # Validation loop
         model.eval()
@@ -552,7 +635,7 @@ def main():
         normalizer=train_val_normalizer,
         device=device,
         data_sampling_step=100,
-        figure_folder='./prediction_figures_new'
+        figure_folder= results_figure_folder
     )
 
 if __name__ == "__main__":

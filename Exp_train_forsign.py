@@ -174,14 +174,14 @@ def main():
     device = torch.device(f'cuda:{device_index}' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    model_save_path = 'exp_model_signnn_classres_64_32_16.pt'
-    results_figure_folder = './exp_results_signnn_classres_64_32_16'
+    model_save_path = 'exp_model_signnn_elu_classres_64_32_16.pt'
+    results_figure_folder = './exp_results_signnn_elu_classres_64_32_16'
 
     # Create the Exponential Sign NN model
     # model = ExponentialSignNN_ver2(hidden_dims=[64, 32, 16],
     #                                activation='relu').to(device)
-    model = ExponentialSignNN_ver3(hidden_dims=[64, 32, 16],
-                                   activation='relu').to(device)
+    model = ExponentialSignNN_ver4(hidden_dims=[64, 32, 16],
+                                   activation='elu').to(device)
 
     # Configure losses - only SignBCE
     loss_config = {
@@ -232,7 +232,8 @@ def main():
             targets_modified = (1 + 0.05 * r) * targets  # Shape: (batch_size, 3)
 
             # Forward pass
-            outputs = model(inputs_modified)
+            # outputs = model(inputs_modified)
+            outputs = model(inputs)
 
             # Prepare loss arguments
             loss_args = {}
@@ -313,7 +314,8 @@ def main():
                 targets_modified = (1 + 0.05 * r) * targets  # Shape: (batch_size, 3)
 
                 # Forward pass
-                outputs = model(inputs_modified)
+                # outputs = model(inputs_modified)
+                outputs = model(inputs)
 
                 # Prepare loss arguments
                 loss_args = {}
@@ -394,7 +396,8 @@ def main():
             targets_modified = (1 + 0.05 * r) * targets  # Shape: (batch_size, 3)
 
             # Forward pass
-            outputs = model(inputs_modified)
+            # outputs = model(inputs_modified)
+            outputs = model(inputs)
 
             # Prepare loss arguments
             loss_args = {}

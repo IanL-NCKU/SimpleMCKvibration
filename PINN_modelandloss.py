@@ -7,12 +7,14 @@ class VibrationPINN(nn.Module):
     """Physics-Informed Neural Network for vibration prediction"""
 
     def __init__(self, hidden_dims=[64, 128, 128, 64], activation='tanh', use_log_output=False,
-                 use_finetune=False, finetune_hidden_dims=[32, 32], finetune_scale=0.1):
+                 use_finetune=False, finetune_hidden_dims=[32, 32], finetune_scale=0.1,
+                 use_exponential_superposition=False):
         super().__init__()
 
         self.use_log_output = use_log_output
         self.use_finetune = use_finetune
         self.finetune_scale = finetune_scale
+        self.use_exponential_superposition = use_exponential_superposition
 
         # Choose activation function
         if activation == 'tanh':
@@ -34,10 +36,15 @@ class VibrationPINN(nn.Module):
             input_dim = hidden_dim
 
         # Final layer output dimension
-        if use_log_output:
+        if use_exponential_superposition:
+            layers.append(nn.Linear(input_dim, 12))
+            # layers.append(act())
+        elif use_log_output:
             layers.append(nn.Linear(input_dim, 6))
+            # layers.append(act())
         else:
             layers.append(nn.Linear(input_dim, 3))
+            # layers.append(act())
 
         self.network = nn.Sequential(*layers)
 
@@ -48,11 +55,11 @@ class VibrationPINN(nn.Module):
 
             for hidden_dim in finetune_hidden_dims:
                 finetune_layers.append(nn.Linear(finetune_input_dim, hidden_dim))
-                finetune_layers.append(act())
+                # finetune_layers.append(act())
                 finetune_input_dim = hidden_dim
 
             finetune_layers.append(nn.Linear(finetune_input_dim, 3))
-            finetune_layers.append(nn.Tanh())
+            # finetune_layers.append(act())
 
             self.finetune_network = nn.Sequential(*finetune_layers)
         else:
@@ -79,7 +86,29 @@ class VibrationPINN(nn.Module):
         output = self.network(x)
 
         # Step 1: Convert network output to real space (base predictions)
-        if self.use_log_output:
+        if self.use_exponential_superposition:
+            # Network outputs: [m_x1, n_x1, m_x2, n_x2, m_v1, n_v1, m_v2, n_v2, m_a1, n_a1, m_a2, n_a2]
+            m_x1 = output[:, 0:1]
+            n_x1 = output[:, 1:2]
+            m_x2 = output[:, 2:3]
+            n_x2 = output[:, 3:4]
+
+            m_v1 = output[:, 4:5]
+            n_v1 = output[:, 5:6]
+            m_v2 = output[:, 6:7]
+            n_v2 = output[:, 7:8]
+
+            m_a1 = output[:, 8:9]
+            n_a1 = output[:, 9:10]
+            m_a2 = output[:, 10:11]
+            n_a2 = output[:, 11:12]
+
+            # Exponential superposition: x_t = m_x1*exp(n_x1) + m_x2*exp(n_x2)
+            x_pred_base = m_x1 * torch.exp(n_x1) + m_x2 * torch.exp(n_x2)
+            v_pred_base = m_v1 * torch.exp(n_v1) + m_v2 * torch.exp(n_v2)
+            a_pred_base = m_a1 * torch.exp(n_a1) + m_a2 * torch.exp(n_a2)
+
+        elif self.use_log_output:
             # Network outputs: [sign_x, log_x, sign_v, log_v, sign_a, log_a]
 
             # Extract sign and log magnitude
@@ -121,54 +150,6 @@ class VibrationPINN(nn.Module):
             a_pred = a_pred_base
 
         return torch.cat([x_pred, v_pred, a_pred], dim=1)
-
-    @staticmethod
-    def convert_targets_to_log_space(targets, eps=1e-10):
-        """
-        Convert real-space targets [x, v, a] to log-space
-        """
-        signs = torch.sign(targets)
-        signs = torch.where(signs == 0, torch.ones_like(signs), signs)
-
-        magnitudes = torch.abs(targets) + eps
-        log_magnitudes = torch.log10(magnitudes)
-
-        log_targets = torch.stack([
-            signs[:, 0], log_magnitudes[:, 0],
-            signs[:, 1], log_magnitudes[:, 1],
-            signs[:, 2], log_magnitudes[:, 2],
-        ], dim=1)
-
-        return log_targets
-
-    @staticmethod
-    def convert_targets_to_log_space(targets, eps=1e-10):
-        """
-        Convert real-space targets [x, v, a] to log-space [sign_x, log_x, sign_v, log_v, sign_a, log_a]
-
-        Args:
-            targets: (batch_size, 3) - [x, v, a] in real space
-            eps: Small value to avoid log(0)
-
-        Returns:
-            log_targets: (batch_size, 6) - [sign_x, log_x, sign_v, log_v, sign_a, log_a]
-        """
-        # Extract signs (convert to -1 or +1)
-        signs = torch.sign(targets)
-        signs = torch.where(signs == 0, torch.ones_like(signs), signs)  # Replace 0 with 1
-
-        # Compute log magnitudes
-        magnitudes = torch.abs(targets) + eps
-        log_magnitudes = torch.log10(magnitudes)
-
-        # Interleave signs and log magnitudes
-        log_targets = torch.stack([
-            signs[:, 0], log_magnitudes[:, 0],  # x
-            signs[:, 1], log_magnitudes[:, 1],  # v
-            signs[:, 2], log_magnitudes[:, 2],  # a
-        ], dim=1)
-
-        return log_targets
     
 
 class BaseLossComponent(ABC, nn.Module):
@@ -219,6 +200,11 @@ class MSELoss(BaseLossComponent):
             loss: Scalar tensor
         """
         eps = 1e-10
+
+        # just nn.MSELoss in all cases
+        # loss_fn = nn.MSELoss(reduction='mean')
+        # loss = loss_fn(predictions, targets)
+
 
         if self.use_log:
             # Log-space MSE
@@ -620,162 +606,6 @@ class ConsistencyLoss_finite_diff(BaseLossComponent):
             total_loss = torch.log(total_loss + eps)
 
         return total_loss
-
-
-class PINNLoss(nn.Module):
-    """
-    Composite PINN Loss with automatic component instantiation
-
-    Usage:
-        # Simple interface - set weight=None or weight=0 to disable
-        loss_fn = PINNLoss(
-            model=my_pinn_model,       # Required for consistency loss
-            mse_weight=0.2,
-            residual_weight=None,      # Won't be created
-            initial_weight=0.8,
-            consistency_weight=0.0     # Won't be created
-        )
-
-        # With component-specific options
-        loss_fn = PINNLoss(
-            model=my_pinn_model,
-            mse_weight=0.5,
-            residual_weight=0.3,
-            initial_weight=0.2,
-            residual_use_relative=True,
-            initial_t_threshold=1e-5
-        )
-    """
-
-    def __init__(self,
-                 model=None,
-                 mse_weight=None,
-                 residual_weight=None,
-                 initial_weight=None,
-                 consistency_weight=None,
-                 # Component-specific kwargs
-                 residual_use_relative=False,
-                 initial_t_threshold=1e-4):
-        super().__init__()
-
-        self.model = model
-
-        self.components = nn.ModuleList()
-        self.component_names = []
-
-        # === MSE Loss ===
-        if mse_weight is not None and mse_weight > 0:
-            self.mse_weight = mse_weight
-            self.mse_fn = nn.MSELoss()
-            self.component_names.append('mse_loss')
-        else:
-            self.mse_weight = None
-            self.mse_fn = None
-
-        # === Residual Loss ===
-        if residual_weight is not None and residual_weight > 0:
-            self.residual_loss = ResidualLoss(
-                weight=residual_weight,
-                use_relative=residual_use_relative
-            )
-            self.components.append(self.residual_loss)
-            self.component_names.append('residual_loss')
-        else:
-            self.residual_loss = None
-
-        # === Initial Condition Loss ===
-        if initial_weight is not None and initial_weight > 0:
-            self.initial_loss = InitialConditionLoss(
-                weight=initial_weight,
-                t_threshold=initial_t_threshold
-            )
-            self.components.append(self.initial_loss)
-            self.component_names.append('initial_loss')
-        else:
-            self.initial_loss = None
-
-        # === Consistency Loss ===
-        if consistency_weight is not None and consistency_weight > 0:
-            if model is None:
-                raise ValueError("Model must be provided to PINNLoss when using consistency_weight > 0")
-            self.consistency_loss = ConsistencyLoss_auto_diff(weight=consistency_weight, model=model)
-            self.components.append(self.consistency_loss)
-            self.component_names.append('consistency_loss')
-        else:
-            self.consistency_loss = None
-
-        # Validate at least one component is active
-        has_mse = self.mse_fn is not None
-        has_other_components = len(self.components) > 0
-        if not (has_mse or has_other_components):
-            raise ValueError("At least one loss component must have weight > 0")
-
-        # Print configuration
-        self._print_config()
-    
-    def _print_config(self):
-        """Print loss configuration"""
-        print(f"\n{'='*60}")
-        print("PINN Loss Configuration:")
-        print(f"{'='*60}")
-
-        if self.mse_fn is not None:
-            print(f"  ✓ MSE Loss           : weight={self.mse_weight:.3f} ✓")
-        else:
-            print(f"  ✗ MSE Loss           : disabled (weight=0)")
-
-        if hasattr(self, 'residual_loss') and self.residual_loss:
-            print(f"  ✓ {self.residual_loss}")
-        else:
-            print(f"  ✗ Residual Loss      : disabled (weight=0)")
-
-        if hasattr(self, 'initial_loss') and self.initial_loss:
-            print(f"  ✓ {self.initial_loss}")
-        else:
-            print(f"  ✗ Initial Cond Loss  : disabled (weight=0)")
-
-        if hasattr(self, 'consistency_loss') and self.consistency_loss:
-            print(f"  ✓ {self.consistency_loss}")
-        else:
-            print(f"  ✗ Consistency Loss   : disabled (weight=0)")
-
-        print(f"{'='*60}\n")
-    
-    def forward(self, predictions, targets, inputs, norm_params=None, inputs_real=None):
-        """
-        Compute total loss from active components
-
-        Args:
-            predictions: (batch_size, 3) - [x, v, a] predictions
-            targets: (batch_size, 3) - [x, v, a] targets
-            inputs: (batch_size, 6) - [m, zeta, k, t, x0, v0] NORMALIZED
-            norm_params: Dictionary with normalizer
-            inputs_real: (batch_size, 6) - [m, zeta, k, t, x0, v0] in REAL space
-
-        Returns:
-            total_loss: Scalar tensor
-            loss_dict: Dictionary with individual components for logging
-        """
-        total_loss = 0.0
-        loss_dict = {}
-
-        # === MSE Loss ===
-        if self.mse_fn is not None:
-            mse_value = self.mse_fn(predictions, targets)
-            weighted_mse = self.mse_weight * mse_value
-            total_loss = total_loss + weighted_mse
-            loss_dict['mse_loss'] = weighted_mse.item()
-
-        # === Other Component Losses ===
-        for component, name in zip(self.components, self.component_names):
-            if name != 'mse_loss':  # MSE already handled above
-                loss_value = component(predictions, targets, inputs, norm_params, inputs_real)
-                total_loss = total_loss + loss_value
-                loss_dict[name] = loss_value.item()
-
-        loss_dict['total'] = total_loss.item()
-
-        return total_loss, loss_dict
 
 
 class PINNLoss_v2(nn.Module):

@@ -667,15 +667,15 @@ class ExponentialPINN_ver3(nn.Module):
         # Build fine-tune network (if enabled)
         if self.use_finetune:
             finetune_layers = []
-            finetune_input_dim = 6  # [a, b, t, x_base, v_base, a_base]
-
+            finetune_input_dim = 9  # [a, b, t, sign_prob_x, sign_prob_v, sign_prob_a, mag_x, mag_v, mag_a]
+            finetune_act = nn.Tanh
             for hidden_dim in finetune_hidden_dims:
                 finetune_layers.append(nn.Linear(finetune_input_dim, hidden_dim))
-                finetune_layers.append(act())
+                finetune_layers.append(finetune_act())
                 finetune_input_dim = hidden_dim
 
             finetune_layers.append(nn.Linear(finetune_input_dim, 3))
-            finetune_layers.append(nn.Softplus())
+            # finetune_layers.append(nn.Tanh())
 
             self.finetune_network = nn.Sequential(*finetune_layers)
         else:
@@ -698,10 +698,36 @@ class ExponentialPINN_ver3(nn.Module):
         # Initialize weights
         self.apply(self._init_weights)
 
+        # Freeze finetune network initially (will be unfrozen later in training)
+        # if self.use_finetune:
+        #     self.freeze_finetune_network()
+
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             nn.init.xavier_normal_(m.weight)
             nn.init.zeros_(m.bias)
+
+    def freeze_finetune_network(self):
+        """Freeze finetune network parameters to prevent optimization"""
+        if self.finetune_network is not None:
+            for param in self.finetune_network.parameters():
+                param.requires_grad = False
+
+    def unfreeze_finetune_network(self):
+        """Unfreeze finetune network parameters to enable optimization"""
+        if self.finetune_network is not None:
+            for param in self.finetune_network.parameters():
+                param.requires_grad = True
+
+    def freeze_magnitude_network(self):
+        """Freeze magnitude network (main network) parameters to prevent optimization"""
+        for param in self.network.parameters():
+            param.requires_grad = False
+
+    def unfreeze_magnitude_network(self):
+        """Unfreeze magnitude network (main network) parameters to enable optimization"""
+        for param in self.network.parameters():
+            param.requires_grad = True
 
     def forward(self, x):
         """
@@ -713,9 +739,10 @@ class ExponentialPINN_ver3(nn.Module):
             mag_preds: Magnitude predictions (batch_size, 3)
             logabs_sign_pred: Sign predictions for log-abs values (batch_size, 3)
             real_sign_pred: Sign predictions for real values (batch_size, 3)
+            ft_cal: Calibration factors (batch_size, 3) - ones if use_finetune=False
         """
         output = self.network(x)
-
+        ln10 = np.log(10.0)  # Python float, PyTorch handles device automatically
         # Step 1: Convert network output to real space (base predictions)
         if self.use_log_output:
             # Network outputs: [sign_x, log_x, sign_v, log_v, sign_a, log_a]
@@ -729,7 +756,7 @@ class ExponentialPINN_ver3(nn.Module):
             log_a = output[:, 5:6]
 
             # Transform to real space: x = sign * 10^log = sign * exp(log * ln(10))
-            ln10 = np.log(10.0)  # Python float, PyTorch handles device automatically
+            
             x_pred_base = sign_x * torch.exp(log_x * ln10)
             v_pred_base = sign_v * torch.exp(log_v * ln10)
             a_pred_base = sign_a * torch.exp(log_a * ln10)
@@ -739,27 +766,12 @@ class ExponentialPINN_ver3(nn.Module):
             v_pred_base = output[:, 1:2]
             a_pred_base = output[:, 2:3]
 
-        # Step 2: Apply fine-tuning (independent of log_output setting)
-        if self.use_finetune:
-            # Ensure concatenation doesn't break gradient flow
-            base_preds = torch.cat([x_pred_base, v_pred_base, a_pred_base], dim=1)
-            finetune_input = torch.cat([x, base_preds], dim=1)
-
-            finetune_raw = self.finetune_network(finetune_input)
-            finetune_corrections = self.finetune_scale * finetune_raw
-
-            # Apply multiplicative correction
-            x_pred = x_pred_base * (1 + finetune_corrections[:, 0:1])
-            v_pred = v_pred_base * (1 + finetune_corrections[:, 1:2])
-            a_pred = a_pred_base * (1 + finetune_corrections[:, 2:3])
-        else:
-            x_pred = x_pred_base
-            v_pred = v_pred_base
-            a_pred = a_pred_base
+        # Step 2: Compute base magnitude predictions
+        # mag_preds is just base predictions, NO calibration applied in forward pass
+        mag_preds = torch.cat([x_pred_base, v_pred_base, a_pred_base], dim=1)
 
         # Step 3: Apply logabs sign network
         # Prepare input: concatenate [a, b, t] + current magnitude predictions (detached)
-        mag_preds = torch.cat([x_pred, v_pred, a_pred], dim=1)
         logabs_sign_input = torch.cat([x, mag_preds.detach()], dim=1)  # Shape: [batch, 6]
 
         # Get logabs sign predictions from ExponentialSignNN_ver3
@@ -774,8 +786,20 @@ class ExponentialPINN_ver3(nn.Module):
         # Store sigmoid probabilities for real sign BCE loss computation
         self.real_last_sign_probs = self.real_sign_network.last_sign_probs
 
-        # Return magnitude and both sign predictions separately
-        return mag_preds, logabs_sign_pred, real_sign_pred
+        # Step 5: Compute calibration factors (independent network with detached inputs)
+        if self.use_finetune:
+            # Use DETACHED inputs: [a, b, t] + sign_probs + mag_preds
+            finetune_input = torch.cat([x, self.logabs_last_sign_probs, mag_preds], dim=1).detach()  # Shape: [batch, 9]
+            
+            ft_cal_raw = self.finetune_network(finetune_input)/self.finetune_scale  # Shape: [batch, 3]
+            # use tanh to constrain calibration factors to (-1, 1)
+            ft_cal = ln10* torch.tanh(ft_cal_raw)
+        else:
+            # Return zeros when finetune disabled (identity calibration)
+            ft_cal = torch.zeros_like(mag_preds)
+
+        # Return magnitude, both sign predictions, and calibration factors separately
+        return mag_preds, logabs_sign_pred, real_sign_pred, ft_cal
 
 
 class BaseLossComponent(ABC, nn.Module):
@@ -788,13 +812,15 @@ class BaseLossComponent(ABC, nn.Module):
         self.enabled = weight > 0
 
     @abstractmethod
-    def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None, real_sign_probs=None):
+    def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None,
+                real_sign_probs=None, ft_cal=None, output_normalizer=None):
         pass
 
-    def forward(self, predictions, targets, inputs, norm_params=None, inputs_real=None, real_sign_probs=None):
+    def forward(self, predictions, targets, inputs, norm_params=None, inputs_real=None,
+                real_sign_probs=None, ft_cal=None, output_normalizer=None):
         if not self.enabled:
             return torch.tensor(0.0, device=predictions.device)
-        loss = self.compute(predictions, targets, inputs, norm_params, inputs_real, real_sign_probs)
+        loss = self.compute(predictions, targets, inputs, norm_params, inputs_real, real_sign_probs, ft_cal, output_normalizer)
         return self.weight * loss
 
     def __repr__(self):
@@ -805,23 +831,30 @@ class BaseLossComponent(ABC, nn.Module):
 class MSELoss(BaseLossComponent):
     """Mean Squared Error loss between predictions and targets"""
 
-    def __init__(self, weight=1.0, use_relative=False, use_log=False, sign_bce_weight=1.0, real_sign_bce_weight=1.0):
+    def __init__(self, weight=1.0, use_relative=False, use_log=False, sign_bce_weight=1.0, real_sign_bce_weight=1.0, ft_cal_weight=1.0, use_finetune_loss=True):
         super().__init__(weight=weight, name="MSE Loss")
         self.use_relative = use_relative
         self.use_log = use_log
+        self.ft_cal_weight = ft_cal_weight
+        self.use_finetune_loss = use_finetune_loss
         # Create SignBCELoss instances for both logabs and real sign loss computation
         self.logabs_sign_bce_loss = SignBCELoss(weight=sign_bce_weight) if sign_bce_weight > 0 else None
         self.real_sign_bce_loss = SignBCELoss(weight=real_sign_bce_weight) if real_sign_bce_weight > 0 else None
+        # Create L1Loss for ft_cal calibration loss (MAE)
+        self.ft_cal_criterion = nn.L1Loss()
 
-    def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None, real_sign_probs=None):
+    def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None,
+                real_sign_probs=None, ft_cal=None, output_normalizer=None):
         """
-        Compute MSE between predictions and targets with dual sign BCE losses
+        Compute MSE between predictions and targets with dual sign BCE losses and ft_cal loss
 
         Args:
             predictions: (batch_size, 3) - mag_preds (positive magnitudes)
             targets: (batch_size, 6) - complete targets [real_signs (0-2), logabs_values (3-5)]
             inputs: (batch_size, 3) - logabs_sign_probs (sigmoid probabilities for logabs signs)
             real_sign_probs: (batch_size, 3) - real_sign_probs (sigmoid probabilities for real signs)
+            ft_cal: (batch_size, 3) - calibration factors from finetune network
+            output_normalizer: normalizer for denormalization
 
         Returns:
             loss: Scalar tensor
@@ -856,13 +889,148 @@ class MSELoss(BaseLossComponent):
                 real_sign_targets = targets[:, :3]  # Extract real signs (columns 0-2)
                 real_sign_bce_value = self.real_sign_bce_loss(real_sign_probs, real_sign_targets)
 
+            # Compute ft_cal loss (additive calibration in log-space)
+            ft_cal_loss_value = 0.0
+            if self.use_finetune_loss and self.ft_cal_weight > 0 and ft_cal is not None:
+                # Use torch.sign on logabs_sign_probs (shifted to [-1, 1] range)
+                # inputs here is logabs_sign_probs in [0, 1], shift to [-0.5, 0.5] then use sign
+                logabs_sign = torch.sign(inputs - 0.5)
+
+                # Additive calibration: calibrated = signed_mag_preds + ft_cal
+                # signed_mag_preds = (logabs_sign * predictions).detach()
+                signed_mag_preds = predictions.detach() 
+                calibrated_preds = signed_mag_preds + ft_cal  # Only ft_cal has gradient
+
+                # MAE loss using nn.L1Loss
+                ft_cal_loss_value = self.ft_cal_criterion(torch.abs(calibrated_preds), torch.abs(logabs_targets))
+                # ft_cal_loss_value = self.ft_cal_criterion(torch.abs(calibrated_preds)/torch.abs(logabs_targets), logabs_targets*0 + 1.0)
+                ft_cal_loss_value = self.ft_cal_weight * ft_cal_loss_value
+
             # Store component losses for detailed reporting
             self.last_magnitude_loss = magnitude_loss.item()
             self.last_logabs_sign_bce_loss = logabs_sign_bce_value.item() if isinstance(logabs_sign_bce_value, torch.Tensor) else logabs_sign_bce_value
             self.last_real_sign_bce_loss = real_sign_bce_value.item() if isinstance(real_sign_bce_value, torch.Tensor) else real_sign_bce_value
+            self.last_ft_cal_loss = ft_cal_loss_value.item() if isinstance(ft_cal_loss_value, torch.Tensor) else ft_cal_loss_value
 
-            # Combine all losses: magnitude + logabs sign + real sign
-            loss = magnitude_loss + logabs_sign_bce_value + real_sign_bce_value
+            # Combine all losses: magnitude + logabs sign + real sign + ft_cal
+            loss = magnitude_loss + logabs_sign_bce_value + real_sign_bce_value + ft_cal_loss_value
+        else:
+            # Standard MSE (not log-space)
+            if self.use_relative:
+                # Relative MSE: normalized by target magnitude
+                loss = torch.mean(((predictions - targets) ** 2) / (torch.square(targets) + eps))
+            else:
+                # Absolute MSE
+                loss = torch.mean((predictions - targets) ** 2)
+
+        return loss
+
+
+
+class Unuse_MSELoss(BaseLossComponent):
+    """Mean Squared Error loss between predictions and targets"""
+
+    def __init__(self, weight=1.0, use_relative=False, use_log=False, sign_bce_weight=1.0, real_sign_bce_weight=1.0, ft_cal_weight=1.0, use_finetune_loss=True):
+        super().__init__(weight=weight, name="MSE Loss")
+        self.use_relative = use_relative
+        self.use_log = use_log
+        self.ft_cal_weight = ft_cal_weight
+        self.use_finetune_loss = use_finetune_loss
+        # Create SignBCELoss instances for both logabs and real sign loss computation
+        self.logabs_sign_bce_loss = SignBCELoss(weight=sign_bce_weight) if sign_bce_weight > 0 else None
+        self.real_sign_bce_loss = SignBCELoss(weight=real_sign_bce_weight) if real_sign_bce_weight > 0 else None
+        # Create L1Loss for ft_cal calibration loss (MAE)
+        self.ft_cal_criterion = nn.L1Loss()
+
+    def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None,
+                real_sign_probs=None, ft_cal=None, output_normalizer=None):
+        """
+        Compute MSE between predictions and targets with dual sign BCE losses and ft_cal loss
+
+        Args:
+            predictions: (batch_size, 3) - mag_preds (positive magnitudes)
+            targets: (batch_size, 6) - complete targets [real_signs (0-2), logabs_values (3-5)]
+            inputs: (batch_size, 3) - logabs_sign_probs (sigmoid probabilities for logabs signs)
+            real_sign_probs: (batch_size, 3) - real_sign_probs (sigmoid probabilities for real signs)
+            ft_cal: (batch_size, 3) - calibration factors from finetune network
+            output_normalizer: normalizer for denormalization
+
+        Returns:
+            loss: Scalar tensor
+        """
+        eps = 1e-10
+
+        if self.use_log:
+            # Extract logabs targets (columns 3-5) for magnitude loss
+            logabs_targets = targets[:, 3:]  # [logabs_x, logabs_v, logabs_a]
+
+            # Compute magnitude loss (log-space MSE)
+            # predictions are already mag_preds (positive magnitudes, no abs needed)
+            log_predictions = torch.log(torch.abs(predictions) + eps)
+            log_targets = torch.log(torch.abs(logabs_targets) + eps)
+
+            if self.use_relative:
+                # Relative log-space MSE for magnitudes
+                magnitude_loss = torch.mean(((log_predictions - log_targets) ** 2) / (torch.square(log_targets) + eps))
+            else:
+                # Absolute log-space MSE for magnitudes
+                magnitude_loss = torch.mean((log_predictions - log_targets) ** 2)
+
+            # Compute logabs sign BCE loss
+            logabs_sign_bce_value = 0.0
+            if self.logabs_sign_bce_loss is not None and inputs is not None:
+                logabs_sigmoid_probs = inputs  # This is logabs_last_sign_probs passed from training loop
+                logabs_sign_bce_value = self.logabs_sign_bce_loss(logabs_sigmoid_probs, logabs_targets)
+
+            # Compute real sign BCE loss
+            real_sign_bce_value = 0.0
+            if self.real_sign_bce_loss is not None and real_sign_probs is not None:
+                real_sign_targets = targets[:, :3]  # Extract real signs (columns 0-2)
+                real_sign_bce_value = self.real_sign_bce_loss(real_sign_probs, real_sign_targets)
+
+            # Compute ft_cal loss (additive calibration in log-space)
+            ft_cal_loss_value = 0.0
+            if self.use_finetune_loss and self.ft_cal_weight > 0 and ft_cal is not None and real_sign_probs is not None:
+                # Use torch.sign on logabs_sign_probs (shifted to [-1, 1] range)
+                # inputs here is logabs_sign_probs in [0, 1], shift to [-0.5, 0.5] then use sign
+                logabs_sign = torch.sign(inputs - 0.5)
+
+                # Additive calibration: calibrated = signed_mag_preds + ft_cal
+                # signed_mag_preds = (logabs_sign * predictions).detach()
+                signed_mag_preds = predictions.detach()
+                calibrated_preds = signed_mag_preds + ft_cal  # Only ft_cal has gradient
+
+                # Old approach: L1 loss in log-space (commented out)
+                # ft_cal_loss_value = self.ft_cal_criterion(torch.abs(calibrated_preds), torch.abs(logabs_targets))
+                # ft_cal_loss_value = self.ft_cal_weight * ft_cal_loss_value
+
+                # New approach: denormalize to real space and compute log-ratio loss
+                # Get real signs from real_sign_probs
+                real_sign = torch.sign(real_sign_probs - 0.5)
+
+                # Denormalize calibrated predictions to real space
+                # calibrated_preds is in log-space, transform: real = sign * 10^logabs
+                ln10 = torch.tensor(np.log(10.0), device=calibrated_preds.device, dtype=calibrated_preds.dtype)
+                real_value_pred = real_sign * torch.exp(calibrated_preds * ln10)
+
+                # Denormalize ground truth to real space
+                # Extract real signs from targets
+                gt_real_sign = targets[:, :3]  # Ground truth real signs
+                real_value_gt = gt_real_sign * torch.exp(logabs_targets * ln10)
+
+                # Compute log-ratio loss: mean(abs(log(abs(pred/gt))))
+                ratio = real_value_pred / (torch.abs(real_value_gt) + eps)
+                ft_cal_loss_value = torch.mean(torch.abs(torch.log(torch.abs(ratio) + eps)))
+                ft_cal_loss_value = self.ft_cal_weight * ft_cal_loss_value
+
+            # Store component losses for detailed reporting
+            self.last_magnitude_loss = magnitude_loss.item()
+            self.last_logabs_sign_bce_loss = logabs_sign_bce_value.item() if isinstance(logabs_sign_bce_value, torch.Tensor) else logabs_sign_bce_value
+            self.last_real_sign_bce_loss = real_sign_bce_value.item() if isinstance(real_sign_bce_value, torch.Tensor) else real_sign_bce_value
+            self.last_ft_cal_loss = ft_cal_loss_value.item() if isinstance(ft_cal_loss_value, torch.Tensor) else ft_cal_loss_value
+
+            # Combine all losses: magnitude + logabs sign + real sign + ft_cal
+            loss = magnitude_loss + logabs_sign_bce_value + real_sign_bce_value + ft_cal_loss_value
         else:
             # Standard MSE (not log-space)
             if self.use_relative:
@@ -932,7 +1100,8 @@ class ExponentialResidualLoss(BaseLossComponent):
         super().__init__(weight=weight, name="Exponential Residual Loss")
         self.use_relative = use_relative
 
-    def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None, real_sign_probs=None):
+    def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None,
+                real_sign_probs=None, ft_cal=None, output_normalizer=None):
         """
         Enforce exponential physics equation:
         (1/(2a))*a_t + 0.5*v_t - a*x_t = 0
@@ -940,7 +1109,7 @@ class ExponentialResidualLoss(BaseLossComponent):
         Args:
             predictions: (batch_size, 3) - [x_t, v_t, a_t] in real space
             inputs_real: (batch_size, 3) - [a, b, t] in real space
-            real_sign_probs: Not used (for signature compatibility)
+            Other args: Not used (for signature compatibility)
         """
         if inputs_real is None:
             raise ValueError("ExponentialResidualLoss requires inputs_real to be provided")
@@ -987,7 +1156,8 @@ class ConsistencyLoss_auto_diff(BaseLossComponent):
         """Set the model reference for gradient computation"""
         self.model = model
 
-    def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None, real_sign_probs=None):
+    def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None,
+                real_sign_probs=None, ft_cal=None, output_normalizer=None):
         """
         Enforces consistency between position, velocity, and acceleration
         using automatic differentiation with log-normalized time.
@@ -997,6 +1167,8 @@ class ConsistencyLoss_auto_diff(BaseLossComponent):
             norm_params: Dictionary with 'normalizer' key containing normalizer instance
             inputs_real: (batch_size, 3) - [a, b, t] in REAL space
             real_sign_probs: Not used (for signature compatibility)
+            ft_cal: Not used (for signature compatibility)
+            output_normalizer: Not used (for signature compatibility)
 
         Returns:
             loss: Scalar tensor measuring consistency error
@@ -1135,7 +1307,8 @@ class ConsistencyLoss_finite_diff(BaseLossComponent):
         self.weight_a_v_target = weight_a_v_target
         self.weight_a_x_target = weight_a_x_target
 
-    def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None, real_sign_probs=None):
+    def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None,
+                real_sign_probs=None, ft_cal=None, output_normalizer=None):
         """
         Compute finite difference consistency loss
 
@@ -1147,6 +1320,8 @@ class ConsistencyLoss_finite_diff(BaseLossComponent):
             inputs_real: (4*batch_size, 3) - predictions at perturbed times
                         [t-2Δt, t-Δt, t+Δt, t+2Δt] stacked
             real_sign_probs: Not used (for signature compatibility)
+            ft_cal: Not used (for signature compatibility)
+            output_normalizer: Not used (for signature compatibility)
 
         Returns:
             total_loss: Scalar tensor representing the natural log of the total loss.
@@ -1276,7 +1451,10 @@ class ExponentialPINNLoss(nn.Module):
             weight = config.get("weight", 1.0)
             sign_bce_weight = config.get("sign_bce_weight", 1.0)
             real_sign_bce_weight = config.get("real_sign_bce_weight", 1.0)
-            self.loss_components["MSE"] = MSELoss(weight=weight, use_relative=use_relative, use_log=use_log, sign_bce_weight=sign_bce_weight, real_sign_bce_weight=real_sign_bce_weight)
+            ft_cal_weight = config.get("ft_cal_weight", 1.0)
+            # Use model.use_finetune to determine if ft_cal_loss should be computed
+            use_finetune_loss = getattr(model, 'use_finetune', False)
+            self.loss_components["MSE"] = MSELoss(weight=weight, use_relative=use_relative, use_log=use_log, sign_bce_weight=sign_bce_weight, real_sign_bce_weight=real_sign_bce_weight, ft_cal_weight=ft_cal_weight, use_finetune_loss=use_finetune_loss)
 
         # Initialize Residual loss if requested
         if self._should_enable("Residual"):
@@ -1328,7 +1506,7 @@ class ExponentialPINNLoss(nn.Module):
         Args:
             loss_args: Dictionary with loss arguments
                 {
-                    "MSE": (mag_preds, targets, logabs_sign_probs, None, None, real_sign_probs),
+                    "MSE": (mag_preds, targets, logabs_sign_probs, None, None, real_sign_probs, ft_cal, output_normalizer),
                     "Residual": (outputs, inputs_real),
                     "Consistency": (inputs, inputs_real, norm_params)
                 }
@@ -1342,10 +1520,10 @@ class ExponentialPINNLoss(nn.Module):
 
         # MSE Loss
         if "MSE" in self.loss_components and "MSE" in loss_args:
-            # Unpack 6 arguments: (mag_preds, targets, logabs_sign_probs, None, None, real_sign_probs)
-            mag_preds, targets, logabs_sign_probs, _, _, real_sign_probs = loss_args["MSE"]
+            # Unpack 8 arguments: (mag_preds, targets, logabs_sign_probs, None, None, real_sign_probs, ft_cal, output_normalizer)
+            mag_preds, targets, logabs_sign_probs, _, _, real_sign_probs, ft_cal, output_normalizer = loss_args["MSE"]
             mse_value = self.loss_components["MSE"](
-                mag_preds, targets, logabs_sign_probs, None, None, real_sign_probs
+                mag_preds, targets, logabs_sign_probs, None, None, real_sign_probs, ft_cal, output_normalizer
             )
             total_loss += mse_value
             loss_summary["mse_loss"] = mse_value.item()
@@ -1357,6 +1535,8 @@ class ExponentialPINNLoss(nn.Module):
                 loss_summary["logabs_sign_bce_loss"] = self.loss_components["MSE"].last_logabs_sign_bce_loss
             if hasattr(self.loss_components["MSE"], 'last_real_sign_bce_loss'):
                 loss_summary["real_sign_bce_loss"] = self.loss_components["MSE"].last_real_sign_bce_loss
+            if hasattr(self.loss_components["MSE"], 'last_ft_cal_loss'):
+                loss_summary["ft_cal_loss"] = self.loss_components["MSE"].last_ft_cal_loss
 
         # Residual Loss
         if "Residual" in self.loss_components and "Residual" in loss_args:

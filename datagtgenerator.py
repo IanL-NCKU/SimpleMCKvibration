@@ -492,7 +492,7 @@ def main():
     attempts = 0
     while i < n:
         attempts += 1
-        
+        """
         # Generate a single random sample
         m = 10.0 ** np.random.uniform(-3, 3)
         if np.random.rand() < 0.05:
@@ -507,7 +507,22 @@ def main():
             t = np.random.uniform(1e-3, 1000)
         x0 = np.random.choice([-1.0, 1.0]) * np.random.uniform(0, 100)
         v0 = np.random.choice([-1.0, 1.0]) * np.random.uniform(0, 100)
-        
+        """
+        # Generate a single random sample
+        m = np.round(10.0 ** np.random.uniform(-2, 2), 3)
+        if np.random.rand() < 0.05:
+            zeta = 1.0
+        else:
+            zeta = np.round(10.0 ** np.random.uniform(-2, 2), 3)
+        k = np.round(10.0 ** np.random.uniform(-2, 2), 3)
+        t_type = np.random.rand()
+        if t_type < 0.2:
+            t = np.round(10.0 ** np.random.uniform(-2, 2), 3)
+        else:
+            t = np.round(np.random.uniform(1e-3, 1000), 3)
+        x0 = np.round(np.random.choice([-1.0, 1.0]) * np.random.uniform(0, 100), 3)
+        v0 = np.round(np.random.choice([-1.0, 1.0]) * np.random.uniform(0, 100), 3)
+
         c = 2 * zeta * np.sqrt(m * k)
         
         is_valid = True
@@ -535,14 +550,14 @@ def main():
                     if len(w) > 0  or \
                         any(np.isnan([x_t, v_t, a_t])) or \
                         any(np.isinf([x_t, v_t, a_t])) or \
-                        any(np.abs([x_t, v_t, a_t]) > 1e4):
+                        any(np.abs([x_t, v_t, a_t]) > 1e3):
 
                         is_valid = False
 
-                    elif any(np.abs([x_t, v_t, a_t]) < 1e-6):
+                    elif any(np.abs([x_t, v_t, a_t]) < 1e-2):
                         # only 1% of the data with very small values
                         j += 1
-                        if np.random.rand() > 0.001:
+                        if np.random.rand() > 0.00:
                             is_valid = False
 
                         # elif any(np.abs([x_t, v_t, a_t]) < 1e-12):
@@ -578,13 +593,13 @@ def main():
     print(f"\nTotal attempts to generate {n} valid samples: {attempts}")
     
     # Save as npz file
-    np.savez('train_val_vibration_data.npz', data=data)
-    print(f"\nData generation complete! Saved {n} samples to 'train_val_vibration_data.npz'")
+    np.savez('small_scale_trainval_vibration_data.npz', data=data)
+    print(f"\nData generation complete! Saved {n} samples to 'small_scale_trainval_vibration_data.npz'")
     print(f"Data shape: {data.shape}")
     print(f"Columns: [m, zeta, k, t, x0, v0, x(t), v(t), a(t)]")
     print(data[:5, :])  # Print first 5 samples
     # Generate and save data distribution plots
-    function_save_datadistribution(data, output_dir='tran_val_data_distributions')
+    function_save_datadistribution(data, output_dir='small_scale_trainval_data_distributions')
     
     for i in range(n):
         if i % 10000 == 0:
@@ -647,6 +662,6 @@ def main():
 
 
 if __name__ == "__main__":
-    # main()
+    main()
     # unittest_overflow()
-    trycalculate_v_a()
+    # trycalculate_v_a()

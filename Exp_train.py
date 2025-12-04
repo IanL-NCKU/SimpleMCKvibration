@@ -17,6 +17,7 @@ def log_training_results(log_dict, results_folder='./results', filename='trainin
     outputs = log_dict['outputs']
     targets = log_dict['targets']
     train_loss = log_dict['train_loss']
+    val_calibration_rate = log_dict.get('val_calibration_rate', None)
 
     if torch.is_tensor(outputs):
         outputs = outputs.detach().cpu().numpy()
@@ -29,10 +30,14 @@ def log_training_results(log_dict, results_folder='./results', filename='trainin
         if not file_exists:
             header_fields = ["epoch", "output_x", "output_v", "output_a",
                            "target_x", "target_v", "target_a", "train_loss"]
+            if val_calibration_rate is not None:
+                header_fields.append("val_calibration_rate")
             f.write(delimiter.join(header_fields) + "\n")
 
         data_fields = [f"{epoch}", f"{outputs[0]:.6e}", f"{outputs[1]:.6e}", f"{outputs[2]:.6e}",
                       f"{targets[0]:.6e}", f"{targets[1]:.6e}", f"{targets[2]:.6e}", f"{train_loss:.6e}"]
+        if val_calibration_rate is not None:
+            data_fields.append(f"{val_calibration_rate:.2f}")
         f.write(delimiter.join(data_fields) + "\n")
 
     return log_path
@@ -68,8 +73,8 @@ def prediction_performance(data_path, model_pt_path, model, normalizer, device, 
             inputs = inputs.to(device, dtype=dtype)
             targets = targets.to(device, dtype=dtype)
 
-            # Forward pass - returns (mag_preds, logabs_sign_pred, real_sign_pred) tuple
-            mag_preds, logabs_sign_pred, real_sign_pred = model(inputs)
+            # Forward pass - returns (mag_preds, logabs_sign_pred, real_sign_pred, ft_cal) tuple
+            mag_preds, logabs_sign_pred, real_sign_pred, ft_cal = model(inputs)
 
             # The model's mag_preds are the predicted log-absolute values.
             # These are directly comparable to the log-absolute part of the targets.
@@ -78,7 +83,8 @@ def prediction_performance(data_path, model_pt_path, model, normalizer, device, 
             # Extract log-absolute targets for comparison
             # Targets shape: (batch, 6) -> [real_signs (0-2), logabs_values (3-5)]
             logabs_targets = targets[:, 3:]
-            outputs = (mag_preds * logabs_sign_pred).detach()
+            # Apply additive calibration: outputs = signed_mag_preds + ft_cal
+            outputs = ( logabs_sign_pred* (mag_preds + ft_cal)).detach()
             all_predictions.append(outputs.cpu().numpy())
             all_targets.append(logabs_targets.cpu().numpy())
 
@@ -136,10 +142,35 @@ def prediction_performance(data_path, model_pt_path, model, normalizer, device, 
     print(f"{'='*60}\n")
 
 
+def calculate_calibration_improvement(outputs_before, outputs_after, targets):
+    """
+    Calculate how much ft_cal improves predictions.
+
+    Args:
+        outputs_before: Predictions before calibration (batch, 3)
+        outputs_after: Predictions after calibration (batch, 3)
+        targets: Ground truth targets (batch, 3)
+
+    Returns:
+        closer_rate: Percentage of outputs closer after calibration
+        mean_improvement: Average error reduction
+    """
+    error_before = torch.abs(torch.abs(outputs_before) - torch.abs(targets))
+    error_after = torch.abs(torch.abs(outputs_after) - torch.abs(targets))
+    improvement = error_before - error_after  # Positive = improvement
+
+    closer_count = (improvement > 0).sum().item()
+    total_count = improvement.numel()
+    closer_rate = closer_count / total_count * 100
+    mean_improvement = improvement.mean().item()
+
+    return closer_rate, mean_improvement
+
+
 def main():
-    device_index = 1
-    train_in_64 = False
-    epochs = 20
+    device_index = 0
+    train_in_64 = True
+    epochs = 1000
 
     # Data paths
     Train_Val_data_source = r'E:\Ian\PINNexample\exponential_trainval_data.npz'
@@ -176,19 +207,19 @@ def main():
         dtype = torch.float32
         print("Training in float32 (single precision) mode")
 
-    model_save_path = 'expwithsign_model_tanh_nofinetune_newsignmodel_realtest.pt'
-    results_figure_folder = './expwithsign_results_tanh_nofinetune_newsignmodel_realtest'
+    model_save_path = 'expwithsign_model_elu_newsignmodel_realtest64_finetunene6.pt'
+    results_figure_folder = './expwithsign_results_elu_newsignmodel_realtest64_finetunene6'
 
     # Create the Exponential PINN model
     model = ExponentialPINN_ver3(hidden_dims=[16, 32, 64, 64, 32, 16],
-                          activation='tanh',
+                          activation='elu',
                           use_log_output=False,
-                          use_finetune=False,
-                          finetune_hidden_dims=[16, 32, 32, 16],
-                          finetune_scale=1,
-                          logabs_sign_network_hidden_dims=[64, 64, 32, 16],
+                          use_finetune=True,
+                          finetune_hidden_dims=[32, 128, 32],
+                          finetune_scale=10,
+                          logabs_sign_network_hidden_dims=[128, 64, 64, 32, 32],
                           logabs_sign_network_dropout=0.3,
-                          real_sign_network_hidden_dims=[64, 64, 32, 16],
+                          real_sign_network_hidden_dims=[64, 64, 32, 32],
                           real_sign_network_dropout=0.3).to(device)
 
     # model = ExponentialPINN(hidden_dims=[16, 32, 32, 64, 32, 32, 16],
@@ -202,14 +233,14 @@ def main():
 
     # Configure losses
     loss_config = {
-        "MSE": {"weight": 1.0, "use_relative": False, "use_log": True, "sign_bce_weight": 1.0, "real_sign_bce_weight": 1.0},
+        "MSE": {"weight": 1.0, "use_relative": False, "use_log": True, "sign_bce_weight": 1.0, "real_sign_bce_weight": 1.0, "ft_cal_weight": 1.0},
         "Residual": {"weight": 0.0, "use_relative": True},
         "Consistency": {"weight": 0.0, "t_threshold": 1e-5, "type": "auto", "use_relative": True, "use_log": False}
     }
 
     loss_fn = ExponentialPINNLoss(model, loss_config)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
-    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=np.max([epochs//10,1]), eta_min=1e-12)
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=np.max([epochs//20,1]), eta_min=1e-13)
 
     # Prepare norm_params for consistency loss
     norm_params = {'normalizer': train_val_inputs_normalizer}
@@ -218,7 +249,43 @@ def main():
     # Input data shape: (batch_size, 3) -> [a, b, t]
     # Target data shape: (batch_size, 3) -> [x_t, v_t, a_t]
     best_combined_loss = float('inf')
+    finetune_activation_epoch = int(epochs * 0.5)  # Activate finetune network after 25% of epochs
+
     for epoch in range(epochs):
+        # Two-phase training logic
+        if epoch == 0:
+            # Phase 1 setup: Freeze finetune network, train magnitude + sign networks
+            print(f"\n{'='*60}")
+            print("PHASE 1: Training magnitude network + sign networks")
+            print("Finetune network: FROZEN")
+            print(f"{'='*60}")
+            model.freeze_finetune_network()
+            model.unfreeze_magnitude_network()
+
+        elif epoch == finetune_activation_epoch:
+            # Phase 2 transition: Load best Phase 1 weights, freeze magnitude, unfreeze finetune
+            print(f"\n{'='*60}")
+            print(f"PHASE 2 TRANSITION at epoch {epoch+1}/{epochs} (25% threshold)")
+            print(f"Loading best Phase 1 weights from: {model_save_path}")
+            print(f"{'='*60}")
+
+            # Load best Phase 1 model
+            model.load_state_dict(torch.load(model_save_path))
+
+            # Switch network freeze states
+            model.freeze_magnitude_network()
+            model.unfreeze_finetune_network()
+
+            # Reset best loss tracking for Phase 2
+            best_combined_loss = float('inf')
+
+            print(f"\n{'='*60}")
+            print("PHASE 2: Training finetune network + sign networks")
+            print("Magnitude network: FROZEN")
+            print("Sign networks: CONTINUE TRAINING")
+            print(f"{'='*60}")
+
+
         print(f"\nEpoch {epoch+1}/{epochs}")
         model.train()
         train_loss = 0.0
@@ -283,13 +350,14 @@ def main():
             # Stack all inputs
             inputs_combined = torch.cat(inputs_list, dim=0)
 
-            # Forward pass - returns (mag_preds, logabs_sign_pred, real_sign_pred) tuple
-            mag_preds_combined, logabs_sign_pred_combined, real_sign_pred_combined = model(inputs_combined)
+            # Forward pass - returns (mag_preds, logabs_sign_pred, real_sign_pred, ft_cal) tuple
+            mag_preds_combined, logabs_sign_pred_combined, real_sign_pred_combined, ft_cal_combined = model(inputs_combined)
 
             # Split outputs based on what was stacked
             mag_preds = mag_preds_combined[:N]
             logabs_sign_pred = logabs_sign_pred_combined[:N]
             real_sign_pred = real_sign_pred_combined[:N]
+            ft_cal = ft_cal_combined[:N]
 
             # Reconstruct signed log-space outputs for display/other losses
             # Use logabs_sign_pred (not real_sign_pred) because outputs represent signed log-abs values
@@ -306,10 +374,10 @@ def main():
             # Prepare loss arguments
             loss_args = {}
             if loss_fn.has_loss("MSE"):
-                # Pass mag_preds, targets (full 6 columns), logabs_sign_probs, and real_sign_probs
+                # Pass mag_preds, targets (full 6 columns), logabs_sign_probs, real_sign_probs, ft_cal, output_normalizer
                 logabs_sign_probs = model.logabs_last_sign_probs
                 real_sign_probs = model.real_last_sign_probs
-                loss_args["MSE"] = (mag_preds, targets, logabs_sign_probs, None, None, real_sign_probs)
+                loss_args["MSE"] = (mag_preds, targets, logabs_sign_probs, None, None, real_sign_probs, ft_cal, train_val_targets_normalizer)
             if loss_fn.has_loss("Residual"):
                 loss_args["Residual"] = (outputs, inputs_real)
             if loss_fn.has_loss("Consistency"):
@@ -339,10 +407,12 @@ def main():
 
         # Print the last output and last ground truth of the inputs and targets
         logabs_targets = targets[:, 3:]  # Extract for printing
-        print("Last batch mag_preds v.s logabs_targets:", mag_preds[-1].detach().cpu().numpy(), logabs_targets[-1].detach().cpu().numpy())
+        print("Last batch mag_preds v.s logabs_targets:", (torch.sign(logabs_sign_pred)*mag_preds)[-1].detach().cpu().numpy(), logabs_targets[-1].detach().cpu().numpy())
 
-        # Print real value predictions vs ground truth
-        pred_normalized = torch.cat([real_sign_pred, outputs], dim=1).detach()
+        # Print real value predictions vs ground truth (with additive calibration applied)
+        outputs_ft_cal = (torch.sign(logabs_sign_pred)*(mag_preds + ft_cal)).detach()
+        print("Last batch outputs_ft_cal v.s logabs_targets:", outputs_ft_cal[-1].cpu().numpy(), logabs_targets[-1].detach().cpu().numpy())
+        pred_normalized = torch.cat([real_sign_pred, outputs_ft_cal], dim=1).detach()
         real_value_pred = train_val_targets_normalizer.denormalize_outputs(pred_normalized[-1:].cpu().numpy())[0]
         real_value_gt = train_val_targets_normalizer.denormalize_outputs(targets.detach().cpu().numpy())[-1]
         print("Last batch pred_real_value v.s targets_real_value:", real_value_pred, real_value_gt)
@@ -353,19 +423,14 @@ def main():
         for key in train_loss_components:
             train_loss_components[key] /= len(train_loader.dataset)
 
-        # Log training results to file (before validation)
-        log_dict = {
-            'epoch': epoch + 1,
-            'outputs': outputs[-1],  # Last batch last sample
-            'targets': logabs_targets[-1],
-            'train_loss': train_loss
-        }
-        log_training_results(log_dict, results_folder=results_figure_folder, filename='training_explog.txt')
-
         # Validation loop
         model.eval()
         val_loss = 0.0
         val_loss_components = {}
+
+        # Initialize calibration metrics
+        val_calibration_closer = 0
+        val_calibration_total = 0
 
         # Determine if we need gradients for consistency loss (auto-diff type)
         use_no_grad_val = True
@@ -436,13 +501,14 @@ def main():
                 # Stack all inputs
                 inputs_combined = torch.cat(inputs_list, dim=0)
 
-                # Forward pass - returns (mag_preds, logabs_sign_pred, real_sign_pred) tuple
-                mag_preds_combined, logabs_sign_pred_combined, real_sign_pred_combined = model(inputs_combined)
+                # Forward pass - returns (mag_preds, logabs_sign_pred, real_sign_pred, ft_cal) tuple
+                mag_preds_combined, logabs_sign_pred_combined, real_sign_pred_combined, ft_cal_combined = model(inputs_combined)
 
                 # Split outputs based on what was stacked
                 mag_preds = mag_preds_combined[:N]
                 logabs_sign_pred = logabs_sign_pred_combined[:N]
                 real_sign_pred = real_sign_pred_combined[:N]
+                ft_cal = ft_cal_combined[:N]
 
                 # Reconstruct signed log-space outputs - DETACH to prevent gradient blending
                 # Use logabs_sign_pred because outputs represent signed log-abs values
@@ -458,10 +524,10 @@ def main():
                 # Prepare loss arguments
                 loss_args = {}
                 if loss_fn.has_loss("MSE"):
-                    # Pass mag_preds, targets (full 6 columns), logabs_sign_probs, and real_sign_probs
+                    # Pass mag_preds, targets (full 6 columns), logabs_sign_probs, real_sign_probs, ft_cal, output_normalizer
                     logabs_sign_probs = model.logabs_last_sign_probs
                     real_sign_probs = model.real_last_sign_probs
-                    loss_args["MSE"] = (mag_preds, targets, logabs_sign_probs, None, None, real_sign_probs)
+                    loss_args["MSE"] = (mag_preds, targets, logabs_sign_probs, None, None, real_sign_probs, ft_cal, train_val_targets_normalizer)
                 if loss_fn.has_loss("Residual"):
                     loss_args["Residual"] = (outputs, inputs_real)
                 if loss_fn.has_loss("Consistency"):
@@ -484,6 +550,17 @@ def main():
                         val_loss_components[key] = 0.0
                     val_loss_components[key] += value * inputs.size(0)
 
+                # Accumulate calibration metrics
+                if model.use_finetune:
+                    logabs_targets = targets[:, 3:]
+                    # Correct pattern: sign * (mag_preds + ft_cal)
+                    outputs_ft_cal = (logabs_sign_pred * (mag_preds + ft_cal)).detach()
+                    error_before = torch.abs(torch.abs(outputs) - torch.abs(logabs_targets))
+                    error_after = torch.abs(torch.abs(outputs_ft_cal) - torch.abs(logabs_targets))
+                    improvement = error_before - error_after
+                    val_calibration_closer += (improvement > 0).sum().item()
+                    val_calibration_total += improvement.numel()
+
                 # Update progress bar with current loss
                 val_pbar.set_postfix({'loss': f'{loss.item():.4e}'})
 
@@ -495,8 +572,27 @@ def main():
 
         lr_scheduler.step()
 
+        # Calculate calibration rate
+        if model.use_finetune and val_calibration_total > 0:
+            val_calibration_rate = val_calibration_closer / val_calibration_total * 100
+        else:
+            val_calibration_rate = None
+
+        # Log training results to file (after validation)
+        log_dict = {
+            'epoch': epoch + 1,
+            'outputs': outputs[-1],  # Last batch last sample
+            'targets': logabs_targets[-1],
+            'train_loss': train_loss,
+            'val_calibration_rate': val_calibration_rate
+        }
+        log_training_results(log_dict, results_folder=results_figure_folder, filename='training_explog.txt')
+
         # Print epoch summary
-        print(f"Epoch [{epoch+1}/{epochs}] -Model name: {os.path.basename(model_save_path)}  Train Loss: {train_loss:.4e}, Val Loss: {val_loss:.4e}")
+        if val_calibration_rate is not None:
+            print(f"Epoch [{epoch+1}/{epochs}] -Model name: {os.path.basename(model_save_path)}  Train Loss: {train_loss:.4e}, Val Loss: {val_loss:.4e}, Calibration Closer rate: {val_calibration_rate:.2f}%")
+        else:
+            print(f"Epoch [{epoch+1}/{epochs}] -Model name: {os.path.basename(model_save_path)}  Train Loss: {train_loss:.4e}, Val Loss: {val_loss:.4e}")
 
         # Build train loss breakdown string with MSE components grouped
         train_total = train_loss_components.get('total', train_loss)
@@ -651,13 +747,14 @@ def main():
             # Stack all inputs
             inputs_combined = torch.cat(inputs_list, dim=0)
 
-            # Forward pass - returns (mag_preds, logabs_sign_pred, real_sign_pred) tuple
-            mag_preds_combined, logabs_sign_pred_combined, real_sign_pred_combined = model(inputs_combined)
+            # Forward pass - returns (mag_preds, logabs_sign_pred, real_sign_pred, ft_cal) tuple
+            mag_preds_combined, logabs_sign_pred_combined, real_sign_pred_combined, ft_cal_combined = model(inputs_combined)
 
             # Split outputs based on what was stacked
             mag_preds = mag_preds_combined[:N]
             logabs_sign_pred = logabs_sign_pred_combined[:N]
             real_sign_pred = real_sign_pred_combined[:N]
+            ft_cal = ft_cal_combined[:N]
 
             # Reconstruct signed log-space outputs - DETACH to prevent gradient blending
             outputs = (mag_preds * logabs_sign_pred).detach()
@@ -677,7 +774,7 @@ def main():
             if loss_fn.has_loss("MSE"):
                 logabs_sign_probs = model.logabs_last_sign_probs
                 real_sign_probs = model.real_last_sign_probs
-                loss_args["MSE"] = (mag_preds, targets, logabs_sign_probs, None, None, real_sign_probs)
+                loss_args["MSE"] = (mag_preds, targets, logabs_sign_probs, None, None, real_sign_probs, ft_cal, test_targets_normalizer)
             if loss_fn.has_loss("Residual"):
                 loss_args["Residual"] = (outputs, inputs_real)
             if loss_fn.has_loss("Consistency"):
