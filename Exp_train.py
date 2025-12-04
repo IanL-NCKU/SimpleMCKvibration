@@ -182,9 +182,9 @@ def main():
     epochs = 40
 
     # Data paths
-    Train_Val_data_source = r'H:\Postgraudate\Research\Test\SimpleMCKvibration\exponential_trainval_data.npz'
-    Test_data_source = r'H:\Postgraudate\Research\Test\SimpleMCKvibration\exponential_test_data.npz'
-    Plot_data_source = r'H:\Postgraudate\Research\Test\SimpleMCKvibration\exponential_test_data.npz'
+    Train_Val_data_source = r'.\exponential_trainval_data.npz'
+    Test_data_source = r'.\exponential_test_data.npz'
+    Plot_data_source = r'.\exponential_test_data.npz'
     data_normalize = True
     # Load the dataset
     train_loader, val_loader, _, train_val_inputs_normalizer, train_val_targets_normalizer = load_exponential_data(
