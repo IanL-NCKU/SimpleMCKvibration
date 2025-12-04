@@ -249,7 +249,7 @@ def main():
 
     loss_fn = ExponentialPINNLoss(model, loss_config)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
-    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=np.max([epochs//10,1]), eta_min=1e-13)
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=np.max([epochs//20,1]), eta_min=1e-13)
 
     # Prepare norm_params for consistency loss
     norm_params = {'normalizer': train_val_inputs_normalizer}
