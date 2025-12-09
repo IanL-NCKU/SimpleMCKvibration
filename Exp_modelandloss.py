@@ -3,6 +3,27 @@ import torch.nn as nn
 import numpy as np
 from abc import ABC, abstractmethod
 
+class SignWithHardTanh(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        # 1. Forward pass: use sign function for binarization
+        ctx.save_for_backward(x)
+        return torch.sign(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # 2. Backward pass: load x and compute HardTanh derivative (Rectangular gradient)
+        x, = ctx.saved_tensors
+        
+        # HardTanh(-1, 1) derivative: 1 between [-1, 1], 0 elsewhere
+        # This is equivalent to (x < 1) & (x > -1)
+        grad_input = grad_output.clone()
+        grad_input[x.abs() > 1.0] = 0
+        
+        # Gradient value remains 1
+        # return grad_input * 1.0  # Which is just grad_input
+        return grad_input
+
 
 class ResidualBlock(nn.Module):
     """Residual block with two linear layers and skip connection
@@ -812,15 +833,13 @@ class BaseLossComponent(ABC, nn.Module):
         self.enabled = weight > 0
 
     @abstractmethod
-    def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None,
-                real_sign_probs=None, ft_cal=None, output_normalizer=None):
+    def compute(self, predictions, targets, **kwargs):
         pass
 
-    def forward(self, predictions, targets, inputs, norm_params=None, inputs_real=None,
-                real_sign_probs=None, ft_cal=None, output_normalizer=None):
+    def forward(self, predictions, targets, **kwargs):
         if not self.enabled:
             return torch.tensor(0.0, device=predictions.device)
-        loss = self.compute(predictions, targets, inputs, norm_params, inputs_real, real_sign_probs, ft_cal, output_normalizer)
+        loss = self.compute(predictions, targets, **kwargs)
         return self.weight * loss
 
     def __repr__(self):
@@ -843,18 +862,17 @@ class MSELoss(BaseLossComponent):
         # Create L1Loss for ft_cal calibration loss (MAE)
         self.ft_cal_criterion = nn.L1Loss()
 
-    def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None,
-                real_sign_probs=None, ft_cal=None, output_normalizer=None):
+    def compute(self, predictions, targets, logabs_sigmoid_probs=None,
+                real_sign_probs=None, ft_cal=None, **kwargs):
         """
         Compute MSE between predictions and targets with dual sign BCE losses and ft_cal loss
 
         Args:
             predictions: (batch_size, 3) - mag_preds (positive magnitudes)
             targets: (batch_size, 6) - complete targets [real_signs (0-2), logabs_values (3-5)]
-            inputs: (batch_size, 3) - logabs_sign_probs (sigmoid probabilities for logabs signs)
+            logabs_sigmoid_probs: (batch_size, 3) - logabs_sign_probs (sigmoid probabilities for logabs signs)
             real_sign_probs: (batch_size, 3) - real_sign_probs (sigmoid probabilities for real signs)
             ft_cal: (batch_size, 3) - calibration factors from finetune network
-            output_normalizer: normalizer for denormalization
 
         Returns:
             loss: Scalar tensor
@@ -879,8 +897,7 @@ class MSELoss(BaseLossComponent):
 
             # Compute logabs sign BCE loss
             logabs_sign_bce_value = 0.0
-            if self.logabs_sign_bce_loss is not None and inputs is not None:
-                logabs_sigmoid_probs = inputs  # This is logabs_last_sign_probs passed from training loop
+            if self.logabs_sign_bce_loss is not None and logabs_sigmoid_probs is not None:
                 logabs_sign_bce_value = self.logabs_sign_bce_loss(logabs_sigmoid_probs, logabs_targets)
 
             # Compute real sign BCE loss
@@ -893,8 +910,8 @@ class MSELoss(BaseLossComponent):
             ft_cal_loss_value = 0.0
             if self.use_finetune_loss and self.ft_cal_weight > 0 and ft_cal is not None:
                 # Use torch.sign on logabs_sign_probs (shifted to [-1, 1] range)
-                # inputs here is logabs_sign_probs in [0, 1], shift to [-0.5, 0.5] then use sign
-                logabs_sign = torch.sign(inputs - 0.5)
+                # logabs_sigmoid_probs is in [0, 1], shift to [-0.5, 0.5] then use sign
+                logabs_sign = torch.sign(logabs_sigmoid_probs - 0.5)
 
                 # Additive calibration: calibrated = signed_mag_preds + ft_cal
                 # signed_mag_preds = (logabs_sign * predictions).detach()
@@ -904,123 +921,6 @@ class MSELoss(BaseLossComponent):
                 # MAE loss using nn.L1Loss
                 ft_cal_loss_value = self.ft_cal_criterion(torch.abs(calibrated_preds), torch.abs(logabs_targets))
                 # ft_cal_loss_value = self.ft_cal_criterion(torch.abs(calibrated_preds)/torch.abs(logabs_targets), logabs_targets*0 + 1.0)
-                ft_cal_loss_value = self.ft_cal_weight * ft_cal_loss_value
-
-            # Store component losses for detailed reporting
-            self.last_magnitude_loss = magnitude_loss.item()
-            self.last_logabs_sign_bce_loss = logabs_sign_bce_value.item() if isinstance(logabs_sign_bce_value, torch.Tensor) else logabs_sign_bce_value
-            self.last_real_sign_bce_loss = real_sign_bce_value.item() if isinstance(real_sign_bce_value, torch.Tensor) else real_sign_bce_value
-            self.last_ft_cal_loss = ft_cal_loss_value.item() if isinstance(ft_cal_loss_value, torch.Tensor) else ft_cal_loss_value
-
-            # Combine all losses: magnitude + logabs sign + real sign + ft_cal
-            loss = magnitude_loss + logabs_sign_bce_value + real_sign_bce_value + ft_cal_loss_value
-        else:
-            # Standard MSE (not log-space)
-            if self.use_relative:
-                # Relative MSE: normalized by target magnitude
-                loss = torch.mean(((predictions - targets) ** 2) / (torch.square(targets) + eps))
-            else:
-                # Absolute MSE
-                loss = torch.mean((predictions - targets) ** 2)
-
-        return loss
-
-
-
-class Unuse_MSELoss(BaseLossComponent):
-    """Mean Squared Error loss between predictions and targets"""
-
-    def __init__(self, weight=1.0, use_relative=False, use_log=False, sign_bce_weight=1.0, real_sign_bce_weight=1.0, ft_cal_weight=1.0, use_finetune_loss=True):
-        super().__init__(weight=weight, name="MSE Loss")
-        self.use_relative = use_relative
-        self.use_log = use_log
-        self.ft_cal_weight = ft_cal_weight
-        self.use_finetune_loss = use_finetune_loss
-        # Create SignBCELoss instances for both logabs and real sign loss computation
-        self.logabs_sign_bce_loss = SignBCELoss(weight=sign_bce_weight) if sign_bce_weight > 0 else None
-        self.real_sign_bce_loss = SignBCELoss(weight=real_sign_bce_weight) if real_sign_bce_weight > 0 else None
-        # Create L1Loss for ft_cal calibration loss (MAE)
-        self.ft_cal_criterion = nn.L1Loss()
-
-    def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None,
-                real_sign_probs=None, ft_cal=None, output_normalizer=None):
-        """
-        Compute MSE between predictions and targets with dual sign BCE losses and ft_cal loss
-
-        Args:
-            predictions: (batch_size, 3) - mag_preds (positive magnitudes)
-            targets: (batch_size, 6) - complete targets [real_signs (0-2), logabs_values (3-5)]
-            inputs: (batch_size, 3) - logabs_sign_probs (sigmoid probabilities for logabs signs)
-            real_sign_probs: (batch_size, 3) - real_sign_probs (sigmoid probabilities for real signs)
-            ft_cal: (batch_size, 3) - calibration factors from finetune network
-            output_normalizer: normalizer for denormalization
-
-        Returns:
-            loss: Scalar tensor
-        """
-        eps = 1e-10
-
-        if self.use_log:
-            # Extract logabs targets (columns 3-5) for magnitude loss
-            logabs_targets = targets[:, 3:]  # [logabs_x, logabs_v, logabs_a]
-
-            # Compute magnitude loss (log-space MSE)
-            # predictions are already mag_preds (positive magnitudes, no abs needed)
-            log_predictions = torch.log(torch.abs(predictions) + eps)
-            log_targets = torch.log(torch.abs(logabs_targets) + eps)
-
-            if self.use_relative:
-                # Relative log-space MSE for magnitudes
-                magnitude_loss = torch.mean(((log_predictions - log_targets) ** 2) / (torch.square(log_targets) + eps))
-            else:
-                # Absolute log-space MSE for magnitudes
-                magnitude_loss = torch.mean((log_predictions - log_targets) ** 2)
-
-            # Compute logabs sign BCE loss
-            logabs_sign_bce_value = 0.0
-            if self.logabs_sign_bce_loss is not None and inputs is not None:
-                logabs_sigmoid_probs = inputs  # This is logabs_last_sign_probs passed from training loop
-                logabs_sign_bce_value = self.logabs_sign_bce_loss(logabs_sigmoid_probs, logabs_targets)
-
-            # Compute real sign BCE loss
-            real_sign_bce_value = 0.0
-            if self.real_sign_bce_loss is not None and real_sign_probs is not None:
-                real_sign_targets = targets[:, :3]  # Extract real signs (columns 0-2)
-                real_sign_bce_value = self.real_sign_bce_loss(real_sign_probs, real_sign_targets)
-
-            # Compute ft_cal loss (additive calibration in log-space)
-            ft_cal_loss_value = 0.0
-            if self.use_finetune_loss and self.ft_cal_weight > 0 and ft_cal is not None and real_sign_probs is not None:
-                # Use torch.sign on logabs_sign_probs (shifted to [-1, 1] range)
-                # inputs here is logabs_sign_probs in [0, 1], shift to [-0.5, 0.5] then use sign
-                logabs_sign = torch.sign(inputs - 0.5)
-
-                # Additive calibration: calibrated = signed_mag_preds + ft_cal
-                # signed_mag_preds = (logabs_sign * predictions).detach()
-                signed_mag_preds = predictions.detach()
-                calibrated_preds = signed_mag_preds + ft_cal  # Only ft_cal has gradient
-
-                # Old approach: L1 loss in log-space (commented out)
-                # ft_cal_loss_value = self.ft_cal_criterion(torch.abs(calibrated_preds), torch.abs(logabs_targets))
-                # ft_cal_loss_value = self.ft_cal_weight * ft_cal_loss_value
-
-                # New approach: denormalize to real space and compute log-ratio loss
-                # Get real signs from real_sign_probs
-                real_sign = torch.sign(real_sign_probs - 0.5)
-
-                # Denormalize calibrated predictions to real space
-                # calibrated_preds is in log-space, transform: real = sign * 10^logabs
-                ln10 = torch.tensor(np.log(10.0), device=calibrated_preds.device, dtype=calibrated_preds.dtype)
-                real_value_pred = real_sign * torch.exp(calibrated_preds * ln10)
-
-                # Denormalize ground truth to real space
-                # Extract real signs from targets
-                gt_real_sign = targets[:, :3]  # Ground truth real signs
-                real_value_gt = gt_real_sign * torch.exp(logabs_targets * ln10)
-
-                # Compute log-ratio loss: mean(abs(log(abs(pred/gt))))
-                ratio = real_value_pred / (torch.abs(real_value_gt) + eps)
-                ft_cal_loss_value = torch.mean(torch.abs(torch.log(torch.abs(ratio) + eps)))
                 ft_cal_loss_value = self.ft_cal_weight * ft_cal_loss_value
 
             # Store component losses for detailed reporting
@@ -1100,23 +1000,54 @@ class ExponentialResidualLoss(BaseLossComponent):
         super().__init__(weight=weight, name="Exponential Residual Loss")
         self.use_relative = use_relative
 
-    def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None,
-                real_sign_probs=None, ft_cal=None, output_normalizer=None):
+    def compute(self, predictions, targets, inputs_real=None, output_normalizer=None, **kwargs):
         """
         Enforce exponential physics equation:
         (1/(2a))*a_t + 0.5*v_t - a*x_t = 0
 
         Args:
-            predictions: (batch_size, 3) - [x_t, v_t, a_t] in real space
+            predictions: (batch_size, 6) - [real_signs (0-2), logabs_values (3-5)] in NORMALIZED log-space
+            targets: Not used (for signature compatibility)
             inputs_real: (batch_size, 3) - [a, b, t] in real space
-            Other args: Not used (for signature compatibility)
+            output_normalizer: Normalizer instance for manual denormalization
         """
         if inputs_real is None:
             raise ValueError("ExponentialResidualLoss requires inputs_real to be provided")
+        if output_normalizer is None:
+            raise ValueError("ExponentialResidualLoss requires output_normalizer to be provided")
 
-        x_pred = predictions[:, 0]
-        v_pred = predictions[:, 1]
-        a_pred = predictions[:, 2]
+        # Manual denormalization to preserve gradients
+        real_signs = predictions[:, :3]  # (batch_size, 3)
+        logabs_normalized = predictions[:, 3:]  # (batch_size, 3)
+
+        # Extract normalizer statistics as tensors (vectorized)
+        device = predictions.device
+        dtype = predictions.dtype
+
+        # Create tensors for log_mean and log_std for [x, v, a]
+        log_mean = torch.tensor([
+            output_normalizer.log_mean['x'],
+            output_normalizer.log_mean['v'],
+            output_normalizer.log_mean['a']
+        ], device=device, dtype=dtype)  # (3,)
+
+        log_std = torch.tensor([
+            output_normalizer.log_std['x'],
+            output_normalizer.log_std['v'],
+            output_normalizer.log_std['a']
+        ], device=device, dtype=dtype)  # (3,)
+
+        # Denormalize logabs values (vectorized, preserves gradients)
+        logabs_denorm = logabs_normalized * log_std + log_mean  # (batch_size, 3)
+
+        # Convert to real space: real_value = sign * 10^logabs (vectorized)
+        ln10 = torch.tensor(np.log(10.0), device=device, dtype=dtype)
+        real_values = torch.sign(real_signs) * torch.exp(logabs_denorm * ln10)  # (batch_size, 3)
+
+        # Extract x, v, a predictions
+        x_pred = real_values[:, 0].detach()  # Detach position to prevent gradient issues
+        v_pred = real_values[:, 1].detach()  # Detach velocity to prevent gradient issues
+        a_pred = real_values[:, 2].detach()  # Detach acceleration to prevent gradient issues
 
         # Extract parameters
         a = inputs_real[:, 0]  # exponential rate
@@ -1124,14 +1055,23 @@ class ExponentialResidualLoss(BaseLossComponent):
         eps = 1e-10
 
         # Physics residual: (1/(2a))*a_t + 0.5*v_t - a*x_t = 0
-        residual = (1.0 / (2.0 * a + eps)) * a_pred + 0.5 * v_pred - a * x_pred
+        residual =(1.0 / (2.0 * a + eps)) * a_pred + 0.5 * v_pred - a * x_pred
+        # residual = torch.log(torch.abs((1.0 / (2.0 * a + eps)) * a_pred)) - torch.log(torch.abs(0.5 * v_pred - a * x_pred)) 
 
         if self.use_relative:
             # Scale-invariant relative residual
-            scale = torch.abs(a * x_pred) + eps
+            # Normalize by target's acceleration term: (1/(2a))*a_target
+            # Denormalize targets to get a_target
+            target_real_signs = targets[:, :3]
+            target_logabs_normalized = targets[:, 3:]
+            target_logabs_denorm = target_logabs_normalized * log_std + log_mean
+            target_real_values = target_real_signs * torch.exp(target_logabs_denorm * ln10)
+            a_target = target_real_values[:, 2].detach()  # Detach target to prevent gradient issues
+
+            scale = torch.abs((1.0 / (2.0 * a + eps)) * a_target) + eps
             residual = residual / scale
 
-        return torch.mean(residual ** 2)
+        return torch.mean(torch.abs(residual))
 
 
 class ConsistencyLoss_auto_diff(BaseLossComponent):
@@ -1156,19 +1096,16 @@ class ConsistencyLoss_auto_diff(BaseLossComponent):
         """Set the model reference for gradient computation"""
         self.model = model
 
-    def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None,
-                real_sign_probs=None, ft_cal=None, output_normalizer=None):
+    def compute(self, predictions, targets, inputs=None, inputs_normalizer=None,
+                inputs_real=None, **kwargs):
         """
         Enforces consistency between position, velocity, and acceleration
         using automatic differentiation with log-normalized time.
 
         Args:
             inputs: (batch_size, 3) - [a, b, t] NORMALIZED
-            norm_params: Dictionary with 'normalizer' key containing normalizer instance
+            inputs_normalizer: Normalizer instance containing log-normalization parameters
             inputs_real: (batch_size, 3) - [a, b, t] in REAL space
-            real_sign_probs: Not used (for signature compatibility)
-            ft_cal: Not used (for signature compatibility)
-            output_normalizer: Not used (for signature compatibility)
 
         Returns:
             loss: Scalar tensor measuring consistency error
@@ -1179,10 +1116,8 @@ class ConsistencyLoss_auto_diff(BaseLossComponent):
         if inputs_real is None:
             raise ValueError("ConsistencyLoss_auto_diff requires inputs_real to be provided")
 
-        if norm_params is None or 'normalizer' not in norm_params:
-            raise ValueError("norm_params with 'normalizer' must be provided for ConsistencyLoss_auto_diff")
-
-        normalizer = norm_params['normalizer']
+        if inputs_normalizer is None:
+            raise ValueError("inputs_normalizer must be provided for ConsistencyLoss_auto_diff")
 
         # Get t_real from inputs_real
         t_real = inputs_real[:, 2]  # Note: index 2 for exponential data (not 3)
@@ -1199,8 +1134,8 @@ class ConsistencyLoss_auto_diff(BaseLossComponent):
         t_real_valid = t_real[valid_mask]
 
         # Get the time std from normalizer (or use 1.0 if no normalization)
-        if normalizer is not None:
-            t_std = normalizer.log_std['t']  # std of log10(t) values
+        if inputs_normalizer is not None:
+            t_std = inputs_normalizer.log_std['t']  # std of log10(t) values
         else:
             # No normalization: dt_model/dt_real = 1
             # chain_rule_factor = 1 / (t_std * t_real * ln(10))
@@ -1242,7 +1177,7 @@ class ConsistencyLoss_auto_diff(BaseLossComponent):
         )[0][:, 2]  # Take only the gradient w.r.t. t_normalized (index 2)
 
         # Apply chain rule to transform from model domain to real domain
-        if normalizer is not None:
+        if inputs_normalizer is not None:
             # With normalization: t_model = (log10(t_real) - mean) / std
             # dt_model/dt_real = 1 / (std * t_real * ln(10))
             ln10 = torch.tensor(np.log(10), device=inputs.device, dtype=inputs.dtype)
@@ -1268,138 +1203,6 @@ class ConsistencyLoss_auto_diff(BaseLossComponent):
         # Apply log transformation if enabled
         if self.use_log:
             eps = 1e-10
-            total_loss = torch.log(total_loss + eps)
-
-        return total_loss
-
-
-class ConsistencyLoss_finite_diff(BaseLossComponent):
-    """
-    Derivative consistency using finite differences
-
-    Computes 6 loss components:
-    1. v from x (finite diff) vs v_pred
-    2. a from v (finite diff) vs a_pred
-    3. a from x (finite diff, 2nd derivative) vs a_pred
-    4. v from x (finite diff) vs v_target
-    5. a from v (finite diff) vs a_target
-    6. a from x (finite diff, 2nd derivative) vs a_target
-    """
-
-    def __init__(self, weight=1.0, use_relative=False, t_threshold=1e-6,
-                 use_log=True,
-                 weight_v_x_pred=1.0,
-                 weight_a_v_pred=1.0,
-                 weight_a_x_pred=1.0,
-                 weight_v_x_target=1.0,
-                 weight_a_v_target=1.0,
-                 weight_a_x_target=1.0):
-        super().__init__(weight=weight, name="Consistency Loss (finite)")
-        self.use_relative = use_relative
-        self.t_threshold = t_threshold
-        self.use_log = use_log
-
-        # Individual component weights
-        self.weight_v_x_pred = weight_v_x_pred
-        self.weight_a_v_pred = weight_a_v_pred
-        self.weight_a_x_pred = weight_a_x_pred
-        self.weight_v_x_target = weight_v_x_target
-        self.weight_a_v_target = weight_a_v_target
-        self.weight_a_x_target = weight_a_x_target
-
-    def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None,
-                real_sign_probs=None, ft_cal=None, output_normalizer=None):
-        """
-        Compute finite difference consistency loss
-
-        Args:
-            predictions: (batch_size, 3) - [x, v, a] at time t
-            targets: (batch_size, 3) - [x, v, a] ground truth at time t
-            inputs: Not used
-            norm_params: Not used
-            inputs_real: (4*batch_size, 3) - predictions at perturbed times
-                        [t-2Δt, t-Δt, t+Δt, t+2Δt] stacked
-            real_sign_probs: Not used (for signature compatibility)
-            ft_cal: Not used (for signature compatibility)
-            output_normalizer: Not used (for signature compatibility)
-
-        Returns:
-            total_loss: Scalar tensor representing the natural log of the total loss.
-        """
-        if inputs_real is None:
-            raise ValueError("ConsistencyLoss_finite_diff requires inputs_real (outputs_dt) to be provided")
-
-        N = predictions.shape[0]
-        eps = 1e-10
-
-        # Extract predictions at different time points
-        # inputs_real is actually outputs_dt with shape (4N, 3)
-        outputs_dt = inputs_real
-
-        x_t = predictions[:, 0:1]
-        v_t = predictions[:, 1:2]
-        a_t = predictions[:, 2:3]
-
-        x_t_minus_minus = outputs_dt[0:N, 0:1]      # t - 2Δt
-        x_t_minus = outputs_dt[N:2*N, 0:1]          # t - Δt
-        x_t_plus = outputs_dt[2*N:3*N, 0:1]         # t + Δt
-        x_t_plus_plus = outputs_dt[3*N:4*N, 0:1]    # t + 2Δt
-
-        v_t_minus = outputs_dt[N:2*N, 1:2]          # t - Δt
-        v_t_plus = outputs_dt[2*N:3*N, 1:2]         # t + Δt
-
-        # Extract targets
-        # Debug: ensure targets is a tensor
-        if not isinstance(targets, torch.Tensor):
-            raise TypeError(f"targets must be a torch.Tensor, got {type(targets)}")
-
-        x_target = targets[:, 0:1]
-        v_target = targets[:, 1:2]
-        a_target = targets[:, 2:3]
-
-        t_delta = self.t_threshold
-
-        # Compute finite difference derivatives
-        # Component 1 & 4: v from x using central difference
-        v_fd_from_x = (x_t_plus - x_t_minus) / (2 * t_delta)
-
-        # Component 2 & 5: a from v using central difference
-        a_fd_from_v = (v_t_plus - v_t_minus) / (2 * t_delta)
-
-        # Component 3 & 6: a from x using second derivative
-        v_t_plus_temp = (x_t_plus_plus - x_t) / (2 * t_delta)
-        v_t_minus_temp = (x_t - x_t_minus_minus) / (2 * t_delta)
-        a_fd_from_x = (v_t_plus_temp - v_t_minus_temp) / (2 * t_delta)
-
-        # Compute squared differences for all 6 components
-        diff_1 = (v_fd_from_x - v_t) ** 2        # v from x vs v_pred
-        diff_2 = (a_fd_from_v - a_t) ** 2        # a from v vs a_pred
-        diff_3 = (a_fd_from_x - a_t) ** 2        # a from x vs a_pred
-        diff_4 = (v_fd_from_x - v_target) ** 2   # v from x vs v_target
-        diff_5 = (a_fd_from_v - a_target) ** 2   # a from v vs a_target
-        diff_6 = (a_fd_from_x - a_target) ** 2   # a from x vs a_target
-
-        # Apply normalization if use_relative is True
-        if self.use_relative:
-            diff_1 = diff_1 / (v_target ** 2 + eps)
-            diff_2 = diff_2 / (a_target ** 2 + eps)
-            diff_3 = diff_3 / (a_target ** 2 + eps)
-            diff_4 = diff_4 / (v_target ** 2 + eps)
-            diff_5 = diff_5 / (a_target ** 2 + eps)
-            diff_6 = diff_6 / (a_target ** 2 + eps)
-
-        # Compute weighted sum of all components
-        total_loss = (
-            self.weight_v_x_pred * torch.mean(diff_1) +
-            self.weight_a_v_pred * torch.mean(diff_2) +
-            self.weight_a_x_pred * torch.mean(diff_3) +
-            self.weight_v_x_target * torch.mean(diff_4) +
-            self.weight_a_v_target * torch.mean(diff_5) +
-            self.weight_a_x_target * torch.mean(diff_6)
-        )
-
-        # Apply log transformation if enabled
-        if self.use_log:
             total_loss = torch.log(total_loss + eps)
 
         return total_loss
@@ -1463,25 +1266,15 @@ class ExponentialPINNLoss(nn.Module):
             weight = config.get("weight", 1.0)
             self.loss_components["Residual"] = ExponentialResidualLoss(weight=weight, use_relative=use_relative)
 
-        # Initialize Consistency loss if requested
+        # Initialize Consistency loss if requested (auto diff only)
         if self._should_enable("Consistency"):
             config = self.loss_config.get("Consistency")
             t_threshold = config.get("t_threshold", 1e-6)
             weight = config.get("weight", 1.0)
-            use_relative = config.get("use_relative", False)
             use_log = config.get("use_log", True)
-            consistency_type = config.get("type", "auto")  # "auto" or "finite"
-
-            if consistency_type == "auto":
-                self.loss_components["Consistency"] = ConsistencyLoss_auto_diff(
-                    weight=weight, model=model, t_threshold=t_threshold, use_log=use_log
-                )
-            elif consistency_type == "finite":
-                self.loss_components["Consistency"] = ConsistencyLoss_finite_diff(
-                    weight=weight, use_relative=use_relative, t_threshold=t_threshold, use_log=use_log
-                )
-            else:
-                raise ValueError(f"Unknown consistency type: {consistency_type}. Use 'auto' or 'finite'.")
+            self.loss_components["Consistency"] = ConsistencyLoss_auto_diff(
+                weight=weight, model=model, t_threshold=t_threshold, use_log=use_log
+            )
 
         # Print configuration
         self._print_config()
@@ -1523,7 +1316,10 @@ class ExponentialPINNLoss(nn.Module):
             # Unpack 8 arguments: (mag_preds, targets, logabs_sign_probs, None, None, real_sign_probs, ft_cal, output_normalizer)
             mag_preds, targets, logabs_sign_probs, _, _, real_sign_probs, ft_cal, output_normalizer = loss_args["MSE"]
             mse_value = self.loss_components["MSE"](
-                mag_preds, targets, logabs_sign_probs, None, None, real_sign_probs, ft_cal, output_normalizer
+                mag_preds, targets,
+                logabs_sigmoid_probs=logabs_sign_probs,
+                real_sign_probs=real_sign_probs,
+                ft_cal=ft_cal
             )
             total_loss += mse_value
             loss_summary["mse_loss"] = mse_value.item()
@@ -1540,33 +1336,25 @@ class ExponentialPINNLoss(nn.Module):
 
         # Residual Loss
         if "Residual" in self.loss_components and "Residual" in loss_args:
-            outputs, inputs_real = loss_args["Residual"]
+            outputs_for_residual, targets, inputs_real, output_normalizer = loss_args["Residual"]
             residual_value = self.loss_components["Residual"](
-                outputs, None, None, None, inputs_real
+                outputs_for_residual, targets,
+                inputs_real=inputs_real,
+                output_normalizer=output_normalizer
             )
             total_loss += residual_value
             loss_summary["residual_loss"] = residual_value.item()
 
-        # Consistency Loss
+        # Consistency Loss (auto diff only)
         if "Consistency" in self.loss_components and "Consistency" in loss_args:
-            # Check if it's auto or finite based on number of arguments
-            consistency_args = loss_args["Consistency"]
-
-            if isinstance(self.loss_components["Consistency"], ConsistencyLoss_auto_diff):
-                # Auto diff: (inputs, inputs_real, norm_params)
-                inputs, inputs_real, norm_params = consistency_args
-                consistency_value = self.loss_components["Consistency"](
-                    None, None, inputs, norm_params, inputs_real
-                )
-            elif isinstance(self.loss_components["Consistency"], ConsistencyLoss_finite_diff):
-                # Finite diff: (outputs, outputs_dt, targets)
-                outputs, outputs_dt, targets = consistency_args
-                consistency_value = self.loss_components["Consistency"](
-                    outputs, targets, None, None, outputs_dt
-                )
-            else:
-                raise ValueError("Unknown consistency loss type")
-
+            # Auto diff: (inputs, inputs_real, inputs_normalizer)
+            inputs, inputs_real, inputs_normalizer = loss_args["Consistency"]
+            consistency_value = self.loss_components["Consistency"](
+                None, None,
+                inputs=inputs,
+                inputs_normalizer=inputs_normalizer,
+                inputs_real=inputs_real
+            )
             total_loss += consistency_value
             loss_summary["consistency_loss"] = consistency_value.item()
 
