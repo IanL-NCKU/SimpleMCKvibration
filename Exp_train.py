@@ -1,4 +1,4 @@
-from Exp_dataset import *
+from Exp_dataset_temp import *
 from Exp_modelandloss import *
 from expdatagenerator import *
 import torch
@@ -36,6 +36,14 @@ def checktargetres(dataloader, inputs_normalizer, targets_normalizer, device, dt
             inputs_real = inputs_normalizer.denormalize_inputs(inputs)
             a = inputs_real[:, 0]  # exponential rate parameter
 
+            # DIAGNOSTIC: Check data shapes (only print for first batch)
+            if len(all_residuals) == 0:
+                print(f"\n[DIAGNOSTIC] Data shapes:")
+                print(f"  inputs shape: {inputs.shape}")
+                print(f"  targets shape: {targets.shape}")
+                print(f"  inputs_real shape: {inputs_real.shape}")
+                print(f"  Expected targets: (batch_size, 6) = [signs(3), logabs(3)]")
+
             # Manual denormalization (same as ExponentialResidualLoss)
             # targets shape: (batch_size, 6) -> [real_signs (0-2), logabs_values (3-5)]
             real_signs = targets[:, :3]  # (batch_size, 3)
@@ -66,9 +74,36 @@ def checktargetres(dataloader, inputs_normalizer, targets_normalizer, device, dt
             v_t = real_values[:, 1]
             a_t = real_values[:, 2]
 
+            # DIAGNOSTIC: Compare denormalize_outputs() vs manual denormalization (only for first batch)
+            if len(all_residuals) == 0:
+                targets_real_auto = targets_normalizer.denormalize_outputs(targets)
+                # Convert to torch tensor with same device/dtype
+                if isinstance(targets_real_auto, np.ndarray):
+                    targets_real_auto = torch.tensor(targets_real_auto, device=device, dtype=dtype)
+
+                # Compare with manual denormalization result
+                x_t_auto, v_t_auto, a_t_auto = targets_real_auto[:, 0], targets_real_auto[:, 1], targets_real_auto[:, 2]
+
+                print(f"\n[DIAGNOSTIC] Denormalization comparison (first sample):")
+                print(f"  Manual x_t: {x_t[0].item():.6e}, Auto x_t: {x_t_auto[0].item():.6e}, Diff: {abs(x_t[0] - x_t_auto[0]).item():.6e}")
+                print(f"  Manual v_t: {v_t[0].item():.6e}, Auto v_t: {v_t_auto[0].item():.6e}, Diff: {abs(v_t[0] - v_t_auto[0]).item():.6e}")
+                print(f"  Manual a_t: {a_t[0].item():.6e}, Auto a_t: {a_t_auto[0].item():.6e}, Diff: {abs(a_t[0] - a_t_auto[0]).item():.6e}")
+
+                max_diff_x = torch.max(torch.abs(x_t - x_t_auto))
+                max_diff_v = torch.max(torch.abs(v_t - v_t_auto))
+                max_diff_a = torch.max(torch.abs(a_t - a_t_auto))
+                print(f"  Max diff x_t: {max_diff_x.item():.6e}")
+                print(f"  Max diff v_t: {max_diff_v.item():.6e}")
+                print(f"  Max diff a_t: {max_diff_a.item():.6e}")
+
             # Physics residual: (1/(2a))*a_t + 0.5*v_t - a*x_t = 0
-            eps = 1e-10
-            residual = (1.0 / (2.0 * a + eps)) * a_t + 0.5 * v_t - a * x_t
+            eps = 1e-12
+            residual = (1.0 / (2.0 * a + eps)) * a_t + 0.5 * v_t - a * x_t\
+
+            # residual = torch.log(torch.abs((1.0 / (2.0 * a + eps)) * a_t)) - torch.log(torch.abs(0.5 * v_t - a * x_t)) \
+            #             + torch.log(torch.abs(a * x_t)) - torch.log(torch.abs((1.0 / (2.0 * a + eps)) * a_t + 0.5 * v_t))\
+            #             + torch.log(torch.abs(0.5 * v_t)) - torch.log(torch.abs(a * x_t - (1.0 / (2.0 * a + eps)) * a_t))
+
 
             if use_relative:
                 # Scale-invariant relative residual (same as ExponentialResidualLoss)
@@ -247,26 +282,53 @@ def calculate_calibration_improvement(outputs_before, outputs_after, targets):
 
     return closer_rate, mean_improvement
 
-def testcudaavailable():
-    if torch.cuda.is_available():
-        print("CUDA is available. Device count:", torch.cuda.device_count())
-        for i in range(torch.cuda.device_count()):
-            print(f"Device {i}: {torch.cuda.get_device_name(i)}")
-    else:
-        print("CUDA is not available. Using CPU.")
+def testdataloaderunchange():
+    device_index = 0
+    train_in_64 = True
+    epochs = 40
+
+    # Data paths
+    Train_Val_data_source = r'.\new_exponential_trainval_data.npz'
+    Test_data_source = r'.\new_exponential_test_data.npz'
+    Plot_data_source = r'.\new_exponential_test_data.npz'
+    data_normalize = True
+    
+    # Check raw data residuals (before normalization)
+    check_raw_data_residuals(Train_Val_data_source, use_relative=True)
+    # check_raw_data_residuals(Test_data_source, use_relative=True)
+    # examinenormalizer(Train_Val_data_source)
+    # Load the dataset
+    train_loader, val_loader, _, train_val_inputs_normalizer, train_val_targets_normalizer = load_exponential_data(
+        filepath=Train_Val_data_source,
+        batch_size=1024,
+        normalize=data_normalize,
+        shuffle_train=False
+    )
+
+    test_loader, _, _, test_inputs_normalizer, test_targets_normalizer = load_exponential_data(
+        filepath=Test_data_source,
+        batch_size=1024,
+        normalize=data_normalize,
+        shuffle_train=False
+    )
     
     
 
 def main():
     device_index = 0
     train_in_64 = True
-    epochs = 40
+    epochs = 1000
 
     # Data paths
-    Train_Val_data_source = r'.\exponential_trainval_data.npz'
-    Test_data_source = r'.\exponential_test_data.npz'
-    Plot_data_source = r'.\exponential_test_data.npz'
+    Train_Val_data_source = r'.\new_exponential_trainval_data.npz'
+    Test_data_source = r'.\new_exponential_test_data.npz'
+    Plot_data_source = r'.\new_exponential_test_data.npz'
     data_normalize = True
+
+    # Check raw data residuals (before normalization)
+    check_raw_data_residuals(Train_Val_data_source, use_relative=True)
+    # check_raw_data_residuals(Test_data_source, use_relative=True)
+
     # Load the dataset
     train_loader, val_loader, _, train_val_inputs_normalizer, train_val_targets_normalizer = load_exponential_data(
         filepath=Train_Val_data_source,
@@ -297,8 +359,8 @@ def main():
         dtype = torch.float32
         print("Training in float32 (single precision) mode")
 
-    model_save_path = 'expwithsign_model_elu_newsignmodel_realtest64_finetunene7_3.pt'
-    results_figure_folder = './expwithsign_results_elu_newsignmodel_realtest64_finetunene7_3'
+    model_save_path = 'expwithsign_model_elu_newsignmodel_realtest64_finetunene_residualok.pt'
+    results_figure_folder = './expwithsign_results_elu_newsignmodel_realtest64_finetunene_residualok'
 
     # Create the Exponential PINN model
     model = ExponentialPINN_ver3(hidden_dims=[16, 32, 64, 64, 32, 16],
@@ -323,14 +385,14 @@ def main():
 
     # Configure losses
     loss_config = {
-        "MSE": {"weight": 1, "use_relative": False, "use_log": True, "sign_bce_weight": 1.0, "real_sign_bce_weight": 1.0, "ft_cal_weight": 1.0},
-        "Residual": {"weight": 0, "use_relative": True},
+        "MSE": {"weight": 0.9, "use_relative": False, "use_log": True, "sign_bce_weight": 1.0, "real_sign_bce_weight": 1.0, "ft_cal_weight": 1.0},
+        "Residual": {"weight": 0.1, "use_relative": True},
         "Consistency": {"weight": 0.0, "t_threshold": 1e-5, "type": "auto", "use_relative": True, "use_log": False}
     }
 
     loss_fn = ExponentialPINNLoss(model, loss_config)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
-    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=np.max([epochs//10,1]), eta_min=1e-13)
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=np.max([epochs//10,1]), eta_min=1e-12)
 
     # Prepare inputs_normalizer for consistency loss
     inputs_normalizer = train_val_inputs_normalizer
@@ -449,15 +511,16 @@ def main():
                 real_sign_probs = model.real_last_sign_probs
                 loss_args["MSE"] = (mag_preds, targets, logabs_sign_probs, None, None, real_sign_probs, ft_cal, train_val_targets_normalizer)
             if loss_fn.has_loss("Residual"):
-                # Determine ft_cal based on phase
+                # Determine ft_cal based on phase (merged ft_cal_for_residual and ft_cal_for_print)
                 if epoch < finetune_activation_epoch:
-                    ft_cal_for_residual = torch.zeros_like(ft_cal)  # Phase 1: no calibration
+                    ft_cal_phase = torch.zeros_like(ft_cal)  # Phase 1: no calibration
                 else:
-                    ft_cal_for_residual = ft_cal  # Phase 2: with calibration
+                    ft_cal_phase = ft_cal  # Phase 2: with calibration
 
                 # Reconstruct outputs with phase-appropriate ft_cal (NO .detach()!)
                 # Use logabs_sign_pred directly (not torch.sign) to keep it trainable
-                logabs_values_residual = torch.sign(logabs_sign_pred) * (mag_preds + ft_cal_for_residual)
+                # logabs_values_residual = torch.sign(logabs_sign_pred) * (mag_preds + ft_cal_phase)
+                logabs_values_residual = SignWithHardTanh.apply(logabs_sign_pred) * (mag_preds + ft_cal_phase)
                 outputs_for_residual = torch.cat([real_sign_pred, logabs_values_residual], dim=1)
 
                 # Pass outputs, targets, inputs_real, and normalizer to residual loss
@@ -485,28 +548,35 @@ def main():
         logabs_targets = targets[:, 3:]  # Extract for printing
         print("Last batch mag_preds v.s logabs_targets:", (torch.sign(logabs_sign_pred)*mag_preds)[-1].detach().cpu().numpy(), logabs_targets[-1].detach().cpu().numpy())
 
-        # Print real value predictions vs ground truth (with additive calibration applied)
+        # Compute uncalibrated and calibrated real values
+        # Uncalibrated (no ft_cal)
+        outputs_no_cal = (torch.sign(logabs_sign_pred) * mag_preds).detach()
+        pred_normalized_no_cal = torch.cat([real_sign_pred, outputs_no_cal], dim=1).detach()
+        real_value_pred_no_cal = train_val_targets_normalizer.denormalize_outputs(pred_normalized_no_cal[-1:].cpu().numpy())[0]
+
+        # Calibrated (with ft_cal - always use full ft_cal for printing)
         outputs_ft_cal = (torch.sign(logabs_sign_pred)*(mag_preds + ft_cal)).detach()
         print("Last batch outputs_ft_cal v.s logabs_targets:", outputs_ft_cal[-1].cpu().numpy(), logabs_targets[-1].detach().cpu().numpy())
         pred_normalized = torch.cat([real_sign_pred, outputs_ft_cal], dim=1).detach()
-        real_value_pred = train_val_targets_normalizer.denormalize_outputs(pred_normalized[-1:].cpu().numpy())[0]
+        real_value_pred_cal = train_val_targets_normalizer.denormalize_outputs(pred_normalized[-1:].cpu().numpy())[0]
+
+        # Ground truth
         real_value_gt = train_val_targets_normalizer.denormalize_outputs(targets.detach().cpu().numpy())[-1]
-        print("Last batch pred_real_value v.s targets_real_value:", real_value_pred, real_value_gt)
+
+        # Print all three in one line: uncalibrated, calibrated, ground truth
+        print("Last batch - pred_real_value (no cal) v.s pred_real_value (cal) v.s targets_real_value:",
+              real_value_pred_no_cal, real_value_pred_cal, real_value_gt)
 
         # Print residuals if residual loss is active
         if loss_fn.has_loss("Residual"):
             # Extract parameter 'a' from inputs_real
             a_values = inputs_real[:, 0]  # (batch_size,)
 
-            # Use phase-appropriate ft_cal for predictions
-            if epoch < finetune_activation_epoch:
-                ft_cal_for_print = torch.zeros_like(ft_cal)
-            else:
-                ft_cal_for_print = ft_cal
-
+            # Use phase-appropriate ft_cal (same as used in residual loss)
+            # ft_cal_phase was already computed above when residual loss is active
             # Reconstruct predictions with phase-appropriate ft_cal
             # Use logabs_sign_pred directly (not torch.sign) for consistency
-            logabs_values_print = logabs_sign_pred * (mag_preds + ft_cal_for_print)
+            logabs_values_print = logabs_sign_pred * (mag_preds + ft_cal_phase)
             outputs_for_print = torch.cat([real_sign_pred, logabs_values_print], dim=1)
 
             # Denormalize (for printing only, gradients already computed in loss)
@@ -584,15 +654,15 @@ def main():
                     real_sign_probs = model.real_last_sign_probs
                     loss_args["MSE"] = (mag_preds, targets, logabs_sign_probs, None, None, real_sign_probs, ft_cal, train_val_targets_normalizer)
                 if loss_fn.has_loss("Residual"):
-                    # Determine ft_cal based on phase
+                    # Determine ft_cal based on phase (merged ft_cal variable)
                     if epoch < finetune_activation_epoch:
-                        ft_cal_for_residual = torch.zeros_like(ft_cal)  # Phase 1: no calibration
+                        ft_cal_phase = torch.zeros_like(ft_cal)  # Phase 1: no calibration
                     else:
-                        ft_cal_for_residual = ft_cal  # Phase 2: with calibration
+                        ft_cal_phase = ft_cal  # Phase 2: with calibration
 
                     # Reconstruct outputs with phase-appropriate ft_cal (NO .detach()!)
                     # Use logabs_sign_pred directly (not torch.sign) to keep it trainable
-                    logabs_values_residual = logabs_sign_pred * (mag_preds + ft_cal_for_residual)
+                    logabs_values_residual = logabs_sign_pred * (mag_preds + ft_cal_phase)
                     outputs_for_residual = torch.cat([real_sign_pred, logabs_values_residual], dim=1)
 
                     # Pass outputs, targets, inputs_real, and normalizer to residual loss
@@ -725,8 +795,8 @@ def main():
                 val_parts.append(f"{key}: {value:.4e} ({ratio:.2f}%)")
 
         # Print both on 2 lines with aligned spacing
-        train_breakdown = "  |  ".join(train_parts)
-        val_breakdown = "  |  ".join(val_parts)
+        train_breakdown = " | ".join(train_parts)
+        val_breakdown = " | ".join(val_parts)
         print(f"  Train Loss: {train_breakdown}")
         print(f"  Val Loss  : {val_breakdown}")
 
@@ -786,11 +856,11 @@ def main():
                 loss_args["MSE"] = (mag_preds, targets, logabs_sign_probs, None, None, real_sign_probs, ft_cal, test_targets_normalizer)
             if loss_fn.has_loss("Residual"):
                 # Test time: use full ft_cal (Phase 2) as we're testing the fully trained model
-                ft_cal_for_residual = ft_cal
+                ft_cal_phase = ft_cal
 
                 # Reconstruct outputs with ft_cal (NO .detach()!)
                 # Use logabs_sign_pred directly (not torch.sign) to keep it trainable
-                logabs_values_residual = logabs_sign_pred * (mag_preds + ft_cal_for_residual)
+                logabs_values_residual = logabs_sign_pred * (mag_preds + ft_cal_phase)
                 outputs_for_residual = torch.cat([real_sign_pred, logabs_values_residual], dim=1)
 
                 # Pass outputs, targets, inputs_real, and normalizer to residual loss
@@ -830,3 +900,4 @@ def main():
 if __name__ == "__main__":
     main()
     # testcudaavailable()
+    # testdataloaderunchange()

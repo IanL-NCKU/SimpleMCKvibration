@@ -171,6 +171,7 @@ class Exponential_DataNormalizer:
         return X_denorm
 
 
+
 class Exponential_OutputNormalizer:
     """Normalization for exponential output data: [x_t, v_t, a_t]
 
@@ -186,7 +187,7 @@ class Exponential_OutputNormalizer:
                                   If False, use standard normalization.
         """
         self.use_log_normalization = use_log_normalization
-
+        self.eps = 1e-12 # Small epsilon for numerical stability
         if self.use_log_normalization:
             self.log_features = ['x', 'v', 'a']  # All outputs use log normalization
             self.log_mean = {}
@@ -208,7 +209,7 @@ class Exponential_OutputNormalizer:
             for feat in self.log_features:
                 values = data_dict[feat]
                 # Assume all values are positive, add epsilon to avoid log(0)
-                log_values = np.log10(np.abs(values) + 1e-10)
+                log_values = np.log10(np.abs(values) + self.eps)
                 self.log_mean[feat] = np.mean(log_values)
                 self.log_std[feat] = np.std(log_values)
         else:
@@ -217,7 +218,7 @@ class Exponential_OutputNormalizer:
                 self.linear_mean[feat] = np.mean(data_dict[feat])
                 self.linear_std[feat] = np.std(data_dict[feat])
 
-    def transform(self, data_dict, eps=1e-10):
+    def transform(self, data_dict):
         """
         Normalize data
 
@@ -240,7 +241,7 @@ class Exponential_OutputNormalizer:
                 # Extract signs
                 signs[feat] = np.sign(values)
                 # Apply log transform to absolute values
-                log_values = np.log10(np.abs(values) + eps)
+                log_values = np.log10(np.abs(values) + self.eps)
                 normalized[feat] = (log_values - self.log_mean[feat]) / self.log_std[feat]
             return normalized, signs
         else:
@@ -248,14 +249,13 @@ class Exponential_OutputNormalizer:
                 normalized[feat] = (data_dict[feat] - self.linear_mean[feat]) / self.linear_std[feat]
             return normalized, None
 
-    def inverse_transform(self, normalized_dict, signs_dict=None, eps=1e-10):
+    def inverse_transform(self, normalized_dict, signs_dict=None):
         """
         Denormalize data
 
         Args:
             normalized_dict: Dictionary with normalized feature arrays
             signs_dict: Optional dictionary with sign arrays (only used when use_log_normalization=True)
-            eps: Small epsilon value for numerical stability
 
         Returns:
             Dictionary with original features
@@ -305,6 +305,41 @@ class Exponential_OutputNormalizer:
             'a': Y[:, 2]
         }
 
+        # Compute unnormalized log values first (for printing)
+        if self.use_log_normalization:
+            # Print normalizer statistics
+            print(f"Output normalizer stats:")
+            print(f"  x: log_mean={self.log_mean['x']:.6f}, log_std={self.log_std['x']:.6f}")
+            print(f"  v: log_mean={self.log_mean['v']:.6f}, log_std={self.log_std['v']:.6f}")
+            print(f"  a: log_mean={self.log_mean['a']:.6f}, log_std={self.log_std['a']:.6f}")
+
+            
+            abs_x = np.abs(data_dict['x'])
+            abs_v = np.abs(data_dict['v'])
+            abs_a = np.abs(data_dict['a'])
+
+            log_values_x = np.log10(abs_x + self.eps)
+            log_values_v = np.log10(abs_v + self.eps)
+            log_values_a = np.log10(abs_a + self.eps)
+
+            # Find minimum absolute values and their corresponding log values
+            min_abs_x = np.min(abs_x)
+            min_abs_v = np.min(abs_v)
+            min_abs_a = np.min(abs_a)
+
+            min_abs_x_idx = np.argmin(abs_x)
+            min_abs_v_idx = np.argmin(abs_v)
+            min_abs_a_idx = np.argmin(abs_a)
+
+            print(f"Minimum absolute values and their log values:")
+            print(f"  x: min(|x|)={min_abs_x:.10e}, corresponding log10(|x|+eps)={log_values_x[min_abs_x_idx]:.6f}")
+            print(f"  v: min(|v|)={min_abs_v:.10e}, corresponding log10(|v|+eps)={log_values_v[min_abs_v_idx]:.6f}")
+            print(f"  a: min(|a|)={min_abs_a:.10e}, corresponding log10(|a|+eps)={log_values_a[min_abs_a_idx]:.6f}")
+
+            print(f"Min/Max of Y_logabs 'x' (before norm): {np.min(log_values_x):.6f}, {np.max(log_values_x):.6f}")
+            print(f"Min/Max of Y_logabs 'v' (before norm): {np.min(log_values_v):.6f}, {np.max(log_values_v):.6f}")
+            print(f"Min/Max of Y_logabs 'a' (before norm): {np.min(log_values_a):.6f}, {np.max(log_values_a):.6f}")
+
         # Normalize using transform
         normalized_dict, sign_dict = self.transform(data_dict)
 
@@ -326,9 +361,9 @@ class Exponential_OutputNormalizer:
             # Concatenate: [sign_x, sign_v, sign_a, logabs_x, logabs_v, logabs_a]
             Y_norm = np.concatenate([signs_array, logabs_array], axis=1)
 
-            print(f"Min/Max of Y_norm logabs 'x': {np.min(Y_norm[:, 3])}, {np.max(Y_norm[:, 3])}")
-            print(f"Min/Max of Y_norm logabs 'v': {np.min(Y_norm[:, 4])}, {np.max(Y_norm[:, 4])}")
-            print(f"Min/Max of Y_norm logabs 'a': {np.min(Y_norm[:, 5])}, {np.max(Y_norm[:, 5])}")
+            print(f"Min/Max of Y_norm logabs 'x' (after norm):  {np.min(Y_norm[:, 3]):.6f}, {np.max(Y_norm[:, 3]):.6f}")
+            print(f"Min/Max of Y_norm logabs 'v' (after norm):  {np.min(Y_norm[:, 4]):.6f}, {np.max(Y_norm[:, 4]):.6f}")
+            print(f"Min/Max of Y_norm logabs 'a' (after norm):  {np.min(Y_norm[:, 5]):.6f}, {np.max(Y_norm[:, 5]):.6f}")
         else:
             # Linear normalization - just stack the normalized values
             Y_norm = np.stack([
@@ -410,7 +445,6 @@ class Exponential_OutputNormalizer:
             Y = torch.FloatTensor(Y).to(device)
 
         return Y
-
 
 class ExponentialDataset(Dataset):
     """PyTorch Dataset for exponential data"""
@@ -821,3 +855,357 @@ def check_all_datasets(train_loader, val_loader, test_loader,
     print("="*70)
 
     return results
+
+
+def check_raw_data_residuals(data_path, use_relative=False):
+    """
+    Check physics residuals for raw data (before normalization).
+    This validates that the original generated data satisfies the physics equation:
+    (1/(2a))*a_t + 0.5*v_t - a*x_t = 0
+
+    Args:
+        data_path: Path to the .npz data file
+        use_relative: If True, compute scale-invariant relative residual
+
+    Returns:
+        dict: Statistics about residuals including mean, std, min, max
+    """
+    print("\n" + "="*80)
+    print("CHECKING RAW DATA PHYSICS RESIDUALS (Before Normalization)")
+    print("="*80)
+    print(f"Data file: {data_path}")
+    print(f"Use relative residual: {use_relative}")
+    print("-"*80)
+
+    # Load raw data
+    data = np.load(data_path)
+
+
+    # Extract the array (npz files can contain multiple arrays)
+    if isinstance(data, np.lib.npyio.NpzFile):
+        # Get the first array in the npz file
+        array_name = list(data.keys())[0]
+        data_array = data[array_name]
+    else:
+        data_array = data
+    # Extract inputs and targets (raw, unnormalized)
+    # inputs: [a, b, t]
+    # targets: [x_t, v_t, a_t] (raw real values, not log-space)
+    inputs = data_array[:, :3]   # Shape: (n_samples, 3)
+    targets = data_array[:, 3:]  # Shape: (n_samples, 3)
+
+    # Extract parameters and target values
+    a = inputs[:, 0]  # exponential rate parameter
+    x_t = targets[:, 0]
+    v_t = targets[:, 1]
+    a_t = targets[:, 2]
+
+    # DIAGNOSTIC: Print raw data sample values
+    print(f"\n[DIAGNOSTIC] Raw data sample values (first sample):")
+    print(f"  a: {a[0]:.6e}, x_t: {x_t[0]:.6e}, v_t: {v_t[0]:.6e}, a_t: {a_t[0]:.6e}")
+
+    # Physics residual: (1/(2a))*a_t + 0.5*v_t - a*x_t = 0
+    eps = 1e-10
+    residual = (1.0 / (2.0 * a + eps)) * a_t + 0.5 * v_t - a * x_t
+
+    if use_relative:
+        # Scale-invariant relative residual
+        # Normalize by target's acceleration term: (1/(2a))*a_target
+        scale = np.abs((1.0 / (2.0 * a + eps)) * a_t) + eps
+        residual = residual / scale
+        residual_type = "relative"
+    else:
+        residual_type = "absolute"
+
+    # Calculate statistics
+    mean_abs_residual = np.mean(np.abs(residual))
+    std_residual = np.std(residual)
+    min_residual = np.min(residual)
+    max_residual = np.max(residual)
+
+    # Print results
+    print(f"\nRaw data {residual_type} residual statistics:")
+    print(f"  Mean absolute residual: {mean_abs_residual:.6e}")
+    print(f"  Std residual:           {std_residual:.6e}")
+    print(f"  Min residual:           {min_residual:.6e}")
+    print(f"  Max residual:           {max_residual:.6e}")
+    print(f"  Residual range:         [{min_residual:.6e}, {max_residual:.6e}]")
+
+    # Evaluation
+    if use_relative:
+        threshold = 1e-3
+    else:
+        threshold = 1e-6
+
+    if mean_abs_residual < threshold:
+        print(f"\n✓ PASSED: Raw data residual is very small (< {threshold:.0e})")
+        print("  The original data satisfies the physics equation well!")
+    elif mean_abs_residual < threshold * 1000:
+        print(f"\n⚠ WARNING: Raw data residual is small but not negligible (< {threshold*1000:.0e})")
+        print("  The data may have numerical errors from generation.")
+    else:
+        print(f"\n✗ FAILED: Raw data residual is large (>= {threshold*1000:.0e})")
+        print("  The data generation may have errors!")
+
+    print("="*80 + "\n")
+
+    return {
+        'mean_abs_residual': mean_abs_residual,
+        'std_residual': std_residual,
+        'min_residual': min_residual,
+        'max_residual': max_residual,
+        'use_relative': use_relative
+    }
+
+
+def examinenormalizer(filepath, tolerance=1e-3, batch_size=1024):
+    """
+    Examine if normalization→denormalization is perfectly reversible.
+
+    This function tests whether the normalization pipeline can perfectly reconstruct
+    the original data after normalize→denormalize operations. Tests both:
+    1. Direct numpy array normalization/denormalization
+    2. DataLoader-based (tensor format) normalization/denormalization
+
+    Args:
+        filepath: Path to .npz data file
+        tolerance: Maximum acceptable relative error (default: 1e-6)
+        batch_size: Batch size for DataLoader test (default: 1024)
+
+    Returns:
+        dict with diagnostic results:
+            - 'inputs_max_error': Max relative error for inputs
+            - 'outputs_max_error': Max relative error for outputs
+            - 'inputs_failed_samples': Number of samples exceeding tolerance
+            - 'outputs_failed_samples': Number of samples exceeding tolerance
+            - 'dataloader_inputs_failed_samples': Number failing in DataLoader
+            - 'dataloader_outputs_failed_samples': Number failing in DataLoader
+    """
+    print("\n" + "="*80)
+    print("EXAMINING NORMALIZER REVERSIBILITY")
+    print("="*80)
+    print(f"Testing normalization→denormalization pipeline on: {filepath}")
+    print(f"Tolerance: {tolerance:.0e}")
+
+    # Step 1: Load raw data
+    data = np.load(filepath)
+    data_array = data['data']  # Shape: (N, 6) = [a, b, t, x_t, v_t, a_t]
+
+    print(f"Testing all {len(data_array)} samples")
+
+    # Split inputs and outputs
+    input_data = data_array[:, :3]   # [a, b, t]
+    output_data = data_array[:, 3:]  # [x_t, v_t, a_t]
+
+    # Step 2: Create and fit normalizers (same as load_exponential_data)
+    print("\n[FITTING NORMALIZERS]")
+    inputs_normalizer = Exponential_DataNormalizer()
+    targets_normalizer = Exponential_OutputNormalizer(use_log_normalization=True)
+
+    inputs_normalizer.fit({
+        'a': input_data[:, 0],
+        'b': input_data[:, 1],
+        't': input_data[:, 2]
+    })
+
+    targets_normalizer.fit({
+        'x': output_data[:, 0],
+        'v': output_data[:, 1],
+        'a': output_data[:, 2]
+    })
+
+    # Print normalization statistics
+    print("\n[INPUT NORMALIZER STATS]")
+    print(f"  Linear features (a, b):")
+    print(f"    a: mean={inputs_normalizer.linear_mean['a']:.6f}, std={inputs_normalizer.linear_std['a']:.6f}")
+    print(f"    b: mean={inputs_normalizer.linear_mean['b']:.6f}, std={inputs_normalizer.linear_std['b']:.6f}")
+    print(f"  Log features (t):")
+    print(f"    t: log_mean={inputs_normalizer.log_mean['t']:.6f}, log_std={inputs_normalizer.log_std['t']:.6f}")
+
+    print("\n[OUTPUT NORMALIZER STATS]")
+    print(f"  Log features (x, v, a):")
+    print(f"    x: log_mean={targets_normalizer.log_mean['x']:.6f}, log_std={targets_normalizer.log_std['x']:.6f}")
+    print(f"    v: log_mean={targets_normalizer.log_mean['v']:.6f}, log_std={targets_normalizer.log_std['v']:.6f}")
+    print(f"    a: log_mean={targets_normalizer.log_mean['a']:.6f}, log_std={targets_normalizer.log_std['a']:.6f}")
+
+    # Step 3: Test inputs normalization reversibility
+    print("\n[TESTING INPUTS REVERSIBILITY]")
+    inputs_dict = {
+        'a': input_data[:, 0],
+        'b': input_data[:, 1],
+        't': input_data[:, 2]
+    }
+    inputs_normalized = inputs_normalizer.transform(inputs_dict)
+
+    # Convert to array format (same as load_exponential_data)
+    inputs_array_norm = np.stack([
+        inputs_normalized['a'],
+        inputs_normalized['b'],
+        inputs_normalized['t']
+    ], axis=1)
+
+    # Denormalize back
+    inputs_reconstructed = inputs_normalizer.denormalize_inputs(inputs_array_norm)
+
+    # Compute errors
+    inputs_error = np.abs(input_data - inputs_reconstructed)
+    inputs_rel_error = inputs_error / (np.abs(input_data) + 1e-10)
+    inputs_max_error = np.max(inputs_rel_error)
+    inputs_failed = np.sum(np.max(inputs_rel_error, axis=1) > tolerance)
+
+    print(f"  Max relative error: {inputs_max_error:.6e}")
+    print(f"  Failed samples (>{tolerance:.0e}): {inputs_failed}/{len(input_data)}")
+
+    if inputs_max_error > tolerance:
+        print(f"  ✗ FAILED: Inputs normalization is NOT reversible!")
+        # Print worst sample
+        worst_idx = np.argmax(np.max(inputs_rel_error, axis=1))
+        print(f"\n  Worst sample (index {worst_idx}):")
+        print(f"    Original:      a={input_data[worst_idx, 0]:.6e}, b={input_data[worst_idx, 1]:.6e}, t={input_data[worst_idx, 2]:.6e}")
+        print(f"    Reconstructed: a={inputs_reconstructed[worst_idx, 0]:.6e}, b={inputs_reconstructed[worst_idx, 1]:.6e}, t={inputs_reconstructed[worst_idx, 2]:.6e}")
+        print(f"    Relative error: a={inputs_rel_error[worst_idx, 0]:.6e}, b={inputs_rel_error[worst_idx, 1]:.6e}, t={inputs_rel_error[worst_idx, 2]:.6e}")
+    else:
+        print(f"  ✓ PASSED: Inputs normalization is reversible")
+
+    # Step 4: Test outputs normalization reversibility
+    print("\n[TESTING OUTPUTS REVERSIBILITY]")
+    outputs_dict = {
+        'x': output_data[:, 0],
+        'v': output_data[:, 1],
+        'a': output_data[:, 2]
+    }
+    outputs_normalized, signs_dict = targets_normalizer.transform(outputs_dict)
+
+    # Convert to array format (same as load_exponential_data)
+    outputs_array_norm = np.stack([
+        signs_dict['x'],
+        signs_dict['v'],
+        signs_dict['a'],
+        outputs_normalized['x'],
+        outputs_normalized['v'],
+        outputs_normalized['a']
+    ], axis=1)  # Shape: (N, 6) = [sign_x, sign_v, sign_a, logabs_x, logabs_v, logabs_a]
+
+    # Denormalize back using denormalize_outputs()
+    outputs_reconstructed = targets_normalizer.denormalize_outputs(outputs_array_norm)
+
+    # Compute errors
+    outputs_error = np.abs(output_data - outputs_reconstructed)
+    outputs_rel_error = outputs_error / (np.abs(output_data) + 1e-10)
+    outputs_max_error = np.max(outputs_rel_error)
+    outputs_failed = np.sum(np.max(outputs_rel_error, axis=1) > tolerance)
+
+    print(f"  Max relative error: {outputs_max_error:.6e}")
+    print(f"  Failed samples (>{tolerance:.0e}): {outputs_failed}/{len(output_data)}")
+
+    if outputs_max_error > tolerance:
+        print(f"  ✗ FAILED: Outputs normalization is NOT reversible!")
+        # Print worst sample
+        worst_idx = np.argmax(np.max(outputs_rel_error, axis=1))
+        print(f"\n  Worst sample (index {worst_idx}):")
+        print(f"    Original:      x_t={output_data[worst_idx, 0]:.6e}, v_t={output_data[worst_idx, 1]:.6e}, a_t={output_data[worst_idx, 2]:.6e}")
+        print(f"    Reconstructed: x_t={outputs_reconstructed[worst_idx, 0]:.6e}, v_t={outputs_reconstructed[worst_idx, 1]:.6e}, a_t={outputs_reconstructed[worst_idx, 2]:.6e}")
+        print(f"    Relative error: x_t={outputs_rel_error[worst_idx, 0]:.6e}, v_t={outputs_rel_error[worst_idx, 1]:.6e}, a_t={outputs_rel_error[worst_idx, 2]:.6e}")
+        print(f"    Signs: x={signs_dict['x'][worst_idx]}, v={signs_dict['v'][worst_idx]}, a={signs_dict['a'][worst_idx]}")
+        print(f"    Normalized logabs: x={outputs_normalized['x'][worst_idx]:.6f}, v={outputs_normalized['v'][worst_idx]:.6f}, a={outputs_normalized['a'][worst_idx]:.6f}")
+    else:
+        print(f"  ✓ PASSED: Outputs normalization is reversible")
+
+    # Step 5: Test with DataLoader (tensor format, no shuffle)
+    print("\n[TESTING DATALOADER REVERSIBILITY (TENSOR FORMAT)]")
+    print(f"Creating DataLoader with batch_size={batch_size}, shuffle=False")
+
+    # Create dataset from normalized arrays
+    dataset = ExponentialDataset(inputs_array_norm, outputs_array_norm)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+    # Collect all denormalized data from dataloader
+    all_inputs_from_loader = []
+    all_outputs_from_loader = []
+
+    for batch_inputs, batch_outputs in dataloader:
+        # Convert to numpy for denormalization
+        batch_inputs_np = batch_inputs.numpy()
+        batch_outputs_np = batch_outputs.numpy()
+
+        # Denormalize
+        batch_inputs_denorm = inputs_normalizer.denormalize_inputs(batch_inputs_np)
+        batch_outputs_denorm = targets_normalizer.denormalize_outputs(batch_outputs_np)
+
+        all_inputs_from_loader.append(batch_inputs_denorm)
+        all_outputs_from_loader.append(batch_outputs_denorm)
+
+    # Concatenate all batches
+    inputs_from_loader = np.concatenate(all_inputs_from_loader, axis=0)
+    outputs_from_loader = np.concatenate(all_outputs_from_loader, axis=0)
+
+    # Compare with original raw data
+    loader_inputs_error = np.abs(input_data - inputs_from_loader)
+    loader_inputs_rel_error = loader_inputs_error / (np.abs(input_data) + 1e-10)
+    loader_inputs_max_error = np.max(loader_inputs_rel_error)
+    loader_inputs_failed = np.sum(np.max(loader_inputs_rel_error, axis=1) > tolerance)
+
+    loader_outputs_error = np.abs(output_data - outputs_from_loader)
+    loader_outputs_rel_error = loader_outputs_error / (np.abs(output_data) + 1e-10)
+    loader_outputs_max_error = np.max(loader_outputs_rel_error)
+    loader_outputs_failed = np.sum(np.max(loader_outputs_rel_error, axis=1) > tolerance)
+
+    print(f"  Inputs:")
+    print(f"    Max relative error: {loader_inputs_max_error:.6e}")
+    print(f"    Failed samples (>{tolerance:.0e}): {loader_inputs_failed}/{len(input_data)}")
+
+    print(f"  Outputs:")
+    print(f"    Max relative error: {loader_outputs_max_error:.6e}")
+    print(f"    Failed samples (>{tolerance:.0e}): {loader_outputs_failed}/{len(output_data)}")
+
+    if loader_inputs_max_error > tolerance or loader_outputs_max_error > tolerance:
+        print(f"  ✗ FAILED: DataLoader tensor format introduces errors!")
+        if loader_outputs_max_error > tolerance:
+            worst_idx = np.argmax(np.max(loader_outputs_rel_error, axis=1))
+            print(f"\n  Worst output sample (index {worst_idx}):")
+            print(f"    Original:    x_t={output_data[worst_idx, 0]:.6e}, v_t={output_data[worst_idx, 1]:.6e}, a_t={output_data[worst_idx, 2]:.6e}")
+            print(f"    From loader: x_t={outputs_from_loader[worst_idx, 0]:.6e}, v_t={outputs_from_loader[worst_idx, 1]:.6e}, a_t={outputs_from_loader[worst_idx, 2]:.6e}")
+            print(f"    Rel error:   x_t={loader_outputs_rel_error[worst_idx, 0]:.6e}, v_t={loader_outputs_rel_error[worst_idx, 1]:.6e}, a_t={loader_outputs_rel_error[worst_idx, 2]:.6e}")
+    else:
+        print(f"  ✓ PASSED: DataLoader tensor format preserves data correctly")
+
+    # Summary
+    print("\n" + "="*80)
+    print("SUMMARY")
+    print("="*80)
+    print(f"Direct numpy test:")
+    print(f"  Inputs failed:  {inputs_failed}/{len(input_data)} samples")
+    print(f"  Outputs failed: {outputs_failed}/{len(output_data)} samples")
+    print(f"DataLoader test:")
+    print(f"  Inputs failed:  {loader_inputs_failed}/{len(input_data)} samples")
+    print(f"  Outputs failed: {loader_outputs_failed}/{len(output_data)} samples")
+    print()
+
+    if inputs_max_error < tolerance and outputs_max_error < tolerance:
+        if loader_inputs_max_error < tolerance and loader_outputs_max_error < tolerance:
+            print("✓ ALL PASSED: Both direct and DataLoader normalization are reversible")
+            print("  → Normalizer implementation is correct")
+            print("  → Problem must be elsewhere in the training pipeline")
+        else:
+            print("✗ DATALOADER FAILED: DataLoader introduces errors")
+            print("  → Direct normalization works, but DataLoader format has issues")
+            print("  → Check tensor conversions or batch processing")
+    elif outputs_max_error > tolerance:
+        print("✗ OUTPUTS FAILED: Outputs normalization has bugs")
+        print("  → Check transform() / inverse_transform() / denormalize_outputs()")
+        print("  → Likely issue with sign handling or log-space operations")
+    else:
+        print("✗ INPUTS FAILED: Inputs normalization has bugs")
+        print("  → Check input normalizer implementation")
+    print("="*80 + "\n")
+
+    return {
+        'inputs_max_error': float(inputs_max_error),
+        'outputs_max_error': float(outputs_max_error),
+        'inputs_failed_samples': int(inputs_failed),
+        'outputs_failed_samples': int(outputs_failed),
+        'dataloader_inputs_max_error': float(loader_inputs_max_error),
+        'dataloader_outputs_max_error': float(loader_outputs_max_error),
+        'dataloader_inputs_failed_samples': int(loader_inputs_failed),
+        'dataloader_outputs_failed_samples': int(loader_outputs_failed)
+    }

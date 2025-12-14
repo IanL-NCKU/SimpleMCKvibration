@@ -877,7 +877,7 @@ class MSELoss(BaseLossComponent):
         Returns:
             loss: Scalar tensor
         """
-        eps = 1e-10
+        eps = 1e-12
 
         if self.use_log:
             # Extract logabs targets (columns 3-5) for magnitude loss
@@ -1042,21 +1042,24 @@ class ExponentialResidualLoss(BaseLossComponent):
 
         # Convert to real space: real_value = sign * 10^logabs (vectorized)
         ln10 = torch.tensor(np.log(10.0), device=device, dtype=dtype)
-        real_values = torch.sign(real_signs) * torch.exp(logabs_denorm * ln10)  # (batch_size, 3)
+        # real_values = torch.sign(real_signs) * torch.exp(logabs_denorm * ln10)  # (batch_size, 3)
+        real_values = SignWithHardTanh.apply(real_signs) * torch.exp(logabs_denorm * ln10)  # (batch_size, 3)
 
         # Extract x, v, a predictions
-        x_pred = real_values[:, 0].detach()  # Detach position to prevent gradient issues
-        v_pred = real_values[:, 1].detach()  # Detach velocity to prevent gradient issues
-        a_pred = real_values[:, 2].detach()  # Detach acceleration to prevent gradient issues
+        x_pred = real_values[:, 0]#.detach()  # Detach position to prevent gradient issues
+        v_pred = real_values[:, 1]#.detach()  # Detach velocity to prevent gradient issues
+        a_pred = real_values[:, 2]#.detach()  # Detach acceleration to prevent gradient issues
 
         # Extract parameters
         a = inputs_real[:, 0]  # exponential rate
 
-        eps = 1e-10
+        eps = 1e-12
 
         # Physics residual: (1/(2a))*a_t + 0.5*v_t - a*x_t = 0
         residual =(1.0 / (2.0 * a + eps)) * a_pred + 0.5 * v_pred - a * x_pred
-        # residual = torch.log(torch.abs((1.0 / (2.0 * a + eps)) * a_pred)) - torch.log(torch.abs(0.5 * v_pred - a * x_pred)) 
+        # residual = torch.log(torch.abs((1.0 / (2.0 * a + eps)) * a_pred)) - torch.log(torch.abs(0.5 * v_pred - a * x_pred)) \
+        #             + torch.log(torch.abs(a * x_pred)) - torch.log(torch.abs((1.0 / (2.0 * a + eps)) * a_pred + 0.5 * v_pred))\
+        #             + torch.log(torch.abs(0.5 * v_pred)) - torch.log(torch.abs(a * x_pred - (1.0 / (2.0 * a + eps)) * a_pred))
 
         if self.use_relative:
             # Scale-invariant relative residual
@@ -1070,8 +1073,9 @@ class ExponentialResidualLoss(BaseLossComponent):
 
             scale = torch.abs((1.0 / (2.0 * a + eps)) * a_target) + eps
             residual = residual / scale
-
-        return torch.mean(torch.abs(residual))
+        # residual = torch.log(torch.abs(residual) + 1)
+        # return torch.mean(torch.abs(residual))
+        return torch.mean(torch.log(torch.square(residual) + 1))
 
 
 class ConsistencyLoss_auto_diff(BaseLossComponent):
@@ -1202,7 +1206,7 @@ class ConsistencyLoss_auto_diff(BaseLossComponent):
 
         # Apply log transformation if enabled
         if self.use_log:
-            eps = 1e-10
+            eps = 1e-12
             total_loss = torch.log(total_loss + eps)
 
         return total_loss
