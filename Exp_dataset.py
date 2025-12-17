@@ -586,7 +586,8 @@ def load_exponential_data(filepath='exponential_trainval_data.npz', batch_size=3
 
 def check_dataset_consistency(dataset, inputs_normalizer, outputs_normalizer,
                               dataset_name="Dataset", error_threshold=0.10, verbose=False,
-                              plot_io_relation=False, save_dir=None, plot_sample_rate=1):
+                              plot_io_relation=False, save_dir=None, plot_sample_rate=1,
+                              verify_derivatives=False):
     """
     Check if normalized dataset is consistent with analytical solution.
 
@@ -596,6 +597,7 @@ def check_dataset_consistency(dataset, inputs_normalizer, outputs_normalizer,
     3. Compares log10(abs(analytical_solution)) with the normalized targets
     4. Reports percentage of samples with error > threshold
     5. Optionally plots input-output relationships (9 scatter plots: 3 inputs × 3 outputs)
+    6. Optionally verifies derivative formulas (analytical vs numerical methods)
 
     Args:
         dataset: PyTorch Dataset with (inputs, outputs)
@@ -607,9 +609,10 @@ def check_dataset_consistency(dataset, inputs_normalizer, outputs_normalizer,
         plot_io_relation: If True, plot input vs output scatter plots (default False)
         save_dir: Directory to save plots. If None, uses './IOrelation' (default None)
         plot_sample_rate: Plot every Nth sample (e.g., 10 means plot 1 out of 10 samples) (default 1)
+        verify_derivatives: If True, verify derivative formulas (analytical vs numerical) (default False)
 
     Returns:
-        dict: Statistics including error counts and samples
+        dict: Statistics including error counts and samples (and derivative verification if enabled)
     """
     print(f"\n{'='*70}")
     print(f"Checking {dataset_name} Dataset ({len(dataset)} samples)")
@@ -668,8 +671,12 @@ def check_dataset_consistency(dataset, inputs_normalizer, outputs_normalizer,
         normalized_analytical_array[:, i] = (log_values - outputs_normalizer.log_mean[feat]) / outputs_normalizer.log_std[feat]
 
     # Step 5: Compare with actual targets
+    # Extract normalized log values from all_targets (columns 3-5)
+    # all_targets shape is (N, 6): [sign_x, sign_v, sign_a, logabs_x_norm, logabs_v_norm, logabs_a_norm]
+    all_targets_normalized = all_targets[:, 3:6]  # Extract columns 3-5
+
     # Compute absolute and relative errors
-    abs_errors = np.abs(all_targets - normalized_analytical_array)
+    abs_errors = np.abs(all_targets_normalized - normalized_analytical_array)
 
     # For relative error, avoid division by zero
     denom = np.abs(normalized_analytical_array) + 1e-10
@@ -698,6 +705,299 @@ def check_dataset_consistency(dataset, inputs_normalizer, outputs_normalizer,
           f"{high_error_count_per_sample} / {n_samples} "
           f"({high_error_count_per_sample/n_samples*100:.2f}%)")
 
+    # ========================================================================
+    # DERIVATIVE VERIFICATION (if requested)
+    # ========================================================================
+    if verify_derivatives:
+        print(f"\n{'='*70}")
+        print(f"DERIVATIVE FORMULA VERIFICATION - ANALYTICAL VS NUMERICAL")
+        print(f"{'='*70}")
+
+        # Extract normalization constants
+        std_x = outputs_normalizer.log_std['x']
+        std_v = outputs_normalizer.log_std['v']
+        std_a = outputs_normalizer.log_std['a']
+        std_t = inputs_normalizer.log_std['t']
+
+        mean_x = outputs_normalizer.log_mean['x']
+        mean_v = outputs_normalizer.log_mean['v']
+        mean_a = outputs_normalizer.log_mean['a']
+        mean_t = inputs_normalizer.log_mean['t']
+
+        print(f"\nNormalization constants:")
+        print(f"  std_x: {std_x:.6f}, mean_x: {mean_x:.6f}")
+        print(f"  std_v: {std_v:.6f}, mean_v: {mean_v:.6f}")
+        print(f"  std_a: {std_a:.6f}, mean_a: {mean_a:.6f}")
+        print(f"  std_t: {std_t:.6f}, mean_t: {mean_t:.6f}")
+
+        # Initialize error storage lists
+        errors_v_analytical = []
+        errors_v_numerical = []
+        errors_vprime_analytical = []
+        errors_vprime_numerical = []
+
+        errors_a_analytical = []
+        errors_a_numerical = []
+        errors_aprime_analytical = []
+        errors_aprime_numerical = []
+
+        # Store predictions for random sample display
+        v_real_samples = []
+        v_analytical_samples = []
+        v_numerical_samples = []
+        v_prime_real_samples = []
+        v_prime_analytical_samples = []
+        v_prime_numerical_samples = []
+
+        a_real_samples = []
+        a_analytical_samples = []
+        a_numerical_samples = []
+        a_prime_real_samples = []
+        a_prime_analytical_samples = []
+        a_prime_numerical_samples = []
+
+        ln10 = np.log(10.0)
+        deriv_invalid_count = 0
+
+        # Loop through each sample
+        for i in range(n_samples):
+            # Skip if analytical solution was invalid
+            if np.isnan(analytical_outputs[i, 0]):
+                deriv_invalid_count += 1
+                continue
+
+            # Extract data
+            a = a_values[i]
+            b = b_values[i]
+            t = t_values[i]
+            x_t = analytical_outputs[i, 0]
+            v_t = analytical_outputs[i, 1]
+            a_t = analytical_outputs[i, 2]
+
+            # Get normalized ground truth from all_targets
+            # Note: all_targets has shape (N, 6) with columns [sign_x, sign_v, sign_a, logabs_x_norm, logabs_v_norm, logabs_a_norm]
+            # We need the normalized log absolute values (columns 3-5)
+            x_prime = all_targets[i, 3]
+            v_prime = all_targets[i, 4]
+            a_prime = all_targets[i, 5]
+
+            # Compute t_prime
+            t_prime = (np.log10(t) - mean_t) / std_t
+
+            # Method 1: Analytical dx'/dt' and dv'/dt'
+            dx_prime_dt_prime_analytical = (std_t / std_x) * a * np.exp((std_t * t_prime + mean_t) * ln10)
+            dv_prime_dt_prime_analytical = (std_t / std_v) * a * np.exp((std_t * t_prime + mean_t) * ln10)
+
+            # Method 2: Numerical dx'/dt' and dv'/dt'
+            t_prime_low = 0.9999 * t_prime
+            t_prime_high = 1.0001 * t_prime
+
+            # Convert back to real time
+            t_low = np.exp((std_t * t_prime_low + mean_t) * ln10)
+            t_high = np.exp((std_t * t_prime_high + mean_t) * ln10)
+
+            # Get analytical solutions at perturbed times
+            x_t_low, v_t_low, _ = analytical_solution_exp(a, b, t_low)
+            x_t_high, v_t_high, _ = analytical_solution_exp(a, b, t_high)
+
+            # Check for validity
+            if any(np.isnan([x_t_low, x_t_high, v_t_low, v_t_high])) or \
+               any(np.isinf([x_t_low, x_t_high, v_t_low, v_t_high])):
+                deriv_invalid_count += 1
+                continue
+
+            # Normalize x and v at perturbed times
+            x_prime_low = (np.log10(np.abs(x_t_low)) - mean_x) / std_x
+            x_prime_high = (np.log10(np.abs(x_t_high)) - mean_x) / std_x
+            v_prime_low = (np.log10(np.abs(v_t_low)) - mean_v) / std_v
+            v_prime_high = (np.log10(np.abs(v_t_high)) - mean_v) / std_v
+
+            # Finite differences (derivative with respect to normalized time t')
+            dx_prime_dt_prime_numerical = (x_prime_high - x_prime_low) / (t_prime_high - t_prime_low)
+            dv_prime_dt_prime_numerical = (v_prime_high - v_prime_low) / (t_prime_high - t_prime_low)
+
+            # Compute velocities AND accelerations using both methods
+            # Velocity predictions (x -> v)
+            common_factor_v = (std_x / std_t) * (np.exp((std_x * x_prime + mean_x) * ln10) / t)
+            v_analytical_method = np.abs(common_factor_v * dx_prime_dt_prime_analytical)
+            v_numerical_method = np.abs(common_factor_v * dx_prime_dt_prime_numerical)
+
+            # Acceleration predictions (v -> a)
+            common_factor_a = (std_v / std_t) * (np.exp((std_v * v_prime + mean_v) * ln10) / t)
+            a_analytical_method = np.abs(common_factor_a * dv_prime_dt_prime_analytical)
+            a_numerical_method = np.abs(common_factor_a * dv_prime_dt_prime_numerical)
+
+            # Ground truths
+            v_real_abs = np.abs(v_t)
+            a_real_abs = np.abs(a_t)
+
+            # Compute normalized v' and a' from predictions
+            v_prime_analytical = (np.log10(v_analytical_method) - mean_v) / std_v
+            v_prime_numerical = (np.log10(v_numerical_method) - mean_v) / std_v
+
+            a_prime_analytical = (np.log10(a_analytical_method) - mean_a) / std_a
+            a_prime_numerical = (np.log10(a_numerical_method) - mean_a) / std_a
+
+            # Compute errors in real space
+            error_v_analytical = v_analytical_method - v_real_abs
+            error_v_numerical = v_numerical_method - v_real_abs
+            error_a_analytical = a_analytical_method - a_real_abs
+            error_a_numerical = a_numerical_method - a_real_abs
+
+            # Errors in normalized space
+            error_vprime_analytical = v_prime_analytical - v_prime
+            error_vprime_numerical = v_prime_numerical - v_prime
+            error_aprime_analytical = a_prime_analytical - a_prime
+            error_aprime_numerical = a_prime_numerical - a_prime
+
+            # Store all errors
+            errors_v_analytical.append(error_v_analytical/v_real_abs)
+            errors_v_numerical.append(error_v_numerical/v_real_abs)
+            errors_vprime_analytical.append(error_vprime_analytical/v_prime)
+            errors_vprime_numerical.append(error_vprime_numerical/v_prime)
+
+            errors_a_analytical.append(error_a_analytical/a_real_abs)
+            errors_a_numerical.append(error_a_numerical/a_real_abs)
+            errors_aprime_analytical.append(error_aprime_analytical/a_prime)
+            errors_aprime_numerical.append(error_aprime_numerical/a_prime)
+
+            # Store actual values for random sample display
+            v_real_samples.append(v_real_abs)
+            v_analytical_samples.append(v_analytical_method)
+            v_numerical_samples.append(v_numerical_method)
+            v_prime_real_samples.append(v_prime)
+            v_prime_analytical_samples.append(v_prime_analytical)
+            v_prime_numerical_samples.append(v_prime_numerical)
+
+            a_real_samples.append(a_real_abs)
+            a_analytical_samples.append(a_analytical_method)
+            a_numerical_samples.append(a_numerical_method)
+            a_prime_real_samples.append(a_prime)
+            a_prime_analytical_samples.append(a_prime_analytical)
+            a_prime_numerical_samples.append(a_prime_numerical)
+
+        # Convert lists to arrays
+        errors_v_analytical = np.array(errors_v_analytical)
+        errors_v_numerical = np.array(errors_v_numerical)
+        errors_vprime_analytical = np.array(errors_vprime_analytical)
+        errors_vprime_numerical = np.array(errors_vprime_numerical)
+
+        errors_a_analytical = np.array(errors_a_analytical)
+        errors_a_numerical = np.array(errors_a_numerical)
+        errors_aprime_analytical = np.array(errors_aprime_analytical)
+        errors_aprime_numerical = np.array(errors_aprime_numerical)
+
+        valid_deriv_samples = len(errors_v_analytical)
+
+        print(f"\nValid samples: {valid_deriv_samples}")
+        print(f"Invalid samples (NaN/Inf): {deriv_invalid_count}")
+
+        # VELOCITY VERIFICATION
+        print(f"\n{'-'*70}")
+        print(f"VELOCITY VERIFICATION (x -> v)")
+        print(f"{'-'*70}")
+
+        print(f"\nReal Space (v in units):")
+        print(f"  Analytical dx'/dt':")
+        print(f"    Mean error:   {np.mean(errors_v_analytical):.6e}    Median: {np.median(errors_v_analytical):.6e}")
+        print(f"    Max error:    {np.max(np.abs(errors_v_analytical)):.6e}    Std:    {np.std(errors_v_analytical):.6e}")
+
+        print(f"\n  Numerical dx'/dt':")
+        print(f"    Mean error:   {np.mean(errors_v_numerical):.6e}    Median: {np.median(errors_v_numerical):.6e}")
+        print(f"    Max error:    {np.max(np.abs(errors_v_numerical)):.6e}    Std:    {np.std(errors_v_numerical):.6e}")
+
+        print(f"\nNormalized Space (v'):")
+        print(f"  Analytical dx'/dt':")
+        print(f"    Mean error:   {np.mean(errors_vprime_analytical):.6e}    Median: {np.median(errors_vprime_analytical):.6e}")
+        print(f"    Max error:    {np.max(np.abs(errors_vprime_analytical)):.6e}    Std:    {np.std(errors_vprime_analytical):.6e}")
+
+        print(f"\n  Numerical dx'/dt':")
+        print(f"    Mean error:   {np.mean(errors_vprime_numerical):.6e}    Median: {np.median(errors_vprime_numerical):.6e}")
+        print(f"    Max error:    {np.max(np.abs(errors_vprime_numerical)):.6e}    Std:    {np.std(errors_vprime_numerical):.6e}")
+
+        # ACCELERATION VERIFICATION
+        print(f"\n{'-'*70}")
+        print(f"ACCELERATION VERIFICATION (v -> a)")
+        print(f"{'-'*70}")
+
+        print(f"\nReal Space (a in units):")
+        print(f"  Analytical dv'/dt':")
+        print(f"    Mean error:   {np.mean(errors_a_analytical):.6e}    Median: {np.median(errors_a_analytical):.6e}")
+        print(f"    Max error:    {np.max(np.abs(errors_a_analytical)):.6e}    Std:    {np.std(errors_a_analytical):.6e}")
+
+        print(f"\n  Numerical dv'/dt':")
+        print(f"    Mean error:   {np.mean(errors_a_numerical):.6e}    Median: {np.median(errors_a_numerical):.6e}")
+        print(f"    Max error:    {np.max(np.abs(errors_a_numerical)):.6e}    Std:    {np.std(errors_a_numerical):.6e}")
+
+        print(f"\nNormalized Space (a'):")
+        print(f"  Analytical dv'/dt':")
+        print(f"    Mean error:   {np.mean(errors_aprime_analytical):.6e}    Median: {np.median(errors_aprime_analytical):.6e}")
+        print(f"    Max error:    {np.max(np.abs(errors_aprime_analytical)):.6e}    Std:    {np.std(errors_aprime_analytical):.6e}")
+
+        print(f"\n  Numerical dv'/dt':")
+        print(f"    Mean error:   {np.mean(errors_aprime_numerical):.6e}    Median: {np.median(errors_aprime_numerical):.6e}")
+        print(f"    Max error:    {np.max(np.abs(errors_aprime_numerical)):.6e}    Std:    {np.std(errors_aprime_numerical):.6e}")
+
+        # Display random samples
+        if valid_deriv_samples >= 5:
+            random_indices = np.random.choice(valid_deriv_samples, size=5, replace=False)
+
+            print(f"\nRandom 5 V samples:")
+            print(f"Real Abs Space (v in units):")
+            for i, idx in enumerate(random_indices, 1):
+                print(f"{i}. [{v_real_samples[idx]:.6e}, {v_analytical_samples[idx]:.6e}, {v_numerical_samples[idx]:.6e}]")
+
+            print(f"\nNormalized Space (v'):")
+            for i, idx in enumerate(random_indices, 1):
+                print(f"{i}. [{v_prime_real_samples[idx]:.6e}, {v_prime_analytical_samples[idx]:.6e}, {v_prime_numerical_samples[idx]:.6e}]")
+
+            print(f"\nRandom 5 A samples:")
+            print(f"Real Abs Space (a in units):")
+            for i, idx in enumerate(random_indices, 1):
+                print(f"{i}. [{a_real_samples[idx]:.6e}, {a_analytical_samples[idx]:.6e}, {a_numerical_samples[idx]:.6e}]")
+
+            print(f"\nNormalized Space (a'):")
+            for i, idx in enumerate(random_indices, 1):
+                print(f"{i}. [{a_prime_real_samples[idx]:.6e}, {a_prime_analytical_samples[idx]:.6e}, {a_prime_numerical_samples[idx]:.6e}]")
+
+        print(f"\n{'='*70}")
+
+        # Store derivative verification results for return
+        deriv_results = {
+            'valid_samples': valid_deriv_samples,
+            'invalid_samples': deriv_invalid_count,
+            'velocity': {
+                'analytical': {
+                    'v_errors': errors_v_analytical,
+                    'vprime_errors': errors_vprime_analytical,
+                    'mean_v_error': float(np.mean(errors_v_analytical)),
+                    'mean_vprime_error': float(np.mean(errors_vprime_analytical))
+                },
+                'numerical': {
+                    'v_errors': errors_v_numerical,
+                    'vprime_errors': errors_vprime_numerical,
+                    'mean_v_error': float(np.mean(errors_v_numerical)),
+                    'mean_vprime_error': float(np.mean(errors_vprime_numerical))
+                }
+            },
+            'acceleration': {
+                'analytical': {
+                    'a_errors': errors_a_analytical,
+                    'aprime_errors': errors_aprime_analytical,
+                    'mean_a_error': float(np.mean(errors_a_analytical)),
+                    'mean_aprime_error': float(np.mean(errors_aprime_analytical))
+                },
+                'numerical': {
+                    'a_errors': errors_a_numerical,
+                    'aprime_errors': errors_aprime_numerical,
+                    'mean_a_error': float(np.mean(errors_a_numerical)),
+                    'mean_aprime_error': float(np.mean(errors_aprime_numerical))
+                }
+            }
+        }
+    else:
+        deriv_results = None
+
     # Optionally show sample high-error cases
     if verbose and high_error_count_per_sample > 0:
         print(f"\nShowing 5 sample high-error cases:")
@@ -708,7 +1008,7 @@ def check_dataset_consistency(dataset, inputs_normalizer, outputs_normalizer,
             print(f"    Input (a, b, t): [{a_values[idx]:.3f}, {b_values[idx]:.3f}, {t_values[idx]:.6f}]")
             for j, name in enumerate(feature_names):
                 if high_error_mask[idx, j]:
-                    print(f"    {name}: target={all_targets[idx, j]:.4f}, "
+                    print(f"    {name}: target={all_targets_normalized[idx, j]:.4f}, "
                           f"expected={normalized_analytical_array[idx, j]:.4f}, "
                           f"rel_err={rel_errors[idx, j]*100:.2f}%")
 
@@ -724,11 +1024,11 @@ def check_dataset_consistency(dataset, inputs_normalizer, outputs_normalizer,
         if plot_sample_rate > 1:
             sample_indices = np.arange(0, n_samples, plot_sample_rate)
             sampled_inputs = denorm_inputs[sample_indices]
-            sampled_targets = all_targets[sample_indices]
+            sampled_targets = all_targets_normalized[sample_indices]
             n_plot_samples = len(sample_indices)
         else:
             sampled_inputs = denorm_inputs
-            sampled_targets = all_targets
+            sampled_targets = all_targets_normalized
             n_plot_samples = n_samples
 
         print(f"\nGenerating input-output relationship plots...")
@@ -765,7 +1065,7 @@ def check_dataset_consistency(dataset, inputs_normalizer, outputs_normalizer,
         print(f"Saved 9 plots to {save_dir}")
 
     # Return statistics
-    return {
+    result = {
         'n_samples': n_samples,
         'invalid_count': invalid_count,
         'high_error_count': high_error_count_per_sample,
@@ -775,6 +1075,12 @@ def check_dataset_consistency(dataset, inputs_normalizer, outputs_normalizer,
         'mean_rel_errors': np.nanmean(rel_errors, axis=0),
         'high_error_counts_per_feature': high_error_mask.sum(axis=0)
     }
+
+    # Add derivative verification results if enabled
+    if verify_derivatives:
+        result['derivative_verification'] = deriv_results
+
+    return result
 
 
 def check_all_datasets(train_loader, val_loader, test_loader,
