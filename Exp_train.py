@@ -359,8 +359,8 @@ def main():
         dtype = torch.float32
         print("Training in float32 (single precision) mode")
 
-    model_save_path = 'expwithsign_model_elu_newsignmodel_realtest64_finetunene_residualok.pt'
-    results_figure_folder = './expwithsign_results_elu_newsignmodel_realtest64_finetunene_residualok'
+    model_save_path = 'expwithsign_model_elu_newsignmodel_realtest64_finetunene_consistency_test2.pt'
+    results_figure_folder = './expwithsign_results_elu_newsignmodel_realtest64_finetunene_consistency_test2'
 
     # Create the Exponential PINN model
     model = ExponentialPINN_ver3(hidden_dims=[16, 32, 64, 64, 32, 16],
@@ -387,7 +387,7 @@ def main():
     loss_config = {
         "MSE": {"weight": 0.9, "use_relative": False, "use_log": True, "sign_bce_weight": 1.0, "real_sign_bce_weight": 1.0, "ft_cal_weight": 1.0},
         "Residual": {"weight": 0.1, "use_relative": True},
-        "Consistency": {"weight": 0.0, "t_threshold": 1e-5, "type": "auto", "use_relative": True, "use_log": False}
+        "Consistency": {"weight": 0.0, "t_threshold": 1e-5, "use_log": True, "Input_grad_outside": True}  # Start with weight=0.0 to verify implementation
     }
 
     loss_fn = ExponentialPINNLoss(model, loss_config)
@@ -496,6 +496,7 @@ def main():
                 inputs_real = inputs.clone()
 
             # Forward pass - returns (mag_preds, logabs_sign_pred, real_sign_pred, ft_cal) tuple
+            inputs.requires_grad_(True)
             mag_preds, logabs_sign_pred, real_sign_pred, ft_cal = model(inputs)
 
             # Reconstruct outputs to match target format: [real_signs (0-2), logabs_values (3-5)]
@@ -526,8 +527,35 @@ def main():
                 # Pass outputs, targets, inputs_real, and normalizer to residual loss
                 loss_args["Residual"] = (outputs_for_residual, targets, inputs_real, train_val_targets_normalizer)
             if loss_fn.has_loss("Consistency"):
-                # Auto diff only
-                loss_args["Consistency"] = (inputs, inputs_real, inputs_normalizer)
+                # Determine ft_cal based on phase (same as Residual loss)
+                if epoch < finetune_activation_epoch:
+                    ft_cal_consistency = torch.zeros_like(ft_cal)  # Phase 1: no calibration
+                else:
+                    ft_cal_consistency = ft_cal  # Phase 2: with calibration
+
+                # Check if Input_grad_outside mode is enabled
+                consistency_config = loss_config.get("Consistency", {})
+                input_grad_outside = consistency_config.get("Input_grad_outside", False)
+
+                if input_grad_outside:
+                    # MODE 1: Pass mag_preds and valid_mask
+                    # Compute valid_mask for t_real > threshold
+                    t_threshold = consistency_config.get("t_threshold", 1e-6)
+                    t_normalized = inputs[:, 2]
+                    t_mean = train_val_inputs_normalizer.log_mean['t']
+                    t_std = train_val_inputs_normalizer.log_std['t']
+                    ln10 = torch.log(torch.tensor(10.0, device=device, dtype=torch.float32))
+                    t_real = torch.exp((t_std * t_normalized + t_mean) * ln10)
+                    valid_mask = t_real > t_threshold
+
+                    # New signature for MODE 1: (mag_preds, targets, inputs, inputs_normalizer, outputs_normalizer, ft_cal, valid_mask)
+                    loss_args["Consistency"] = (mag_preds, targets, inputs, train_val_inputs_normalizer,
+                                               train_val_targets_normalizer, ft_cal_consistency, valid_mask)
+                else:
+                    # MODE 2: Pass None for predictions, consistency loss will call model internally
+                    # New signature for MODE 2: (None, targets, inputs, inputs_normalizer, outputs_normalizer, ft_cal, None)
+                    loss_args["Consistency"] = (None, targets, inputs, train_val_inputs_normalizer,
+                                               train_val_targets_normalizer, ft_cal_consistency, None)
 
             # Compute loss
             loss, loss_dict = loss_fn(loss_args)
@@ -668,8 +696,37 @@ def main():
                     # Pass outputs, targets, inputs_real, and normalizer to residual loss
                     loss_args["Residual"] = (outputs_for_residual, targets, inputs_real, train_val_targets_normalizer)
                 if loss_fn.has_loss("Consistency"):
-                    # Auto diff only
-                    loss_args["Consistency"] = (inputs, inputs_real, inputs_normalizer)
+                    # Determine ft_cal based on phase (same as Residual loss)
+                    if epoch < finetune_activation_epoch:
+                        ft_cal_consistency = torch.zeros_like(ft_cal)  # Phase 1: no calibration
+                    else:
+                        ft_cal_consistency = ft_cal  # Phase 2: with calibration
+
+                    # Check if Input_grad_outside mode is enabled
+                    consistency_config = loss_config.get("Consistency", {})
+                    input_grad_outside = consistency_config.get("Input_grad_outside", False)
+
+                    if input_grad_outside:
+                        # MODE 1: Pass mag_preds and valid_mask
+                        # Note: In validation, inputs doesn't have requires_grad=True, so this mode won't compute gradients
+                        # For validation, it's better to use MODE 2 (compute internally)
+                        # But if user explicitly requests MODE 1, we respect it
+                        t_threshold = consistency_config.get("t_threshold", 1e-6)
+                        t_normalized = inputs[:, 2]
+                        t_mean = train_val_inputs_normalizer.log_mean['t']
+                        t_std = train_val_inputs_normalizer.log_std['t']
+                        ln10 = torch.log(torch.tensor(10.0, device=device, dtype=torch.float32))
+                        t_real = torch.exp((t_std * t_normalized + t_mean) * ln10)
+                        valid_mask = t_real > t_threshold
+
+                        # Signature: (mag_preds, targets, inputs, inputs_normalizer, outputs_normalizer, ft_cal, valid_mask)
+                        loss_args["Consistency"] = (mag_preds, targets, inputs, train_val_inputs_normalizer,
+                                                   train_val_targets_normalizer, ft_cal_consistency, valid_mask)
+                    else:
+                        # MODE 2: Pass None for predictions
+                        # Signature: (None, targets, inputs, inputs_normalizer, outputs_normalizer, ft_cal, None)
+                        loss_args["Consistency"] = (None, targets, inputs, train_val_inputs_normalizer,
+                                                   train_val_targets_normalizer, ft_cal_consistency, None)
 
                 # Compute loss
                 loss, loss_dict = loss_fn(loss_args)
@@ -866,8 +923,33 @@ def main():
                 # Pass outputs, targets, inputs_real, and normalizer to residual loss
                 loss_args["Residual"] = (outputs_for_residual, targets, inputs_real, test_targets_normalizer)
             if loss_fn.has_loss("Consistency"):
-                # Auto diff only
-                loss_args["Consistency"] = (inputs, inputs_real, test_inputs_normalizer)
+                # Test time: use full ft_cal (Phase 2) - fully trained model
+                ft_cal_consistency = ft_cal
+
+                # Check if Input_grad_outside mode is enabled
+                consistency_config = loss_config.get("Consistency", {})
+                input_grad_outside = consistency_config.get("Input_grad_outside", False)
+
+                if input_grad_outside:
+                    # MODE 1: Pass mag_preds and valid_mask
+                    # Note: In test, inputs doesn't have requires_grad=True, so this mode won't compute gradients
+                    # For test, it's better to use MODE 2 (compute internally)
+                    t_threshold = consistency_config.get("t_threshold", 1e-6)
+                    t_normalized = inputs[:, 2]
+                    t_mean = test_inputs_normalizer.log_mean['t']
+                    t_std = test_inputs_normalizer.log_std['t']
+                    ln10 = torch.log(torch.tensor(10.0, device=device, dtype=torch.float32))
+                    t_real = torch.exp((t_std * t_normalized + t_mean) * ln10)
+                    valid_mask = t_real > t_threshold
+
+                    # Signature: (mag_preds, targets, inputs, inputs_normalizer, outputs_normalizer, ft_cal, valid_mask)
+                    loss_args["Consistency"] = (mag_preds, targets, inputs, test_inputs_normalizer,
+                                               test_targets_normalizer, ft_cal_consistency, valid_mask)
+                else:
+                    # MODE 2: Pass None for predictions
+                    # Signature: (None, targets, inputs, inputs_normalizer, outputs_normalizer, ft_cal, None)
+                    loss_args["Consistency"] = (None, targets, inputs, test_inputs_normalizer,
+                                               test_targets_normalizer, ft_cal_consistency, None)
 
             # Compute loss
             loss, loss_dict = loss_fn(loss_args)
