@@ -317,7 +317,7 @@ def testdataloaderunchange():
 def main():
     device_index = 0
     train_in_64 = True
-    epochs = 1000
+    epochs = 500
 
     # Data paths
     Train_Val_data_source = r'.\new_exponential_trainval_data.npz'
@@ -359,8 +359,8 @@ def main():
         dtype = torch.float32
         print("Training in float32 (single precision) mode")
 
-    model_save_path = 'expwithsign_model_elu_newsignmodel_realtest64_finetunene_consistency_test2.pt'
-    results_figure_folder = './expwithsign_results_elu_newsignmodel_realtest64_finetunene_consistency_test2'
+    model_save_path = 'expwithsign_model_elu_newsignmodel_realtest64_finetunene_consistency_checkwithftcal_sep.pt'#consistency_testOutside_nolog.pt'
+    results_figure_folder = './expwithsign_results_elu_newsignmodel_realtest64_finetunene_consistency_checkwithftcal_sep.pt'
 
     # Create the Exponential PINN model
     model = ExponentialPINN_ver3(hidden_dims=[16, 32, 64, 64, 32, 16],
@@ -374,25 +374,46 @@ def main():
                           real_sign_network_hidden_dims=[64, 64, 32, 32],
                           real_sign_network_dropout=0.3).to(device)
 
-    # model = ExponentialPINN(hidden_dims=[16, 32, 32, 64, 32, 32, 16],
-    #                       activation='relu',
-    #                       use_log_output=False,
-    #                       use_finetune=True,
-    #                       finetune_hidden_dims=[16, 32, 64, 32, 16],
-    #                       finetune_scale=1,
-    #                       use_sign_network=False,
-    #                       sign_network_hidden_dims=[16, 32, 32, 16]).to(device)
+
+    
+    """
+    # check for the consistency of the ft_cal implementation
+    # first load the best model from previous training
+    
+    """
+    previous_model_path = r'H:\Postgraudate\Research\Test\SimpleMCKvibration\expwithsign_model_elu_newsignmodel_realtest64_finetunene_consistency_testOutside.pt'
+    model.load_state_dict(torch.load(previous_model_path))
+    print(f"Loaded previous model from: {previous_model_path} for ft_cal consistency check.")
+
 
     # Configure losses
     loss_config = {
-        "MSE": {"weight": 0.9, "use_relative": False, "use_log": True, "sign_bce_weight": 1.0, "real_sign_bce_weight": 1.0, "ft_cal_weight": 1.0},
+        "MSE": {"weight": 0.8, "use_relative": False, "use_log": True, "sign_bce_weight": 1.0, "real_sign_bce_weight": 1.0, "ft_cal_weight": 1.0},
         "Residual": {"weight": 0.1, "use_relative": True},
-        "Consistency": {"weight": 0.0, "t_threshold": 1e-5, "use_log": True, "Input_grad_outside": True}  # Start with weight=0.0 to verify implementation
+        "Consistency": {"weight": 0.1, "t_threshold": 1e-6, "use_log": False, "Input_grad_outside": True}  # Start with weight=0.0 to verify implementation
     }
 
     loss_fn = ExponentialPINNLoss(model, loss_config)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
-    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=np.max([epochs//10,1]), eta_min=1e-12)
+
+    # Create separate optimizers for each network component
+    mag_optimizer = torch.optim.Adam(model.network.parameters(), lr=0.005)
+    finetune_optimizer = torch.optim.Adam(model.finetune_network.parameters(), lr=0.005)
+    sign_optimizer = torch.optim.Adam(
+        list(model.logabs_sign_network.parameters()) +
+        list(model.real_sign_network.parameters()),
+        lr=0.005
+    )
+
+    # Create separate schedulers for each optimizer
+    mag_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        mag_optimizer, T_max=np.max([epochs//25,1]), eta_min=1e-12
+    )
+    finetune_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        finetune_optimizer, T_max=np.max([epochs//25,1]), eta_min=1e-12
+    )
+    sign_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        sign_optimizer, T_max=np.max([epochs//25,1]), eta_min=1e-12
+    )
 
     # Prepare inputs_normalizer for consistency loss
     inputs_normalizer = train_val_inputs_normalizer
@@ -430,44 +451,43 @@ def main():
             print("  Please check the denormalization and physics equation.")
 
         print("="*80 + "\n")
+    
+
+
 
     # Training loop
     # Input data shape: (batch_size, 3) -> [a, b, t]
     # Target data shape: (batch_size, 3) -> [x_t, v_t, a_t]
     best_combined_loss = float('inf')
-    finetune_activation_epoch = int(epochs * 0.6)  # Activate finetune network after 60% of epochs
+    finetune_activation_epoch = int(epochs * 0.2)  # Activate finetune network after 50% of epochs
+
+
 
     for epoch in range(epochs):
         # Two-phase training logic
         if epoch == 0:
-            # Phase 1 setup: Freeze finetune network, train magnitude + sign networks
+            # Phase 1 setup
             print(f"\n{'='*60}")
             print("PHASE 1: Training magnitude network + sign networks")
-            print("Finetune network: FROZEN")
+            print("Finetune network: Not optimized (gradients computed but optimizer not stepped)")
             print(f"{'='*60}")
-            model.freeze_finetune_network()
-            model.unfreeze_magnitude_network()
 
         elif epoch == finetune_activation_epoch:
-            # Phase 2 transition: Load best Phase 1 weights, freeze magnitude, unfreeze finetune
+            # Phase 2 transition: Load best Phase 1 weights
             print(f"\n{'='*60}")
-            print(f"PHASE 2 TRANSITION at epoch {epoch+1}/{epochs} (25% threshold)")
+            print(f"PHASE 2 TRANSITION at epoch {epoch+1}/{epochs} (60% threshold)")
             print(f"Loading best Phase 1 weights from: {model_save_path}")
             print(f"{'='*60}")
 
             # Load best Phase 1 model
             model.load_state_dict(torch.load(model_save_path))
 
-            # Switch network freeze states
-            model.freeze_magnitude_network()
-            model.unfreeze_finetune_network()
-
             # Reset best loss tracking for Phase 2
             best_combined_loss = float('inf')
 
             print(f"\n{'='*60}")
             print("PHASE 2: Training finetune network + sign networks")
-            print("Magnitude network: FROZEN")
+            print("Magnitude network: Not optimized (gradients computed but optimizer not stepped)")
             print("Sign networks: CONTINUE TRAINING")
             print(f"{'='*60}")
 
@@ -487,7 +507,10 @@ def main():
             # Keep full targets (batch, 6) - [real_signs (0-2), logabs_values (3-5)]
             # No extraction needed anymore
 
-            optimizer.zero_grad()
+            # Zero gradients for all optimizers (ALL networks compute gradients)
+            mag_optimizer.zero_grad()
+            finetune_optimizer.zero_grad()
+            sign_optimizer.zero_grad()
 
             # Denormalize inputs for loss calculation (if normalizer exists)
             if train_val_inputs_normalizer is not None:
@@ -496,13 +519,13 @@ def main():
                 inputs_real = inputs.clone()
 
             # Forward pass - returns (mag_preds, logabs_sign_pred, real_sign_pred, ft_cal) tuple
-            inputs.requires_grad_(True)
+            if loss_fn.has_loss("Consistency"):
+                consistency_config = loss_config.get("Consistency", {})
+                input_grad_outside = consistency_config.get("Input_grad_outside", False)
+                if input_grad_outside:
+                    inputs.requires_grad_(True)
+    
             mag_preds, logabs_sign_pred, real_sign_pred, ft_cal = model(inputs)
-
-            # Reconstruct outputs to match target format: [real_signs (0-2), logabs_values (3-5)]
-            # DETACH to prevent gradient blending between magnitude and sign
-            signed_logabs = (mag_preds * torch.sign(logabs_sign_pred)).detach()
-            outputs = torch.cat([real_sign_pred, signed_logabs], dim=1)
 
             # Prepare loss arguments
             loss_args = {}
@@ -548,7 +571,9 @@ def main():
                     t_real = torch.exp((t_std * t_normalized + t_mean) * ln10)
                     valid_mask = t_real > t_threshold
 
-                    # New signature for MODE 1: (mag_preds, targets, inputs, inputs_normalizer, outputs_normalizer, ft_cal, valid_mask)
+                    # Combine mag_preds + ft_cal_consistency outside (phase-aware)
+                    mag_ft_cal_pred = mag_preds + ft_cal_consistency
+
                     loss_args["Consistency"] = (mag_preds, targets, inputs, train_val_inputs_normalizer,
                                                train_val_targets_normalizer, ft_cal_consistency, valid_mask)
                 else:
@@ -556,11 +581,27 @@ def main():
                     # New signature for MODE 2: (None, targets, inputs, inputs_normalizer, outputs_normalizer, ft_cal, None)
                     loss_args["Consistency"] = (None, targets, inputs, train_val_inputs_normalizer,
                                                train_val_targets_normalizer, ft_cal_consistency, None)
-
+            
+            # Reconstruct outputs to match target format: [real_signs (0-2), logabs_values (3-5)]
+            # DETACH to prevent gradient blending between magnitude and sign
+            signed_logabs = (mag_preds * torch.sign(logabs_sign_pred)).detach()
+            outputs = torch.cat([real_sign_pred, signed_logabs], dim=1)
             # Compute loss
             loss, loss_dict = loss_fn(loss_args)
-            loss.backward()
-            optimizer.step()
+            loss.backward()  # Backward pass computes gradients for ALL networks
+
+            # Step only the optimizers for current phase (selective weight updates)
+            if epoch < finetune_activation_epoch:
+                # Phase 1: Update magnitude + sign networks only
+                mag_optimizer.step()
+                sign_optimizer.step()
+                # finetune_optimizer does NOT step → finetune_network weights unchanged
+            else:
+                # Phase 2: Update finetune + sign networks only
+                finetune_optimizer.step()
+                sign_optimizer.step()
+                # mag_optimizer does NOT step → magnitude network weights unchanged
+
             train_loss += loss.item() * inputs.size(0)
 
             # Accumulate loss components
@@ -623,11 +664,29 @@ def main():
 
             print(f"Last batch pred_residual v.s targets_residual: [{pred_res_val:.6e}] [{target_res_val:.6e}]")
 
+        # Save last batch data for consistency diagnostics (computed after validation)
+        if loss_fn.has_loss("Consistency"):
+            last_batch_inputs = inputs.clone().detach()
+            last_batch_targets = targets.clone().detach()
+
         train_loss /= len(train_loader.dataset)
 
         # Calculate average loss components
         for key in train_loss_components:
             train_loss_components[key] /= len(train_loader.dataset)
+
+        # Step schedulers (update learning rates for optimizers that stepped this epoch)
+        # Must be called AFTER optimizer.step() per PyTorch 1.1.0+ requirements
+        if epoch < finetune_activation_epoch:
+            # Phase 1: Only step schedulers for optimizers that stepped
+            mag_scheduler.step()
+            sign_scheduler.step()
+            # Don't step finetune_scheduler (finetune_optimizer didn't step)
+        else:
+            # Phase 2: Only step schedulers for optimizers that stepped
+            finetune_scheduler.step()
+            sign_scheduler.step()
+            # Don't step mag_scheduler (mag_optimizer didn't step)
 
         # Validation loop
         model.eval()
@@ -638,9 +697,10 @@ def main():
         val_calibration_closer = 0
         val_calibration_total = 0
 
-        # Determine if we need gradients for consistency loss (auto-diff type)
+        # Determine if we need gradients for consistency loss
+        # Consistency loss always uses auto-differentiation, so we need gradients
         use_no_grad_val = True
-        if loss_fn.has_loss("Consistency") and loss_config["Consistency"]["type"] == "auto":
+        if loss_fn.has_loss("Consistency"):
             use_no_grad_val = False
 
         # Conditionally use torch.no_grad() based on consistency type
@@ -667,6 +727,12 @@ def main():
                     inputs_real = inputs.clone()
 
                 # Forward pass - returns (mag_preds, logabs_sign_pred, real_sign_pred, ft_cal) tuple
+                if loss_fn.has_loss("Consistency"):
+                    consistency_config = loss_config.get("Consistency", {})
+                    input_grad_outside = consistency_config.get("Input_grad_outside", False)
+                    if input_grad_outside:
+                        inputs.requires_grad_(True)
+
                 mag_preds, logabs_sign_pred, real_sign_pred, ft_cal = model(inputs)
 
                 # Reconstruct outputs to match target format: [real_signs (0-2), logabs_values (3-5)]
@@ -718,7 +784,7 @@ def main():
                         ln10 = torch.log(torch.tensor(10.0, device=device, dtype=torch.float32))
                         t_real = torch.exp((t_std * t_normalized + t_mean) * ln10)
                         valid_mask = t_real > t_threshold
-
+                        
                         # Signature: (mag_preds, targets, inputs, inputs_normalizer, outputs_normalizer, ft_cal, valid_mask)
                         loss_args["Consistency"] = (mag_preds, targets, inputs, train_val_inputs_normalizer,
                                                    train_val_targets_normalizer, ft_cal_consistency, valid_mask)
@@ -761,7 +827,108 @@ def main():
         for key in val_loss_components:
             val_loss_components[key] /= len(val_loader.dataset)
 
-        lr_scheduler.step()
+        # Compute consistency loss diagnostics (after validation, works for both MODE 1 and MODE 2)
+        if loss_fn.has_loss("Consistency") and 'last_batch_inputs' in locals():
+            # Get consistency configuration
+            consistency_config = loss_config.get("Consistency", {})
+            t_threshold = consistency_config.get("t_threshold", 1e-6)
+
+            # Prepare fresh inputs with gradient tracking (completely independent of training)
+            diag_inputs = last_batch_inputs.clone().requires_grad_(True)
+            diag_targets = last_batch_targets
+
+            # DO A FRESH FORWARD PASS to get predictions connected to diag_inputs
+            # This creates a new computational graph separate from training
+            with torch.set_grad_enabled(True):
+                diag_mag_preds, _, _, diag_ft_cal = model(diag_inputs)
+
+            # Use phase-appropriate ft_cal (same logic as training)
+            if epoch < finetune_activation_epoch:
+                diag_ft_cal_phase = torch.zeros_like(diag_ft_cal)  # Phase 1
+            else:
+                diag_ft_cal_phase = diag_ft_cal  # Phase 2
+
+            # Get normalizer stats
+            t_mean = train_val_inputs_normalizer.log_mean['t']
+            t_std = train_val_inputs_normalizer.log_std['t']
+            mean_x = train_val_targets_normalizer.log_mean['x']
+            std_x = train_val_targets_normalizer.log_std['x']
+            mean_v = train_val_targets_normalizer.log_mean['v']
+            std_v = train_val_targets_normalizer.log_std['v']
+            mean_a = train_val_targets_normalizer.log_mean['a']
+            std_a = train_val_targets_normalizer.log_std['a']
+            ln10 = torch.log(torch.tensor(10.0, device=device, dtype=torch.float32))
+
+            # Compute valid mask
+            t_normalized = diag_inputs[:, 2]
+            t_real = torch.exp((t_std * t_normalized + t_mean) * ln10)
+            valid_mask = t_real > t_threshold
+
+            # Combine mag_preds + ft_cal (now both are from the fresh forward pass)
+            mag_ft_cal_pred = diag_mag_preds + diag_ft_cal_phase
+            mag_ft_cal_pred_valid = mag_ft_cal_pred[valid_mask]
+            targets_valid = diag_targets[valid_mask]
+            t_real_valid = t_real[valid_mask]
+
+            if len(mag_ft_cal_pred_valid) > 0:
+                mag_x = mag_ft_cal_pred_valid[:, 0]
+                mag_v = mag_ft_cal_pred_valid[:, 1]
+                mag_a = mag_ft_cal_pred_valid[:, 2]
+
+                # Compute gradients (fresh graph, doesn't affect training)
+                dx_prime_dt_prime = torch.autograd.grad(
+                    outputs=mag_x,
+                    inputs=diag_inputs,
+                    grad_outputs=torch.ones_like(mag_x),
+                    create_graph=False,
+                    retain_graph=True,
+                    allow_unused=True
+                )[0]
+                if dx_prime_dt_prime is not None:
+                    dx_prime_dt_prime = dx_prime_dt_prime[valid_mask, 2]
+
+                    dv_prime_dt_prime = torch.autograd.grad(
+                        outputs=mag_v,
+                        inputs=diag_inputs,
+                        grad_outputs=torch.ones_like(mag_v),
+                        create_graph=False,
+                        retain_graph=False,  # Last grad call, can free graph
+                        allow_unused=True
+                    )[0]
+                    if dv_prime_dt_prime is not None:
+                        dv_prime_dt_prime = dv_prime_dt_prime[valid_mask, 2]
+
+                        # Compute theory values
+                        logabs_targets = targets_valid[:, 3:]
+                        logabs_sign = torch.sign(logabs_targets)
+
+                        x_pred = logabs_sign[:, 0] * mag_x
+                        v_pred = logabs_sign[:, 1] * mag_v
+
+                        x_real = torch.exp((std_x * x_pred.detach() + mean_x) * ln10)
+                        v_real = torch.exp((std_v * v_pred.detach() + mean_v) * ln10)
+
+                        eps = 1e-12
+                        common_factor_v = (std_x / t_std) * (x_real / (t_real_valid + eps))
+                        v_theory = torch.abs(common_factor_v * dx_prime_dt_prime.detach())
+
+                        common_factor_a = (std_v / t_std) * (v_real / (t_real_valid + eps))
+                        a_theory = torch.abs(common_factor_a * dv_prime_dt_prime.detach())
+
+                        v_theory_normalized = (torch.log10(v_theory + eps) - mean_v) / std_v
+                        a_theory_normalized = (torch.log10(a_theory + eps) - mean_a) / std_a
+
+                        # Print diagnostics
+                        v_theory_log = v_theory_normalized.detach().cpu().numpy()
+                        a_theory_log = a_theory_normalized.detach().cpu().numpy()
+                        v_model_log = mag_v.detach().cpu().numpy()
+                        a_model_log = mag_a.detach().cpu().numpy()
+                        v_target_log = targets_valid[:, 4].detach().cpu().numpy()
+                        a_target_log = targets_valid[:, 5].detach().cpu().numpy()
+
+                        if len(v_model_log) > 0:
+                            print(f"Last batch logabs v_theory v_model v_target: [{abs(v_theory_log[-1]):.8f} {abs(v_model_log[-1]):.8f} {abs(v_target_log[-1]):.8f}]")
+                            print(f"Last batch logabs a_theory a_model a_target: [{abs(a_theory_log[-1]):.8f} {abs(a_model_log[-1]):.8f} {abs(a_target_log[-1]):.8f}]")
 
         # Calculate calibration rate
         if model.use_finetune and val_calibration_total > 0:
@@ -785,75 +952,99 @@ def main():
         else:
             print(f"Epoch [{epoch+1}/{epochs}] -Model name: {os.path.basename(model_save_path)}  Train Loss: {train_loss:.4e}, Val Loss: {val_loss:.4e}")
 
-        # Build train loss breakdown string with MSE components grouped
+        # Build train loss breakdown string with grouped loss types
         train_total = train_loss_components.get('total', train_loss)
-        train_parts = []
+        train_groups = []
 
-        # Handle MSE loss and its components specially
+        # Group 1: MSE Loss and its components
         if 'mse_loss' in train_loss_components:
             mse_value = train_loss_components['mse_loss']
             mse_ratio = (mse_value / train_total * 100) if train_total > 0 else 0
-            mse_str = f"mse_loss: {mse_value:.4e} ({mse_ratio:.2f}%)"
+            mse_str = f"MSE_loss: {mse_value:.4e} ({mse_ratio:.2f}%)"
 
-            # Check if we have magnitude and sign components
+            # Add MSE sub-components in brackets
             mse_components = []
             if 'magnitude_loss' in train_loss_components:
                 mag_value = train_loss_components['magnitude_loss']
                 mag_ratio = (mag_value / mse_value * 100) if mse_value > 0 else 0
                 mse_components.append(f"magnitude_loss: {mag_value:.4e} ({mag_ratio:.2f}%)")
-            if 'sign_bce_loss' in train_loss_components:
-                sign_value = train_loss_components['sign_bce_loss']
-                sign_ratio = (sign_value / mse_value * 100) if mse_value > 0 else 0
-                mse_components.append(f"sign_bce_loss: {sign_value:.4e} ({sign_ratio:.2f}%)")
+            if 'ft_cal_loss' in train_loss_components:
+                ft_value = train_loss_components['ft_cal_loss']
+                ft_ratio = (ft_value / mse_value * 100) if mse_value > 0 else 0
+                mse_components.append(f"ft_cal_loss: {ft_value:.4e} ({ft_ratio:.2f}%)")
+            if 'logabs_sign_bce_loss' in train_loss_components:
+                logabs_sign_value = train_loss_components['logabs_sign_bce_loss']
+                logabs_sign_ratio = (logabs_sign_value / mse_value * 100) if mse_value > 0 else 0
+                mse_components.append(f"logabs_sign_bce_loss: {logabs_sign_value:.4e} ({logabs_sign_ratio:.2f}%)")
+            if 'real_sign_bce_loss' in train_loss_components:
+                real_sign_value = train_loss_components['real_sign_bce_loss']
+                real_sign_ratio = (real_sign_value / mse_value * 100) if mse_value > 0 else 0
+                mse_components.append(f"real_sign_bce_loss: {real_sign_value:.4e} ({real_sign_ratio:.2f}%)")
 
-            # Add MSE with components in brackets if they exist
             if mse_components:
                 mse_str += f" [{' | '.join(mse_components)}]"
-            train_parts.append(mse_str)
+            train_groups.append(f"{{{mse_str}}}")
 
-        # Add other losses (excluding mse_loss, magnitude_loss, sign_bce_loss, total)
-        for key in sorted(train_loss_components.keys()):
-            if key not in ['total', 'mse_loss', 'magnitude_loss', 'sign_bce_loss']:
-                value = train_loss_components[key]
-                ratio = (value / train_total * 100) if train_total > 0 else 0
-                train_parts.append(f"{key}: {value:.4e} ({ratio:.2f}%)")
+        # Group 2: Residual Loss
+        if 'residual_loss' in train_loss_components:
+            residual_value = train_loss_components['residual_loss']
+            residual_ratio = (residual_value / train_total * 100) if train_total > 0 else 0
+            train_groups.append(f"{{Residual_loss: {residual_value:.4e} ({residual_ratio:.2f}%)}}")
 
-        # Build val loss breakdown string with MSE components grouped
+        # Group 3: Consistency Loss
+        if 'consistency_loss' in train_loss_components:
+            consistency_value = train_loss_components['consistency_loss']
+            consistency_ratio = (consistency_value / train_total * 100) if train_total > 0 else 0
+            train_groups.append(f"{{Consistency_loss: {consistency_value:.4e} ({consistency_ratio:.2f}%)}}")
+
+        # Build val loss breakdown string with grouped loss types
         val_total = val_loss_components.get('total', val_loss)
-        val_parts = []
+        val_groups = []
 
-        # Handle MSE loss and its components specially
+        # Group 1: MSE Loss and its components
         if 'mse_loss' in val_loss_components:
             mse_value = val_loss_components['mse_loss']
             mse_ratio = (mse_value / val_total * 100) if val_total > 0 else 0
-            mse_str = f"mse_loss: {mse_value:.4e} ({mse_ratio:.2f}%)"
+            mse_str = f"MSE_loss: {mse_value:.4e} ({mse_ratio:.2f}%)"
 
-            # Check if we have magnitude and sign components
+            # Add MSE sub-components in brackets
             mse_components = []
             if 'magnitude_loss' in val_loss_components:
                 mag_value = val_loss_components['magnitude_loss']
                 mag_ratio = (mag_value / mse_value * 100) if mse_value > 0 else 0
                 mse_components.append(f"magnitude_loss: {mag_value:.4e} ({mag_ratio:.2f}%)")
-            if 'sign_bce_loss' in val_loss_components:
-                sign_value = val_loss_components['sign_bce_loss']
-                sign_ratio = (sign_value / mse_value * 100) if mse_value > 0 else 0
-                mse_components.append(f"sign_bce_loss: {sign_value:.4e} ({sign_ratio:.2f}%)")
+            if 'ft_cal_loss' in val_loss_components:
+                ft_value = val_loss_components['ft_cal_loss']
+                ft_ratio = (ft_value / mse_value * 100) if mse_value > 0 else 0
+                mse_components.append(f"ft_cal_loss: {ft_value:.4e} ({ft_ratio:.2f}%)")
+            if 'logabs_sign_bce_loss' in val_loss_components:
+                logabs_sign_value = val_loss_components['logabs_sign_bce_loss']
+                logabs_sign_ratio = (logabs_sign_value / mse_value * 100) if mse_value > 0 else 0
+                mse_components.append(f"logabs_sign_bce_loss: {logabs_sign_value:.4e} ({logabs_sign_ratio:.2f}%)")
+            if 'real_sign_bce_loss' in val_loss_components:
+                real_sign_value = val_loss_components['real_sign_bce_loss']
+                real_sign_ratio = (real_sign_value / mse_value * 100) if mse_value > 0 else 0
+                mse_components.append(f"real_sign_bce_loss: {real_sign_value:.4e} ({real_sign_ratio:.2f}%)")
 
-            # Add MSE with components in brackets if they exist
             if mse_components:
                 mse_str += f" [{' | '.join(mse_components)}]"
-            val_parts.append(mse_str)
+            val_groups.append(f"{{{mse_str}}}")
 
-        # Add other losses (excluding mse_loss, magnitude_loss, sign_bce_loss, total)
-        for key in sorted(val_loss_components.keys()):
-            if key not in ['total', 'mse_loss', 'magnitude_loss', 'sign_bce_loss']:
-                value = val_loss_components[key]
-                ratio = (value / val_total * 100) if val_total > 0 else 0
-                val_parts.append(f"{key}: {value:.4e} ({ratio:.2f}%)")
+        # Group 2: Residual Loss
+        if 'residual_loss' in val_loss_components:
+            residual_value = val_loss_components['residual_loss']
+            residual_ratio = (residual_value / val_total * 100) if val_total > 0 else 0
+            val_groups.append(f"{{Residual_loss: {residual_value:.4e} ({residual_ratio:.2f}%)}}")
+
+        # Group 3: Consistency Loss
+        if 'consistency_loss' in val_loss_components:
+            consistency_value = val_loss_components['consistency_loss']
+            consistency_ratio = (consistency_value / val_total * 100) if val_total > 0 else 0
+            val_groups.append(f"{{Consistency_loss: {consistency_value:.4e} ({consistency_ratio:.2f}%)}}")
 
         # Print both on 2 lines with aligned spacing
-        train_breakdown = " | ".join(train_parts)
-        val_breakdown = " | ".join(val_parts)
+        train_breakdown = " ".join(train_groups)
+        val_breakdown = " ".join(val_groups)
         print(f"  Train Loss: {train_breakdown}")
         print(f"  Val Loss  : {val_breakdown}")
 
@@ -872,9 +1063,10 @@ def main():
     test_loss = 0.0
     test_loss_components = {}
 
-    # Determine if we need gradients for consistency loss (auto-diff type)
+    # Determine if we need gradients for consistency loss
+    # Consistency loss always uses auto-differentiation, so we need gradients
     use_no_grad_test = True
-    if loss_fn.has_loss("Consistency") and loss_config["Consistency"]["type"] == "auto":
+    if loss_fn.has_loss("Consistency"):
         use_no_grad_test = False
 
     # Conditionally use torch.no_grad() based on consistency type
@@ -898,6 +1090,12 @@ def main():
                 inputs_real = inputs.clone()
 
             # Forward pass - returns (mag_preds, logabs_sign_pred, real_sign_pred, ft_cal) tuple
+            if loss_fn.has_loss("Consistency"):
+                consistency_config = loss_config.get("Consistency", {})
+                input_grad_outside = consistency_config.get("Input_grad_outside", False)
+                if input_grad_outside:
+                    inputs.requires_grad_(True)
+
             mag_preds, logabs_sign_pred, real_sign_pred, ft_cal = model(inputs)
 
             # Reconstruct outputs to match target format: [real_signs (0-2), logabs_values (3-5)]
@@ -944,6 +1142,7 @@ def main():
 
                     # Signature: (mag_preds, targets, inputs, inputs_normalizer, outputs_normalizer, ft_cal, valid_mask)
                     loss_args["Consistency"] = (mag_preds, targets, inputs, test_inputs_normalizer,
+
                                                test_targets_normalizer, ft_cal_consistency, valid_mask)
                 else:
                     # MODE 2: Pass None for predictions
