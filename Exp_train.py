@@ -285,7 +285,7 @@ def calculate_calibration_improvement(outputs_before, outputs_after, targets):
 def testdataloaderunchange():
     device_index = 0
     train_in_64 = True
-    epochs = 40
+    epochs = 50
 
     # Data paths
     Train_Val_data_source = r'.\new_exponential_trainval_data.npz'
@@ -359,8 +359,8 @@ def main():
         dtype = torch.float32
         print("Training in float32 (single precision) mode")
 
-    model_save_path = 'expwithsign_model_elu_newsignmodel_realtest64_finetunene_consistency_checkwithftcal_sep.pt'#consistency_testOutside_nolog.pt'
-    results_figure_folder = './expwithsign_results_elu_newsignmodel_realtest64_finetunene_consistency_checkwithftcal_sep.pt'
+    model_save_path = 'expwithsign_model_elu_newsignmodel_realtest64_finetune_noconsistency.pt'#consistency_testOutside_nolog.pt'
+    results_figure_folder = './expwithsign_results_elu_newsignmodel_realtest64_finetune_noconsistency'
 
     # Create the Exponential PINN model
     model = ExponentialPINN_ver3(hidden_dims=[16, 32, 64, 64, 32, 16],
@@ -381,16 +381,16 @@ def main():
     # first load the best model from previous training
     
     """
-    previous_model_path = r'H:\Postgraudate\Research\Test\SimpleMCKvibration\expwithsign_model_elu_newsignmodel_realtest64_finetunene_consistency_testOutside.pt'
-    model.load_state_dict(torch.load(previous_model_path))
-    print(f"Loaded previous model from: {previous_model_path} for ft_cal consistency check.")
+    # previous_model_path = r'H:\Postgraudate\Research\Test\SimpleMCKvibration\expwithsign_model_elu_newsignmodel_realtest64_finetunene_consistency_testInside.pt'
+    # model.load_state_dict(torch.load(previous_model_path))
+    # print(f"Loaded previous model from: {previous_model_path} for ft_cal consistency check.")
 
 
     # Configure losses
     loss_config = {
         "MSE": {"weight": 0.8, "use_relative": False, "use_log": True, "sign_bce_weight": 1.0, "real_sign_bce_weight": 1.0, "ft_cal_weight": 1.0},
         "Residual": {"weight": 0.1, "use_relative": True},
-        "Consistency": {"weight": 0.1, "t_threshold": 1e-6, "use_log": False, "Input_grad_outside": True}  # Start with weight=0.0 to verify implementation
+        "Consistency": {"weight": 0, "t_threshold": 1e-6, "use_log": True, "Input_grad_outside": True}  # Start with weight=0.0 to verify implementation
     }
 
     loss_fn = ExponentialPINNLoss(model, loss_config)
@@ -459,7 +459,7 @@ def main():
     # Input data shape: (batch_size, 3) -> [a, b, t]
     # Target data shape: (batch_size, 3) -> [x_t, v_t, a_t]
     best_combined_loss = float('inf')
-    finetune_activation_epoch = int(epochs * 0.2)  # Activate finetune network after 50% of epochs
+    finetune_activation_epoch = int(epochs * 0.2)  # Activate finetune network after 40% of epochs
 
 
 
@@ -486,8 +486,11 @@ def main():
             best_combined_loss = float('inf')
 
             print(f"\n{'='*60}")
-            print("PHASE 2: Training finetune network + sign networks")
-            print("Magnitude network: Not optimized (gradients computed but optimizer not stepped)")
+            # print("PHASE 2: Training finetune network + sign networks")
+            # print("Magnitude network: Not optimized (gradients computed but optimizer not stepped)")
+            print("PHASE 2: Training ALL networks (magnitude + finetune + sign)")
+            print("Magnitude network: CONTINUE TRAINING (jointly with finetune)")
+            print("Finetune network: NOW TRAINING (started from zeros)")
             print("Sign networks: CONTINUE TRAINING")
             print(f"{'='*60}")
 
@@ -597,10 +600,10 @@ def main():
                 sign_optimizer.step()
                 # finetune_optimizer does NOT step → finetune_network weights unchanged
             else:
-                # Phase 2: Update finetune + sign networks only
+                # Phase 2: Update ALL networks (finetune + sign)
+                # mag_optimizer.step()  # Now ALSO update mag network in Phase 2!
                 finetune_optimizer.step()
                 sign_optimizer.step()
-                # mag_optimizer does NOT step → magnitude network weights unchanged
 
             train_loss += loss.item() * inputs.size(0)
 
@@ -665,7 +668,9 @@ def main():
             print(f"Last batch pred_residual v.s targets_residual: [{pred_res_val:.6e}] [{target_res_val:.6e}]")
 
         # Save last batch data for consistency diagnostics (computed after validation)
+        # Always save last batch for diagnostics (even if Consistency loss not enabled)
         if loss_fn.has_loss("Consistency"):
+        # if True:
             last_batch_inputs = inputs.clone().detach()
             last_batch_targets = targets.clone().detach()
 
@@ -683,10 +688,11 @@ def main():
             sign_scheduler.step()
             # Don't step finetune_scheduler (finetune_optimizer didn't step)
         else:
+            # Phase 2: Step ALL schedulers (all optimizers stepped)
+            # mag_scheduler.step()  # Now ALSO step mag scheduler in Phase 2!
             # Phase 2: Only step schedulers for optimizers that stepped
             finetune_scheduler.step()
             sign_scheduler.step()
-            # Don't step mag_scheduler (mag_optimizer didn't step)
 
         # Validation loop
         model.eval()
@@ -828,8 +834,11 @@ def main():
             val_loss_components[key] /= len(val_loader.dataset)
 
         # Compute consistency loss diagnostics (after validation, works for both MODE 1 and MODE 2)
+        # Always run consistency diagnostics (even if Consistency loss not enabled)
         if loss_fn.has_loss("Consistency") and 'last_batch_inputs' in locals():
-            # Get consistency configuration
+        #     # Get consistency configuration
+        # if True:
+            # Get consistency configuration (use defaults if not specified)
             consistency_config = loss_config.get("Consistency", {})
             t_threshold = consistency_config.get("t_threshold", 1e-6)
 
@@ -865,7 +874,7 @@ def main():
             valid_mask = t_real > t_threshold
 
             # Combine mag_preds + ft_cal (now both are from the fresh forward pass)
-            mag_ft_cal_pred = diag_mag_preds + diag_ft_cal_phase
+            mag_ft_cal_pred = torch.abs(diag_mag_preds) + diag_ft_cal_phase
             mag_ft_cal_pred_valid = mag_ft_cal_pred[valid_mask]
             targets_valid = diag_targets[valid_mask]
             t_real_valid = t_real[valid_mask]
@@ -898,7 +907,7 @@ def main():
                     if dv_prime_dt_prime is not None:
                         dv_prime_dt_prime = dv_prime_dt_prime[valid_mask, 2]
 
-                        # Compute theory values
+                        # Compute theory values from MODEL predictions
                         logabs_targets = targets_valid[:, 3:]
                         logabs_sign = torch.sign(logabs_targets)
 
@@ -909,26 +918,59 @@ def main():
                         v_real = torch.exp((std_v * v_pred.detach() + mean_v) * ln10)
 
                         eps = 1e-12
-                        common_factor_v = (std_x / t_std) * (x_real / (t_real_valid + eps))
-                        v_theory = torch.abs(common_factor_v * dx_prime_dt_prime.detach())
+                        common_factor_v_model = (std_x / t_std) * (x_real / (t_real_valid + eps))
+                        v_theory_model = torch.abs(common_factor_v_model * dx_prime_dt_prime.detach())
 
-                        common_factor_a = (std_v / t_std) * (v_real / (t_real_valid + eps))
-                        a_theory = torch.abs(common_factor_a * dv_prime_dt_prime.detach())
+                        common_factor_a_model = (std_v / t_std) * (v_real / (t_real_valid + eps))
+                        a_theory_model = torch.abs(common_factor_a_model * dv_prime_dt_prime.detach())
 
-                        v_theory_normalized = (torch.log10(v_theory + eps) - mean_v) / std_v
-                        a_theory_normalized = (torch.log10(a_theory + eps) - mean_a) / std_a
+                        v_theory_model_normalized = (torch.log10(v_theory_model + eps) - mean_v) / std_v
+                        a_theory_model_normalized = (torch.log10(a_theory_model + eps) - mean_a) / std_a
+
+                        # Compute theory values from GROUND TRUTH targets (analytical)
+                        # Extract target values in normalized log space
+                        x_target = targets_valid[:, 3]  # x' normalized
+                        v_target = targets_valid[:, 4]  # v' normalized
+
+                        # Denormalize targets to real space
+                        x_target_real = torch.exp((std_x * x_target + mean_x) * ln10)
+                        v_target_real = torch.exp((std_v * v_target + mean_v) * ln10)
+
+                        # Compute analytical derivatives dx'/dt' and dv'/dt' from ground truth
+                        # Using formula from check_dataset_consistency: dx'/dt' = (std_t / std_x) * a * t_real
+                        # where a is the exponential rate parameter
+                        inputs_valid = diag_inputs[valid_mask]
+                        # Denormalize inputs to get real 'a', 'b', 't' values (like in check_dataset_consistency)
+                        inputs_valid_np = inputs_valid.detach().cpu().numpy()
+                        denorm_inputs = train_val_inputs_normalizer.denormalize_inputs(inputs_valid_np)
+                        a_param_real = torch.tensor(denorm_inputs[:, 0], device=device, dtype=torch.float32)
+
+                        dx_dt_target_analytical = (t_std / std_x) * a_param_real * t_real_valid
+                        dv_dt_target_analytical = (t_std / std_v) * a_param_real * t_real_valid
+
+                        # Compute theory from target's derivatives
+                        common_factor_v_target = (std_x / t_std) * (x_target_real / (t_real_valid + eps))
+                        v_theory_target = torch.abs(common_factor_v_target * dx_dt_target_analytical)
+
+                        common_factor_a_target = (std_v / t_std) * (v_target_real / (t_real_valid + eps))
+                        a_theory_target = torch.abs(common_factor_a_target * dv_dt_target_analytical)
+
+                        v_theory_target_normalized = (torch.log10(v_theory_target + eps) - mean_v) / std_v
+                        a_theory_target_normalized = (torch.log10(a_theory_target + eps) - mean_a) / std_a
 
                         # Print diagnostics
-                        v_theory_log = v_theory_normalized.detach().cpu().numpy()
-                        a_theory_log = a_theory_normalized.detach().cpu().numpy()
+                        v_theory_model_log = v_theory_model_normalized.detach().cpu().numpy()
+                        a_theory_model_log = a_theory_model_normalized.detach().cpu().numpy()
+                        v_theory_target_log = v_theory_target_normalized.detach().cpu().numpy()
+                        a_theory_target_log = a_theory_target_normalized.detach().cpu().numpy()
                         v_model_log = mag_v.detach().cpu().numpy()
                         a_model_log = mag_a.detach().cpu().numpy()
                         v_target_log = targets_valid[:, 4].detach().cpu().numpy()
                         a_target_log = targets_valid[:, 5].detach().cpu().numpy()
 
                         if len(v_model_log) > 0:
-                            print(f"Last batch logabs v_theory v_model v_target: [{abs(v_theory_log[-1]):.8f} {abs(v_model_log[-1]):.8f} {abs(v_target_log[-1]):.8f}]")
-                            print(f"Last batch logabs a_theory a_model a_target: [{abs(a_theory_log[-1]):.8f} {abs(a_model_log[-1]):.8f} {abs(a_target_log[-1]):.8f}]")
+                            print(f"Last batch logabs v_model v_theory_model v_target v_theory_target: [{abs(v_model_log[-1]):.8f} {abs(v_theory_model_log[-1]):.8f} {abs(v_target_log[-1]):.8f} {abs(v_theory_target_log[-1]):.8f}]")
+                            print(f"Last batch logabs a_model a_theory_model a_target a_theory_target: [{abs(a_model_log[-1]):.8f} {abs(a_theory_model_log[-1]):.8f} {abs(a_target_log[-1]):.8f} {abs(a_theory_target_log[-1]):.8f}]")
 
         # Calculate calibration rate
         if model.use_finetune and val_calibration_total > 0:
