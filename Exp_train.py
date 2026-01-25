@@ -317,7 +317,7 @@ def testdataloaderunchange():
 def main():
     device_index = 0
     train_in_64 = True
-    epochs = 500
+    epochs = 200
 
     # Data paths
     Train_Val_data_source = r'.\new_exponential_trainval_data.npz'
@@ -359,8 +359,8 @@ def main():
         dtype = torch.float32
         print("Training in float32 (single precision) mode")
 
-    model_save_path = 'expwithsign_model_elu_newsignmodel_realtest64_finetune_noconsistency.pt'#consistency_testOutside_nolog.pt'
-    results_figure_folder = './expwithsign_results_elu_newsignmodel_realtest64_finetune_noconsistency'
+    model_save_path = 'expwithsign_model_elu_newsignmodel_realtest64_finetune_testnewconsistencyloss_no.pt'#consistency_testOutside_nolog.pt'
+    results_figure_folder = './expwithsign_results_elu_newsignmodel_realtest64_finetune_testnewconsistencyloss_no'
 
     # Create the Exponential PINN model
     model = ExponentialPINN_ver3(hidden_dims=[16, 32, 64, 64, 32, 16],
@@ -406,13 +406,13 @@ def main():
 
     # Create separate schedulers for each optimizer
     mag_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        mag_optimizer, T_max=np.max([epochs//25,1]), eta_min=1e-12
+        mag_optimizer, T_max=np.max([epochs//20,1]), eta_min=1e-12
     )
     finetune_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        finetune_optimizer, T_max=np.max([epochs//25,1]), eta_min=1e-12
+        finetune_optimizer, T_max=np.max([epochs//20,1]), eta_min=1e-12
     )
     sign_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        sign_optimizer, T_max=np.max([epochs//25,1]), eta_min=1e-12
+        sign_optimizer, T_max=np.max([epochs//20,1]), eta_min=1e-12
     )
 
     # Prepare inputs_normalizer for consistency loss
@@ -459,7 +459,7 @@ def main():
     # Input data shape: (batch_size, 3) -> [a, b, t]
     # Target data shape: (batch_size, 3) -> [x_t, v_t, a_t]
     best_combined_loss = float('inf')
-    finetune_activation_epoch = int(epochs * 0.2)  # Activate finetune network after 40% of epochs
+    finetune_activation_epoch = int(epochs * 0.2)  # Activate finetune network after 20% of epochs
 
 
 
@@ -669,8 +669,8 @@ def main():
 
         # Save last batch data for consistency diagnostics (computed after validation)
         # Always save last batch for diagnostics (even if Consistency loss not enabled)
-        if loss_fn.has_loss("Consistency"):
-        # if True:
+        # if loss_fn.has_loss("Consistency"):
+        if True:
             last_batch_inputs = inputs.clone().detach()
             last_batch_targets = targets.clone().detach()
 
@@ -835,9 +835,9 @@ def main():
 
         # Compute consistency loss diagnostics (after validation, works for both MODE 1 and MODE 2)
         # Always run consistency diagnostics (even if Consistency loss not enabled)
-        if loss_fn.has_loss("Consistency") and 'last_batch_inputs' in locals():
+        # if loss_fn.has_loss("Consistency") and 'last_batch_inputs' in locals():
         #     # Get consistency configuration
-        # if True:
+        if True:
             # Get consistency configuration (use defaults if not specified)
             consistency_config = loss_config.get("Consistency", {})
             t_threshold = consistency_config.get("t_threshold", 1e-6)
@@ -1221,6 +1221,6 @@ def main():
     )
 
 if __name__ == "__main__":
-    main()
+    # main()
     # testcudaavailable()
-    # testdataloaderunchange()
+    testdataloaderunchange()

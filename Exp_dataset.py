@@ -572,14 +572,14 @@ def load_exponential_data(filepath='exponential_trainval_data.npz', batch_size=3
         num_workers=0
     )
 
-    # results = check_all_datasets(
-    #     train_loader, val_loader, test_loader,
-    #     inputs_normalizer, outputs_normalizer,
-    #     error_threshold=0.10,  # 10% threshold
-    #     verbose=False,  # Set True to see 5 sample errors per dataset
-    #     plot_io_relation=True,
-    #     plot_sample_rate=10
-    # )
+    results = check_all_datasets(
+        train_loader, val_loader, test_loader,
+        inputs_normalizer, outputs_normalizer,
+        error_threshold=0.10,  # 10% threshold
+        verbose=False,  # Set True to see 5 sample errors per dataset
+        plot_io_relation=True,
+        plot_sample_rate=10
+    )
 
     return train_loader, val_loader, test_loader, inputs_normalizer, outputs_normalizer
 

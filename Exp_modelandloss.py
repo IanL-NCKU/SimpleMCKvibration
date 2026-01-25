@@ -1077,7 +1077,7 @@ class ExponentialResidualLoss(BaseLossComponent):
         # return torch.mean(torch.abs(residual))
         return torch.mean(torch.log(torch.square(residual) + 1))
 
-'''
+
 class ConsistencyLoss_auto_diff_magver(BaseLossComponent):
     """
     Derivative consistency using VERIFIED formulas for log-normalized space training.
@@ -1378,7 +1378,7 @@ class ConsistencyLoss_auto_diff_magver(BaseLossComponent):
         total_loss = v_consistency_loss + a_consistency_loss
 
         return total_loss
-
+'''
 
 
 class ConsistencyLoss_auto_diff_derivagrad_ver0(BaseLossComponent):
@@ -2737,9 +2737,9 @@ class ConsistencyLoss_auto_diff(BaseLossComponent):
                 # dx_prime_dt_prime = torch.abs(dx_mag_dt)
                 # dv_prime_dt_prime = torch.abs(dv_mag_dt)
 
-        # ======================
-        # DERIVATIVE-BASED APPROACH: Compute ground truth derivatives from targets
-        # ======================
+        # ==============================================
+        # STEP 1: Compute TARGET derivatives (ground truth from dataset)
+        # ==============================================
         # Extract targets
         x_target = targets_valid[:, 3]  # x' target (SIGNED normalized log-space)
         v_target = targets_valid[:, 4]  # v' target (SIGNED normalized log-space)
@@ -2759,33 +2759,71 @@ class ConsistencyLoss_auto_diff(BaseLossComponent):
         dx_dt_target = torch.abs(v_target_real / (common_factor_v_target + eps))
         dv_dt_target = torch.abs(a_target_real / (common_factor_a_target + eps))
 
-        # Use the phase-aware combined derivatives (already computed above)
+        # ==============================================
+        # STEP 2: Compute PREDICTION-based derivatives (from model's v' and a' outputs)
+        # ==============================================
+        # Extract signs from targets (targets contain SIGNED values)
+        # targets[:, 3:6] are already SIGNED normalized log-space values
+        logabs_targets = targets_valid[:, 3:]  # [x', v', a'] in normalized log-space (signed)
+        logabs_sign = torch.sign(logabs_targets)  # Extract signs from logabs targets
+
+        # Extract predicted v' and a' from model predictions and apply signs
+        if self.input_grad_outside:
+            # MODE 1: Use mag_preds_valid (unsigned magnitudes)
+            v_prime_predict = mag_preds_valid[:, 1] * logabs_sign[:, 1]  # Apply sign to v'
+            a_prime_predict = mag_preds_valid[:, 2] * logabs_sign[:, 2]  # Apply sign to a'
+        else:
+            # MODE 2: Use mag_preds_internal (unsigned magnitudes)
+            v_prime_predict = mag_preds_internal[:, 1] * logabs_sign[:, 1]  # Apply sign to v'
+            a_prime_predict = mag_preds_internal[:, 2] * logabs_sign[:, 2]  # Apply sign to a'
+
+        # Denormalize predicted v' and a' to real space
+        v_predict_real = torch.exp((std_v * v_prime_predict + mean_v) * ln10)
+        a_predict_real = torch.exp((std_a * a_prime_predict + mean_a) * ln10)
+
+        # Compute prediction-based derivatives using theory formula
+        # Theory: v_theory = |common_factor_v * dx'/dt'| → |dx'/dt'| = v / common_factor_v
+        dx_dt_predict = torch.abs(v_predict_real / (common_factor_v_target + eps))
+        dv_dt_predict = torch.abs(a_predict_real / (common_factor_a_target + eps))
+
+        # ==============================================
+        # STEP 3: Use AUTOGRAD-based derivatives (from spatial gradients ∂x'/∂t')
+        # ==============================================
         # Phase 1: dx_prime_dt_prime = torch.abs(dx_mag_dt)
         # Phase 2: dx_prime_dt_prime = torch.abs(dx_mag_dt) + dx_ft_dt
-        model_dx_dt = dx_prime_dt_prime  # Use the phase-aware combined derivatives
+        model_dx_dt = dx_prime_dt_prime  # Use the phase-aware combined derivatives (from autograd)
         model_dv_dt = dv_prime_dt_prime
 
         # ======================
         # DERIVATIVE-BASED CONSISTENCY LOSS
         # ======================
         # STEP 9: Compute loss (log-space MSE or regular MSE based on use_log)
-        # COMPARING DERIVATIVES instead of values
+        # DUAL CONSISTENCY: Compare BOTH autograd derivatives AND prediction-based derivatives
         if self.use_log:
-            # Log-space MSE - comparing model derivatives vs target derivatives
-            # log_model_dx_dt = torch.log(torch.abs(model_dx_dt) + eps)
-            # log_dx_dt_target = torch.log(torch.abs(dx_dt_target) + eps)
-            # v_consistency_loss = torch.mean((log_model_dx_dt - log_dx_dt_target) ** 2)
-            v_consistency_loss = torch.mean(torch.log(torch.abs((model_dx_dt - dx_dt_target)/ (dx_dt_target + eps)) + 1))
+            # Autograd-based derivative loss (from ∂x'/∂t')
+            v_consistency_loss_autograd = torch.mean(torch.log(torch.abs((model_dx_dt - dx_dt_target) / (dx_dt_target + eps)) + 1))
+            a_consistency_loss_autograd = torch.mean(torch.log(torch.abs((model_dv_dt - dv_dt_target) / (dv_dt_target + eps)) + 1))
 
+            # Prediction-based derivative loss (from predicted v' and a')
+            v_consistency_loss_predict = torch.mean(torch.log(torch.abs((dx_dt_predict - dx_dt_target) / (dx_dt_target + eps)) + 1))
+            a_consistency_loss_predict = torch.mean(torch.log(torch.abs((dv_dt_predict - dv_dt_target) / (dv_dt_target + eps)) + 1))
 
-            # log_model_dv_dt = torch.log(torch.abs(model_dv_dt) + eps)
-            # log_dv_dt_target = torch.log(torch.abs(dv_dt_target) + eps)
-            # a_consistency_loss = torch.mean((log_model_dv_dt - log_dv_dt_target) ** 2)
-            a_consistency_loss = torch.mean(torch.log(torch.abs((model_dv_dt - dv_dt_target)/ (dv_dt_target + eps)) + 1))
+            # Combine both losses
+            v_consistency_loss = v_consistency_loss_autograd + v_consistency_loss_predict
+            a_consistency_loss = a_consistency_loss_autograd + a_consistency_loss_predict
         else:
             # Relative error MSE - comparing derivatives
-            v_consistency_loss = torch.mean(((torch.abs(model_dx_dt) - torch.abs(dx_dt_target))/torch.abs(model_dx_dt)) ** 2)
-            a_consistency_loss = torch.mean(((torch.abs(model_dv_dt) - torch.abs(dv_dt_target))/torch.abs(model_dv_dt)) ** 2)
+            # Autograd-based derivative loss
+            v_consistency_loss_autograd = torch.mean(((torch.abs(model_dx_dt) - torch.abs(dx_dt_target)) / torch.abs(model_dx_dt)) ** 2)
+            a_consistency_loss_autograd = torch.mean(((torch.abs(model_dv_dt) - torch.abs(dv_dt_target)) / torch.abs(model_dv_dt)) ** 2)
+
+            # Prediction-based derivative loss
+            v_consistency_loss_predict = torch.mean(((torch.abs(dx_dt_predict) - torch.abs(dx_dt_target)) / torch.abs(dx_dt_predict)) ** 2)
+            a_consistency_loss_predict = torch.mean(((torch.abs(dv_dt_predict) - torch.abs(dv_dt_target)) / torch.abs(dv_dt_predict)) ** 2)
+
+            # Combine both losses
+            v_consistency_loss = v_consistency_loss_autograd + v_consistency_loss_predict
+            a_consistency_loss = a_consistency_loss_autograd + a_consistency_loss_predict
 
         # STEP 10: Total consistency loss
         total_loss = v_consistency_loss + a_consistency_loss
