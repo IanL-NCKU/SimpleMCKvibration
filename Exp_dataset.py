@@ -449,14 +449,15 @@ class Exponential_OutputNormalizer:
 class ExponentialDataset(Dataset):
     """PyTorch Dataset for exponential data"""
 
-    def __init__(self, inputs, outputs):
+    def __init__(self, inputs, outputs, dtype=torch.float32):
         """
         Args:
             inputs: numpy array of shape (N, 3) - [a, b, t]
-            outputs: numpy array of shape (N, 3) - [x_t, v_t, a_t]
+            outputs: numpy array of shape (N, 3) or (N, 6) - [x_t, v_t, a_t] or with signs
+            dtype: torch dtype for the tensors (default: torch.float32)
         """
-        self.inputs = torch.FloatTensor(inputs)
-        self.outputs = torch.FloatTensor(outputs)
+        self.inputs = torch.tensor(inputs, dtype=dtype)
+        self.outputs = torch.tensor(outputs, dtype=dtype)
 
     def __len__(self):
         return len(self.inputs)
@@ -465,7 +466,7 @@ class ExponentialDataset(Dataset):
         return self.inputs[idx], self.outputs[idx]
 
 
-def load_exponential_data(filepath='exponential_trainval_data.npz', batch_size=32, shuffle_train=True, normalize=True):
+def load_exponential_data(filepath='exponential_trainval_data.npz', batch_size=32, shuffle_train=True, normalize=True, dtype=torch.float32, inputs_normalizer=None, outputs_normalizer=None):
     """Loads and prepares exponential data from an .npz file.
 
     This function splits the data into training, validation, and test sets,
@@ -479,16 +480,23 @@ def load_exponential_data(filepath='exponential_trainval_data.npz', batch_size=3
         batch_size (int): Batch size for the DataLoaders.
         shuffle_train (bool): Whether to shuffle the training data.
         normalize (bool): If True, normalizes both input and output features.
+        dtype (torch.dtype): Torch dtype for the tensors (default: torch.float32).
+        inputs_normalizer (Exponential_DataNormalizer or None): Pre-fitted input normalizer.
+            If provided, this normalizer will be used instead of creating a new one.
+            Useful for applying train/val normalization to test data.
+        outputs_normalizer (Exponential_OutputNormalizer or None): Pre-fitted output normalizer.
+            If provided, this normalizer will be used instead of creating a new one.
+            Useful for applying train/val normalization to test data.
 
     Returns:
         tuple: A tuple containing:
             - train_loader (DataLoader): DataLoader for the training set.
             - val_loader (DataLoader): DataLoader for the validation set.
             - test_loader (DataLoader): DataLoader for the test set.
-            - inputs_normalizer (Exponential_DataNormalizer or None): The fitted
-              input normalizer instance if normalize=True, otherwise None.
-            - outputs_normalizer (Exponential_OutputNormalizer or None): The fitted
-              output normalizer instance if normalize=True, otherwise None.
+            - inputs_normalizer (Exponential_DataNormalizer or None): The input normalizer
+              (either provided as parameter or newly fitted). Returns None if normalize=False.
+            - outputs_normalizer (Exponential_OutputNormalizer or None): The output normalizer
+              (either provided as parameter or newly fitted). Returns None if normalize=False.
     """
     # Load data
     data = np.load(filepath)
@@ -512,31 +520,31 @@ def load_exponential_data(filepath='exponential_trainval_data.npz', batch_size=3
         X_temp, y_temp, test_size=0.2, random_state=32)
 
     # Normalize inputs and outputs if requested
-    inputs_normalizer = None
-    outputs_normalizer = None
-
     if normalize:
-        # Create data dictionaries for training set
-        train_input_dict = {
-            'a': X_train[:, 0],
-            'b': X_train[:, 1],
-            't': X_train[:, 2]
-        }
+        # Check if normalizers were provided as parameters
+        if inputs_normalizer is None or outputs_normalizer is None:
+            # Create and fit new normalizers on training data only
+            train_input_dict = {
+                'a': X_train[:, 0],
+                'b': X_train[:, 1],
+                't': X_train[:, 2]
+            }
 
-        train_output_dict = {
-            'x': y_train[:, 0],
-            'v': y_train[:, 1],
-            'a': y_train[:, 2]
-        }
+            train_output_dict = {
+                'x': y_train[:, 0],
+                'v': y_train[:, 1],
+                'a': y_train[:, 2]
+            }
 
-        # Fit normalizers on training data only
-        inputs_normalizer = Exponential_DataNormalizer()
-        inputs_normalizer.fit(train_input_dict)
+            if inputs_normalizer is None:
+                inputs_normalizer = Exponential_DataNormalizer()
+                inputs_normalizer.fit(train_input_dict)
 
-        outputs_normalizer = Exponential_OutputNormalizer(use_log_normalization=True)
-        outputs_normalizer.fit(train_output_dict)
+            if outputs_normalizer is None:
+                outputs_normalizer = Exponential_OutputNormalizer(use_log_normalization=True)
+                outputs_normalizer.fit(train_output_dict)
 
-        # Normalize all splits
+        # Use provided or newly fitted normalizers to normalize all splits
         X_train = inputs_normalizer.normalize_inputs(X_train)
         X_val = inputs_normalizer.normalize_inputs(X_val)
         X_test = inputs_normalizer.normalize_inputs(X_test)
@@ -544,11 +552,15 @@ def load_exponential_data(filepath='exponential_trainval_data.npz', batch_size=3
         y_train = outputs_normalizer.normalize_outputs(y_train)
         y_val = outputs_normalizer.normalize_outputs(y_val)
         y_test = outputs_normalizer.normalize_outputs(y_test)
+    else:
+        # If normalize=False, set normalizers to None
+        inputs_normalizer = None
+        outputs_normalizer = None
 
     # Create PyTorch Datasets
-    train_dataset = ExponentialDataset(X_train, y_train)
-    val_dataset = ExponentialDataset(X_val, y_val)
-    test_dataset = ExponentialDataset(X_test, y_test)
+    train_dataset = ExponentialDataset(X_train, y_train, dtype=dtype)
+    val_dataset = ExponentialDataset(X_val, y_val, dtype=dtype)
+    test_dataset = ExponentialDataset(X_test, y_test, dtype=dtype)
 
     # Create DataLoaders
     train_loader = DataLoader(

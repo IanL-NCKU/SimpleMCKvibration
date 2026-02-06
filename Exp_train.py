@@ -7,6 +7,68 @@ import matplotlib.pyplot as plt
 import os
 import numpy as np
 
+
+def save_checkpoint(model_path, model, inputs_normalizer, outputs_normalizer):
+    """
+    Save model weights and normalizers together.
+
+    Args:
+        model_path (str): Path where model.pt will be saved (e.g., "model_epoch_100.pt")
+        model: PyTorch model
+        inputs_normalizer: Fitted input normalizer
+        outputs_normalizer: Fitted output normalizer
+
+    Creates two files:
+        - model_epoch_100.pt (model weights)
+        - model_epoch_100_normalizers.pt (normalizer states)
+    """
+    # Create parent directory if it doesn't exist
+    model_dir = os.path.dirname(model_path)
+    if model_dir and not os.path.exists(model_dir):
+        os.makedirs(model_dir)
+        print(f"Created directory: {model_dir}")
+
+    # Save model weights
+    torch.save(model.state_dict(), model_path)
+
+    # Save normalizers
+    normalizer_path = model_path.replace('.pt', '_normalizers.pt')
+    torch.save({
+        'inputs_normalizer': inputs_normalizer,
+        'outputs_normalizer': outputs_normalizer
+    }, normalizer_path)
+
+    print(f"Saved model to: {model_path}")
+    print(f"Saved normalizers to: {normalizer_path}")
+
+
+def load_checkpoint(model_path, model):
+    """
+    Load model weights and normalizers together.
+
+    Args:
+        model_path (str): Path to model.pt file
+        model: PyTorch model (must match architecture)
+
+    Returns:
+        tuple: (model, inputs_normalizer, outputs_normalizer)
+    """
+    # Load model weights
+    model.load_state_dict(torch.load(model_path))
+
+    # Load normalizers
+    normalizer_path = model_path.replace('.pt', '_normalizers.pt')
+    normalizers = torch.load(normalizer_path)
+
+    inputs_normalizer = normalizers['inputs_normalizer']
+    outputs_normalizer = normalizers['outputs_normalizer']
+
+    print(f"Loaded model from: {model_path}")
+    print(f"Loaded normalizers from: {normalizer_path}")
+
+    return model, inputs_normalizer, outputs_normalizer
+
+
 def checktargetres(dataloader, inputs_normalizer, targets_normalizer, device, dtype, use_relative=False):
     """
     Check target residuals to validate ExponentialResidualLoss implementation.
@@ -159,7 +221,7 @@ def log_training_results(log_dict, results_folder='./results', filename='trainin
     return log_path
 
 
-def prediction_performance(data_path, model_pt_path, model, normalizer, device, dtype=torch.float32, data_sampling_step=1, figure_folder='./figures'):
+def prediction_performance(data_path, model_pt_path, model, inputs_normalizer, outputs_normalizer, device, dtype=torch.float32, data_sampling_step=1, figure_folder='./figures'):
     """Generate prediction performance scatter plots."""
     print(f"\n{'='*60}")
     print("Generating Prediction Performance Plots")
@@ -177,7 +239,9 @@ def prediction_performance(data_path, model_pt_path, model, normalizer, device, 
         filepath=data_path,
         batch_size=256,
         normalize=True,
-        shuffle_train=False
+        shuffle_train=False,
+        inputs_normalizer=inputs_normalizer,
+        outputs_normalizer=outputs_normalizer
     )
     print(f"Loaded test data from: {data_path}")
 
@@ -287,12 +351,21 @@ def testdataloaderunchange():
     train_in_64 = True
     epochs = 50
 
+    # Setup float64 training if requested (MUST be done BEFORE loading data)
+    if train_in_64:
+        torch.set_default_dtype(torch.float64)
+        dtype = torch.float64
+        print("Training in float64 (double precision) mode")
+    else:
+        dtype = torch.float32
+        print("Training in float32 (single precision) mode")
+
     # Data paths
     Train_Val_data_source = r'.\new_exponential_trainval_data.npz'
     Test_data_source = r'.\new_exponential_test_data.npz'
     Plot_data_source = r'.\new_exponential_test_data.npz'
     data_normalize = True
-    
+
     # Check raw data residuals (before normalization)
     check_raw_data_residuals(Train_Val_data_source, use_relative=True)
     # check_raw_data_residuals(Test_data_source, use_relative=True)
@@ -302,22 +375,155 @@ def testdataloaderunchange():
         filepath=Train_Val_data_source,
         batch_size=1024,
         normalize=data_normalize,
-        shuffle_train=False
+        shuffle_train=False,
+        dtype=dtype
     )
 
     test_loader, _, _, test_inputs_normalizer, test_targets_normalizer = load_exponential_data(
         filepath=Test_data_source,
         batch_size=1024,
         normalize=data_normalize,
-        shuffle_train=False
+        shuffle_train=False,
+        dtype=dtype,
+        inputs_normalizer=train_val_inputs_normalizer,
+        outputs_normalizer=train_val_targets_normalizer
     )
-    
-    
+
+    # =========================================================================
+    # STATISTICS CHECK: Verify Train/Val/Test data are in the same range
+    # =========================================================================
+    print("\n" + "="*80)
+    print("DATA STATISTICS CHECK: Verifying Train/Val/Test Consistency")
+    print("="*80)
+
+    def compute_statistics(dataloader, dataset_name):
+        """Compute min, max, mean, std for inputs and targets."""
+        all_inputs = []
+        all_targets = []
+
+        for inputs, targets in dataloader:
+            all_inputs.append(inputs.numpy())
+            all_targets.append(targets.numpy())
+
+        all_inputs = np.concatenate(all_inputs, axis=0)
+        all_targets = np.concatenate(all_targets, axis=0)
+
+        stats = {
+            'name': dataset_name,
+            'n_samples': len(all_inputs),
+            'inputs': {
+                'min': np.min(all_inputs, axis=0),
+                'max': np.max(all_inputs, axis=0),
+                'mean': np.mean(all_inputs, axis=0),
+                'std': np.std(all_inputs, axis=0)
+            },
+            'targets': {
+                'min': np.min(all_targets, axis=0),
+                'max': np.max(all_targets, axis=0),
+                'mean': np.mean(all_targets, axis=0),
+                'std': np.std(all_targets, axis=0)
+            }
+        }
+        return stats
+
+    # Compute statistics for each dataset
+    print("\nComputing statistics for Train/Val/Test datasets...")
+    train_stats = compute_statistics(train_loader, "Train")
+    val_stats = compute_statistics(val_loader, "Val")
+    test_stats = compute_statistics(test_loader, "Test")
+
+    # Print sample counts
+    print("\n" + "-"*80)
+    print("SAMPLE COUNTS:")
+    print("-"*80)
+    print(f"  Train samples: {train_stats['n_samples']}")
+    print(f"  Val samples:   {val_stats['n_samples']}")
+    print(f"  Test samples:  {test_stats['n_samples']}")
+    print(f"  Total samples: {train_stats['n_samples'] + val_stats['n_samples'] + test_stats['n_samples']}")
+
+    # Print INPUT statistics
+    n_input_features = len(train_stats['inputs']['min'])
+    input_names = ['a', 'b', 't'] if n_input_features == 3 else [f'input_{i}' for i in range(n_input_features)]
+    print("\n" + "-"*80)
+    print("INPUT STATISTICS (Normalized):")
+    print("-"*80)
+
+    for idx, name in enumerate(input_names):
+        print(f"\n  [{name}]")
+        print(f"    {'Dataset':<10} {'Min':>12} {'Max':>12} {'Mean':>12} {'Std':>12}")
+        print(f"    {'-'*10} {'-'*12} {'-'*12} {'-'*12} {'-'*12}")
+        print(f"    {'Train':<10} {train_stats['inputs']['min'][idx]:12.6e} {train_stats['inputs']['max'][idx]:12.6e} {train_stats['inputs']['mean'][idx]:12.6e} {train_stats['inputs']['std'][idx]:12.6e}")
+        print(f"    {'Val':<10} {val_stats['inputs']['min'][idx]:12.6e} {val_stats['inputs']['max'][idx]:12.6e} {val_stats['inputs']['mean'][idx]:12.6e} {val_stats['inputs']['std'][idx]:12.6e}")
+        print(f"    {'Test':<10} {test_stats['inputs']['min'][idx]:12.6e} {test_stats['inputs']['max'][idx]:12.6e} {test_stats['inputs']['mean'][idx]:12.6e} {test_stats['inputs']['std'][idx]:12.6e}")
+
+        # Check if ranges are consistent (within 10% tolerance)
+        all_mins = [train_stats['inputs']['min'][idx], val_stats['inputs']['min'][idx], test_stats['inputs']['min'][idx]]
+        all_maxs = [train_stats['inputs']['max'][idx], val_stats['inputs']['max'][idx], test_stats['inputs']['max'][idx]]
+        all_means = [train_stats['inputs']['mean'][idx], val_stats['inputs']['mean'][idx], test_stats['inputs']['mean'][idx]]
+
+        min_range = max(all_mins) - min(all_mins)
+        max_range = max(all_maxs) - min(all_maxs)
+        mean_range = max(all_means) - min(all_means)
+
+        if min_range > 0.1 or max_range > 0.1 or mean_range > 0.1:
+            print(f"    ⚠ WARNING: Significant difference detected in [{name}]!")
+
+    # Print TARGET statistics
+    n_target_features = len(train_stats['targets']['min'])
+    target_names = ['sign_x', 'sign_v', 'sign_a', 'logabs_x', 'logabs_v', 'logabs_a'] if n_target_features == 6 else [f'target_{i}' for i in range(n_target_features)]
+    print("\n" + "-"*80)
+    print("TARGET STATISTICS (Normalized):")
+    print("-"*80)
+
+    for idx, name in enumerate(target_names):
+        print(f"\n  [{name}]")
+        print(f"    {'Dataset':<10} {'Min':>12} {'Max':>12} {'Mean':>12} {'Std':>12}")
+        print(f"    {'-'*10} {'-'*12} {'-'*12} {'-'*12} {'-'*12}")
+        print(f"    {'Train':<10} {train_stats['targets']['min'][idx]:12.6e} {train_stats['targets']['max'][idx]:12.6e} {train_stats['targets']['mean'][idx]:12.6e} {train_stats['targets']['std'][idx]:12.6e}")
+        print(f"    {'Val':<10} {val_stats['targets']['min'][idx]:12.6e} {val_stats['targets']['max'][idx]:12.6e} {val_stats['targets']['mean'][idx]:12.6e} {val_stats['targets']['std'][idx]:12.6e}")
+        print(f"    {'Test':<10} {test_stats['targets']['min'][idx]:12.6e} {test_stats['targets']['max'][idx]:12.6e} {test_stats['targets']['mean'][idx]:12.6e} {test_stats['targets']['std'][idx]:12.6e}")
+
+        # Check if ranges are consistent (within 10% tolerance for continuous values, exact for signs)
+        all_mins = [train_stats['targets']['min'][idx], val_stats['targets']['min'][idx], test_stats['targets']['min'][idx]]
+        all_maxs = [train_stats['targets']['max'][idx], val_stats['targets']['max'][idx], test_stats['targets']['max'][idx]]
+        all_means = [train_stats['targets']['mean'][idx], val_stats['targets']['mean'][idx], test_stats['targets']['mean'][idx]]
+
+        min_range = max(all_mins) - min(all_mins)
+        max_range = max(all_maxs) - min(all_maxs)
+        mean_range = max(all_means) - min(all_means)
+
+        # For sign columns (0-2), expect exact match (-1 or 1)
+        # For logabs columns (3-5), expect normalized range
+        if 'sign' in name:
+            if min_range > 0.01 or max_range > 0.01:
+                print(f"    ⚠ WARNING: Sign values differ across datasets!")
+        else:
+            if min_range > 0.2 or max_range > 0.2 or mean_range > 0.2:
+                print(f"    ⚠ WARNING: Significant difference detected in [{name}]!")
+
+    # Summary
+    print("\n" + "="*80)
+    print("SUMMARY:")
+    print("="*80)
+    print("✓ Statistics computed for Train/Val/Test datasets")
+    print("✓ Check for warnings above to ensure data consistency")
+    print("="*80 + "\n")
+
+
 
 def main():
     device_index = 0
     train_in_64 = True
-    epochs = 200
+    epochs = 50
+
+    # Setup float64 training if requested (MUST be done BEFORE loading data)
+    if train_in_64:
+        torch.set_default_dtype(torch.float64)
+        dtype = torch.float64
+        print("Training in float64 (double precision) mode")
+    else:
+        dtype = torch.float32
+        print("Training in float32 (single precision) mode")
 
     # Data paths
     Train_Val_data_source = r'.\new_exponential_trainval_data.npz'
@@ -334,14 +540,18 @@ def main():
         filepath=Train_Val_data_source,
         batch_size=1024,
         normalize=data_normalize,
-        shuffle_train=True
+        shuffle_train=True,
+        dtype=dtype
     )
 
     test_loader, _, _, test_inputs_normalizer, test_targets_normalizer = load_exponential_data(
         filepath=Test_data_source,
         batch_size=1024,
         normalize=data_normalize,
-        shuffle_train=False
+        shuffle_train=False,
+        dtype=dtype,
+        inputs_normalizer=train_val_inputs_normalizer,
+        outputs_normalizer=train_val_targets_normalizer
     )
 
     print(f"Data loaders created:")
@@ -350,18 +560,17 @@ def main():
     device = torch.device(f'cuda:{device_index}' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # Setup float64 training if requested
-    if train_in_64:
-        torch.set_default_dtype(torch.float64)
-        dtype = torch.float64
-        print("Training in float64 (double precision) mode")
-    else:
-        dtype = torch.float32
-        print("Training in float32 (single precision) mode")
+    model_file_name = 'exp_test0.pt'#consistency_testOutside_nolog.pt'
+    model_and_result_folder = './exp_test0'
 
-    model_save_path = 'expwithsign_model_elu_newsignmodel_realtest64_finetune_testnewconsistencyloss_no.pt'#consistency_testOutside_nolog.pt'
-    results_figure_folder = './expwithsign_results_elu_newsignmodel_realtest64_finetune_testnewconsistencyloss_no'
+    # Create the results folder if it doesn't exist
+    if not os.path.exists(model_and_result_folder):
+        os.makedirs(model_and_result_folder)
+        print(f"Created results folder: {model_and_result_folder}")
 
+    model_save_path = os.path.join(model_and_result_folder, model_file_name)
+    # model_save_path = 'exp_test0.pt'#consistency_testOutside_nolog.pt'
+    # results_figure_folder = './exp_test0'
     # Create the Exponential PINN model
     model = ExponentialPINN_ver3(hidden_dims=[16, 32, 64, 64, 32, 16],
                           activation='elu',
@@ -381,16 +590,16 @@ def main():
     # first load the best model from previous training
     
     """
-    # previous_model_path = r'H:\Postgraudate\Research\Test\SimpleMCKvibration\expwithsign_model_elu_newsignmodel_realtest64_finetunene_consistency_testInside.pt'
-    # model.load_state_dict(torch.load(previous_model_path))
-    # print(f"Loaded previous model from: {previous_model_path} for ft_cal consistency check.")
+    previous_model_path = r'H:\Postgraudate\Research\Test\SimpleMCKvibration\expwithsign_model_elu_newsignmodel_realtest64_finetunene_consistency_testInside.pt'
+    model.load_state_dict(torch.load(previous_model_path))
+    print(f"Loaded previous model from: {previous_model_path} for ft_cal consistency check.")
 
 
     # Configure losses
     loss_config = {
         "MSE": {"weight": 0.8, "use_relative": False, "use_log": True, "sign_bce_weight": 1.0, "real_sign_bce_weight": 1.0, "ft_cal_weight": 1.0},
         "Residual": {"weight": 0.1, "use_relative": True},
-        "Consistency": {"weight": 0, "t_threshold": 1e-6, "use_log": True, "Input_grad_outside": True}  # Start with weight=0.0 to verify implementation
+        "Consistency": {"weight": 0.1, "t_threshold": 1e-6, "use_log": True, "Input_grad_outside": True}  # Start with weight=0.0 to verify implementation
     }
 
     loss_fn = ExponentialPINNLoss(model, loss_config)
@@ -406,13 +615,13 @@ def main():
 
     # Create separate schedulers for each optimizer
     mag_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        mag_optimizer, T_max=np.max([epochs//20,1]), eta_min=1e-12
+        mag_optimizer, T_max=np.max([epochs//5,1]), eta_min=1e-12
     )
     finetune_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        finetune_optimizer, T_max=np.max([epochs//20,1]), eta_min=1e-12
+        finetune_optimizer, T_max=np.max([epochs//5,1]), eta_min=1e-12
     )
     sign_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        sign_optimizer, T_max=np.max([epochs//20,1]), eta_min=1e-12
+        sign_optimizer, T_max=np.max([epochs//5,1]), eta_min=1e-12
     )
 
     # Prepare inputs_normalizer for consistency loss
@@ -459,7 +668,7 @@ def main():
     # Input data shape: (batch_size, 3) -> [a, b, t]
     # Target data shape: (batch_size, 3) -> [x_t, v_t, a_t]
     best_combined_loss = float('inf')
-    finetune_activation_epoch = int(epochs * 0.2)  # Activate finetune network after 20% of epochs
+    finetune_activation_epoch = int(epochs * 0.4)  # Activate finetune network after 40% of epochs
 
 
 
@@ -570,7 +779,7 @@ def main():
                     t_normalized = inputs[:, 2]
                     t_mean = train_val_inputs_normalizer.log_mean['t']
                     t_std = train_val_inputs_normalizer.log_std['t']
-                    ln10 = torch.log(torch.tensor(10.0, device=device, dtype=torch.float32))
+                    ln10 = torch.log(torch.tensor(10.0, device=device, dtype=dtype))
                     t_real = torch.exp((t_std * t_normalized + t_mean) * ln10)
                     valid_mask = t_real > t_threshold
 
@@ -787,7 +996,7 @@ def main():
                         t_normalized = inputs[:, 2]
                         t_mean = train_val_inputs_normalizer.log_mean['t']
                         t_std = train_val_inputs_normalizer.log_std['t']
-                        ln10 = torch.log(torch.tensor(10.0, device=device, dtype=torch.float32))
+                        ln10 = torch.log(torch.tensor(10.0, device=device, dtype=dtype))
                         t_real = torch.exp((t_std * t_normalized + t_mean) * ln10)
                         valid_mask = t_real > t_threshold
                         
@@ -866,7 +1075,7 @@ def main():
             std_v = train_val_targets_normalizer.log_std['v']
             mean_a = train_val_targets_normalizer.log_mean['a']
             std_a = train_val_targets_normalizer.log_std['a']
-            ln10 = torch.log(torch.tensor(10.0, device=device, dtype=torch.float32))
+            ln10 = torch.log(torch.tensor(10.0, device=device, dtype=dtype))
 
             # Compute valid mask
             t_normalized = diag_inputs[:, 2]
@@ -943,7 +1152,7 @@ def main():
                         # Denormalize inputs to get real 'a', 'b', 't' values (like in check_dataset_consistency)
                         inputs_valid_np = inputs_valid.detach().cpu().numpy()
                         denorm_inputs = train_val_inputs_normalizer.denormalize_inputs(inputs_valid_np)
-                        a_param_real = torch.tensor(denorm_inputs[:, 0], device=device, dtype=torch.float32)
+                        a_param_real = torch.tensor(denorm_inputs[:, 0], device=device, dtype=dtype)
 
                         dx_dt_target_analytical = (t_std / std_x) * a_param_real * t_real_valid
                         dv_dt_target_analytical = (t_std / std_v) * a_param_real * t_real_valid
@@ -986,7 +1195,9 @@ def main():
             'train_loss': train_loss,
             'val_calibration_rate': val_calibration_rate
         }
-        log_training_results(log_dict, results_folder=results_figure_folder, filename='training_explog.txt')
+
+        # log_training_results(log_dict, results_folder=results_figure_folder, filename='training_explog.txt')
+        log_training_results(log_dict, results_folder=model_and_result_folder, filename='training_explog.txt')
 
         # Print epoch summary
         if val_calibration_rate is not None:
@@ -1094,13 +1305,16 @@ def main():
         combined_loss = train_loss + val_loss
         if combined_loss < best_combined_loss:
             best_combined_loss = combined_loss
-            torch.save(model.state_dict(), model_save_path)
+            save_checkpoint(model_save_path, model, train_val_inputs_normalizer, train_val_targets_normalizer)
             print(f"New best model saved with combined loss: {combined_loss:.4e} (train: {train_loss:.4e}, val: {val_loss:.4e})")
 
     # Testing loop
     print("\nRunning test evaluation on the best model...")
     # Load the best model for testing
-    model.load_state_dict(torch.load(model_save_path))
+    model, loaded_inputs_norm, loaded_outputs_norm = load_checkpoint(model_save_path, model)
+    # Update normalizer references
+    train_val_inputs_normalizer = loaded_inputs_norm
+    train_val_targets_normalizer = loaded_outputs_norm
     model.eval()
     test_loss = 0.0
     test_loss_components = {}
@@ -1178,7 +1392,7 @@ def main():
                     t_normalized = inputs[:, 2]
                     t_mean = test_inputs_normalizer.log_mean['t']
                     t_std = test_inputs_normalizer.log_std['t']
-                    ln10 = torch.log(torch.tensor(10.0, device=device, dtype=torch.float32))
+                    ln10 = torch.log(torch.tensor(10.0, device=device, dtype=dtype))
                     t_real = torch.exp((t_std * t_normalized + t_mean) * ln10)
                     valid_mask = t_real > t_threshold
 
@@ -1206,21 +1420,342 @@ def main():
             test_pbar.set_postfix({'loss': f'{loss.item():.4e}'})
 
     test_loss /= len(test_loader.dataset)
+
+    # Calculate average loss components
+    for key in test_loss_components:
+        test_loss_components[key] /= len(test_loader.dataset)
+
     print(f"\nTest Loss: {test_loss:.4e}")
+
+    # Build test loss breakdown string with grouped loss types
+    test_total = test_loss_components.get('total', test_loss)
+    test_groups = []
+
+    # Group 1: MSE Loss and its components
+    if 'mse_loss' in test_loss_components:
+        mse_value = test_loss_components['mse_loss']
+        mse_ratio = (mse_value / test_total * 100) if test_total > 0 else 0
+        mse_str = f"MSE_loss: {mse_value:.4e} ({mse_ratio:.2f}%)"
+
+        # Add MSE sub-components in brackets
+        mse_components = []
+        if 'magnitude_loss' in test_loss_components:
+            mag_value = test_loss_components['magnitude_loss']
+            mag_ratio = (mag_value / mse_value * 100) if mse_value > 0 else 0
+            mse_components.append(f"magnitude_loss: {mag_value:.4e} ({mag_ratio:.2f}%)")
+        if 'ft_cal_loss' in test_loss_components:
+            ft_value = test_loss_components['ft_cal_loss']
+            ft_ratio = (ft_value / mse_value * 100) if mse_value > 0 else 0
+            mse_components.append(f"ft_cal_loss: {ft_value:.4e} ({ft_ratio:.2f}%)")
+        if 'logabs_sign_bce_loss' in test_loss_components:
+            logabs_sign_value = test_loss_components['logabs_sign_bce_loss']
+            logabs_sign_ratio = (logabs_sign_value / mse_value * 100) if mse_value > 0 else 0
+            mse_components.append(f"logabs_sign_bce_loss: {logabs_sign_value:.4e} ({logabs_sign_ratio:.2f}%)")
+        if 'real_sign_bce_loss' in test_loss_components:
+            real_sign_value = test_loss_components['real_sign_bce_loss']
+            real_sign_ratio = (real_sign_value / mse_value * 100) if mse_value > 0 else 0
+            mse_components.append(f"real_sign_bce_loss: {real_sign_value:.4e} ({real_sign_ratio:.2f}%)")
+
+        if mse_components:
+            mse_str += f" [{' | '.join(mse_components)}]"
+        test_groups.append(f"{{{mse_str}}}")
+
+    # Group 2: Residual Loss
+    if 'residual_loss' in test_loss_components:
+        residual_value = test_loss_components['residual_loss']
+        residual_ratio = (residual_value / test_total * 100) if test_total > 0 else 0
+        test_groups.append(f"{{Residual_loss: {residual_value:.4e} ({residual_ratio:.2f}%)}}")
+
+    # Group 3: Consistency Loss
+    if 'consistency_loss' in test_loss_components:
+        consistency_value = test_loss_components['consistency_loss']
+        consistency_ratio = (consistency_value / test_total * 100) if test_total > 0 else 0
+        test_groups.append(f"{{Consistency_loss: {consistency_value:.4e} ({consistency_ratio:.2f}%)}}")
+
+    # Print test loss breakdown
+    test_breakdown = " ".join(test_groups)
+    print(f"  Test Loss : {test_breakdown}")
+
+    # =========================================================================
+    # VERIFICATION: Re-run Training and Validation with Frozen Parameters
+    # This proves the loaded model matches the saved best model
+    # =========================================================================
+    print("\n" + "="*80)
+    print("VERIFICATION: Training and Validation Loss (Just for Proof)")
+    print("Running forward pass with frozen parameters to verify loaded model...")
+    print("="*80)
+
+    model.eval()
+
+    # Verification on Training Set
+    verify_train_loss = 0.0
+    verify_train_loss_components = {}
+
+    # Determine if we need gradients for consistency loss
+    use_no_grad_verify = True
+    if loss_fn.has_loss("Consistency"):
+        use_no_grad_verify = False
+
+    if use_no_grad_verify:
+        context_manager_verify = torch.no_grad()
+    else:
+        context_manager_verify = torch.enable_grad()
+
+    with context_manager_verify:
+        verify_train_pbar = tqdm(train_loader, desc="Verifying Train", leave=True)
+        for inputs, targets in verify_train_pbar:
+            inputs = inputs.to(device, dtype=dtype)
+            targets = targets.to(device, dtype=dtype)
+
+            if train_val_inputs_normalizer is not None:
+                inputs_real = train_val_inputs_normalizer.denormalize_inputs(inputs).clone()
+            else:
+                inputs_real = inputs.clone()
+
+            if loss_fn.has_loss("Consistency"):
+                consistency_config = loss_config.get("Consistency", {})
+                input_grad_outside = consistency_config.get("Input_grad_outside", False)
+                if input_grad_outside:
+                    inputs.requires_grad_(True)
+
+            mag_preds, logabs_sign_pred, real_sign_pred, ft_cal = model(inputs)
+
+            # Prepare loss arguments (use Phase 2 ft_cal - fully trained model)
+            loss_args = {}
+            if loss_fn.has_loss("MSE"):
+                logabs_sign_probs = model.logabs_last_sign_probs
+                real_sign_probs = model.real_last_sign_probs
+                loss_args["MSE"] = (mag_preds, targets, logabs_sign_probs, None, None, real_sign_probs, ft_cal, train_val_targets_normalizer)
+            if loss_fn.has_loss("Residual"):
+                ft_cal_phase = ft_cal  # Phase 2: with calibration
+                logabs_values_residual = SignWithHardTanh.apply(logabs_sign_pred) * (mag_preds + ft_cal_phase)
+                outputs_for_residual = torch.cat([real_sign_pred, logabs_values_residual], dim=1)
+                loss_args["Residual"] = (outputs_for_residual, targets, inputs_real, train_val_targets_normalizer)
+            if loss_fn.has_loss("Consistency"):
+                ft_cal_consistency = ft_cal  # Phase 2: with calibration
+                consistency_config = loss_config.get("Consistency", {})
+                input_grad_outside = consistency_config.get("Input_grad_outside", False)
+
+                if input_grad_outside:
+                    t_threshold = consistency_config.get("t_threshold", 1e-6)
+                    t_normalized = inputs[:, 2]
+                    t_mean = train_val_inputs_normalizer.log_mean['t']
+                    t_std = train_val_inputs_normalizer.log_std['t']
+                    ln10 = torch.log(torch.tensor(10.0, device=device, dtype=dtype))
+                    t_real = torch.exp((t_std * t_normalized + t_mean) * ln10)
+                    valid_mask = t_real > t_threshold
+                    loss_args["Consistency"] = (mag_preds, targets, inputs, train_val_inputs_normalizer,
+                                               train_val_targets_normalizer, ft_cal_consistency, valid_mask)
+                else:
+                    loss_args["Consistency"] = (None, targets, inputs, train_val_inputs_normalizer,
+                                               train_val_targets_normalizer, ft_cal_consistency, None)
+
+            loss, loss_dict = loss_fn(loss_args)
+            verify_train_loss += loss.item() * inputs.size(0)
+
+            for key, value in loss_dict.items():
+                if key not in verify_train_loss_components:
+                    verify_train_loss_components[key] = 0.0
+                verify_train_loss_components[key] += value * inputs.size(0)
+
+            verify_train_pbar.set_postfix({'loss': f'{loss.item():.4e}'})
+
+    verify_train_loss /= len(train_loader.dataset)
+
+    # Calculate average loss components
+    for key in verify_train_loss_components:
+        verify_train_loss_components[key] /= len(train_loader.dataset)
+
+    # Verification on Validation Set
+    verify_val_loss = 0.0
+    verify_val_loss_components = {}
+
+    with context_manager_verify:
+        verify_val_pbar = tqdm(val_loader, desc="Verifying Val", leave=True)
+        for inputs, targets in verify_val_pbar:
+            inputs = inputs.to(device, dtype=dtype)
+            targets = targets.to(device, dtype=dtype)
+
+            if train_val_inputs_normalizer is not None:
+                inputs_real = train_val_inputs_normalizer.denormalize_inputs(inputs).clone()
+            else:
+                inputs_real = inputs.clone()
+
+            if loss_fn.has_loss("Consistency"):
+                consistency_config = loss_config.get("Consistency", {})
+                input_grad_outside = consistency_config.get("Input_grad_outside", False)
+                if input_grad_outside:
+                    inputs.requires_grad_(True)
+
+            mag_preds, logabs_sign_pred, real_sign_pred, ft_cal = model(inputs)
+
+            # Prepare loss arguments (use Phase 2 ft_cal - fully trained model)
+            loss_args = {}
+            if loss_fn.has_loss("MSE"):
+                logabs_sign_probs = model.logabs_last_sign_probs
+                real_sign_probs = model.real_last_sign_probs
+                loss_args["MSE"] = (mag_preds, targets, logabs_sign_probs, None, None, real_sign_probs, ft_cal, train_val_targets_normalizer)
+            if loss_fn.has_loss("Residual"):
+                ft_cal_phase = ft_cal  # Phase 2: with calibration
+                logabs_values_residual = logabs_sign_pred * (mag_preds + ft_cal_phase)
+                outputs_for_residual = torch.cat([real_sign_pred, logabs_values_residual], dim=1)
+                loss_args["Residual"] = (outputs_for_residual, targets, inputs_real, train_val_targets_normalizer)
+            if loss_fn.has_loss("Consistency"):
+                ft_cal_consistency = ft_cal  # Phase 2: with calibration
+                consistency_config = loss_config.get("Consistency", {})
+                input_grad_outside = consistency_config.get("Input_grad_outside", False)
+
+                if input_grad_outside:
+                    t_threshold = consistency_config.get("t_threshold", 1e-6)
+                    t_normalized = inputs[:, 2]
+                    t_mean = train_val_inputs_normalizer.log_mean['t']
+                    t_std = train_val_inputs_normalizer.log_std['t']
+                    ln10 = torch.log(torch.tensor(10.0, device=device, dtype=dtype))
+                    t_real = torch.exp((t_std * t_normalized + t_mean) * ln10)
+                    valid_mask = t_real > t_threshold
+                    loss_args["Consistency"] = (mag_preds, targets, inputs, train_val_inputs_normalizer,
+                                               train_val_targets_normalizer, ft_cal_consistency, valid_mask)
+                else:
+                    loss_args["Consistency"] = (None, targets, inputs, train_val_inputs_normalizer,
+                                               train_val_targets_normalizer, ft_cal_consistency, None)
+
+            loss, loss_dict = loss_fn(loss_args)
+            verify_val_loss += loss.item() * inputs.size(0)
+
+            for key, value in loss_dict.items():
+                if key not in verify_val_loss_components:
+                    verify_val_loss_components[key] = 0.0
+                verify_val_loss_components[key] += value * inputs.size(0)
+
+            verify_val_pbar.set_postfix({'loss': f'{loss.item():.4e}'})
+
+    verify_val_loss /= len(val_loader.dataset)
+
+    # Calculate average loss components
+    for key in verify_val_loss_components:
+        verify_val_loss_components[key] /= len(val_loader.dataset)
+
+    # Print verification results
+    print("\n" + "="*80)
+    print("VERIFICATION RESULTS (Just for Proof - Model Loaded from Best Checkpoint)")
+    print("="*80)
+    print(f"Verified Train Loss: {verify_train_loss:.4e}")
+    print(f"Verified Val Loss:   {verify_val_loss:.4e}")
+    print(f"Combined Loss:       {verify_train_loss + verify_val_loss:.4e}")
+
+    # Build verify train loss breakdown string with grouped loss types
+    verify_train_total = verify_train_loss_components.get('total', verify_train_loss)
+    verify_train_groups = []
+
+    # Group 1: MSE Loss and its components
+    if 'mse_loss' in verify_train_loss_components:
+        mse_value = verify_train_loss_components['mse_loss']
+        mse_ratio = (mse_value / verify_train_total * 100) if verify_train_total > 0 else 0
+        mse_str = f"MSE_loss: {mse_value:.4e} ({mse_ratio:.2f}%)"
+
+        # Add MSE sub-components in brackets
+        mse_components = []
+        if 'magnitude_loss' in verify_train_loss_components:
+            mag_value = verify_train_loss_components['magnitude_loss']
+            mag_ratio = (mag_value / mse_value * 100) if mse_value > 0 else 0
+            mse_components.append(f"magnitude_loss: {mag_value:.4e} ({mag_ratio:.2f}%)")
+        if 'ft_cal_loss' in verify_train_loss_components:
+            ft_value = verify_train_loss_components['ft_cal_loss']
+            ft_ratio = (ft_value / mse_value * 100) if mse_value > 0 else 0
+            mse_components.append(f"ft_cal_loss: {ft_value:.4e} ({ft_ratio:.2f}%)")
+        if 'logabs_sign_bce_loss' in verify_train_loss_components:
+            logabs_sign_value = verify_train_loss_components['logabs_sign_bce_loss']
+            logabs_sign_ratio = (logabs_sign_value / mse_value * 100) if mse_value > 0 else 0
+            mse_components.append(f"logabs_sign_bce_loss: {logabs_sign_value:.4e} ({logabs_sign_ratio:.2f}%)")
+        if 'real_sign_bce_loss' in verify_train_loss_components:
+            real_sign_value = verify_train_loss_components['real_sign_bce_loss']
+            real_sign_ratio = (real_sign_value / mse_value * 100) if mse_value > 0 else 0
+            mse_components.append(f"real_sign_bce_loss: {real_sign_value:.4e} ({real_sign_ratio:.2f}%)")
+
+        if mse_components:
+            mse_str += f" [{' | '.join(mse_components)}]"
+        verify_train_groups.append(f"{{{mse_str}}}")
+
+    # Group 2: Residual Loss
+    if 'residual_loss' in verify_train_loss_components:
+        residual_value = verify_train_loss_components['residual_loss']
+        residual_ratio = (residual_value / verify_train_total * 100) if verify_train_total > 0 else 0
+        verify_train_groups.append(f"{{Residual_loss: {residual_value:.4e} ({residual_ratio:.2f}%)}}")
+
+    # Group 3: Consistency Loss
+    if 'consistency_loss' in verify_train_loss_components:
+        consistency_value = verify_train_loss_components['consistency_loss']
+        consistency_ratio = (consistency_value / verify_train_total * 100) if verify_train_total > 0 else 0
+        verify_train_groups.append(f"{{Consistency_loss: {consistency_value:.4e} ({consistency_ratio:.2f}%)}}")
+
+    # Build verify val loss breakdown string with grouped loss types
+    verify_val_total = verify_val_loss_components.get('total', verify_val_loss)
+    verify_val_groups = []
+
+    # Group 1: MSE Loss and its components
+    if 'mse_loss' in verify_val_loss_components:
+        mse_value = verify_val_loss_components['mse_loss']
+        mse_ratio = (mse_value / verify_val_total * 100) if verify_val_total > 0 else 0
+        mse_str = f"MSE_loss: {mse_value:.4e} ({mse_ratio:.2f}%)"
+
+        # Add MSE sub-components in brackets
+        mse_components = []
+        if 'magnitude_loss' in verify_val_loss_components:
+            mag_value = verify_val_loss_components['magnitude_loss']
+            mag_ratio = (mag_value / mse_value * 100) if mse_value > 0 else 0
+            mse_components.append(f"magnitude_loss: {mag_value:.4e} ({mag_ratio:.2f}%)")
+        if 'ft_cal_loss' in verify_val_loss_components:
+            ft_value = verify_val_loss_components['ft_cal_loss']
+            ft_ratio = (ft_value / mse_value * 100) if mse_value > 0 else 0
+            mse_components.append(f"ft_cal_loss: {ft_value:.4e} ({ft_ratio:.2f}%)")
+        if 'logabs_sign_bce_loss' in verify_val_loss_components:
+            logabs_sign_value = verify_val_loss_components['logabs_sign_bce_loss']
+            logabs_sign_ratio = (logabs_sign_value / mse_value * 100) if mse_value > 0 else 0
+            mse_components.append(f"logabs_sign_bce_loss: {logabs_sign_value:.4e} ({logabs_sign_ratio:.2f}%)")
+        if 'real_sign_bce_loss' in verify_val_loss_components:
+            real_sign_value = verify_val_loss_components['real_sign_bce_loss']
+            real_sign_ratio = (real_sign_value / mse_value * 100) if mse_value > 0 else 0
+            mse_components.append(f"real_sign_bce_loss: {real_sign_value:.4e} ({real_sign_ratio:.2f}%)")
+
+        if mse_components:
+            mse_str += f" [{' | '.join(mse_components)}]"
+        verify_val_groups.append(f"{{{mse_str}}}")
+
+    # Group 2: Residual Loss
+    if 'residual_loss' in verify_val_loss_components:
+        residual_value = verify_val_loss_components['residual_loss']
+        residual_ratio = (residual_value / verify_val_total * 100) if verify_val_total > 0 else 0
+        verify_val_groups.append(f"{{Residual_loss: {residual_value:.4e} ({residual_ratio:.2f}%)}}")
+
+    # Group 3: Consistency Loss
+    if 'consistency_loss' in verify_val_loss_components:
+        consistency_value = verify_val_loss_components['consistency_loss']
+        consistency_ratio = (consistency_value / verify_val_total * 100) if verify_val_total > 0 else 0
+        verify_val_groups.append(f"{{Consistency_loss: {consistency_value:.4e} ({consistency_ratio:.2f}%)}}")
+
+    # Print both on 2 lines with aligned spacing
+    verify_train_breakdown = " ".join(verify_train_groups)
+    verify_val_breakdown = " ".join(verify_val_groups)
+    print(f"  Verified Train Loss: {verify_train_breakdown}")
+    print(f"  Verified Val Loss  : {verify_val_breakdown}")
+
+    print("="*80)
+    print("Note: These losses should match the best epoch during training.")
+    print("="*80 + "\n")
 
     # Generate prediction performance plots
     prediction_performance(
         data_path=Plot_data_source,
         model_pt_path=model_save_path,
         model=model,
-        normalizer=train_val_inputs_normalizer,
+        inputs_normalizer=train_val_inputs_normalizer,
+        outputs_normalizer=train_val_targets_normalizer,
         device=device,
         dtype=dtype,
         data_sampling_step=100,
-        figure_folder=results_figure_folder
+        figure_folder=model_and_result_folder  # Fixed: use correct parameter name
     )
 
 if __name__ == "__main__":
-    # main()
-    # testcudaavailable()
-    testdataloaderunchange()
+    main()
+    # testdataloaderunchange()
