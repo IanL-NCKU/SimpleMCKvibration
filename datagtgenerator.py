@@ -191,8 +191,8 @@ def function_save_datadistribution(data, output_dir='data_distributions'):
 
                 if len(all_log_values) > 0:
                     # Use percentiles to avoid extreme outliers
-                    x_min = np.percentile(all_log_values, 0.5) - 0.5  # 0.5th percentile
-                    x_max = np.percentile(all_log_values, 99.5) + 0.5  # 99.5th percentile
+                    x_min = np.min(all_log_values) - 0.5  # Full range
+                    x_max = np.max(all_log_values) + 0.5  # Full range
                     
                     # Print diagnostics
                     actual_min = np.min(all_log_values)
@@ -288,16 +288,10 @@ def function_save_datadistribution(data, output_dir='data_distributions'):
                             positive_data if len(positive_data) > 0 else negative_data
 
                 if len(all_values) > 0:
-                    x_min = np.percentile(all_values, 0.5)  # 0.5th percentile
-                    x_max = np.percentile(all_values, 99.5)  # 99.5th percentile
-                    
-                    # Add 10% padding
-                    range_width = x_max - x_min
-                    x_min -= range_width * 0.1
-                    x_max += range_width * 0.1
-                    
-                    print(f"  {name}: value range = [{np.min(all_values):.2f}, {np.max(all_values):.2f}], "
-                          f"plot range = [{x_min:.2f}, {x_max:.2f}]")
+                    x_min = np.min(all_values)  # Full range
+                    x_max = np.max(all_values)  # Full range
+
+                    print(f"  {name}: value range = [{x_min:.2f}, {x_max:.2f}]")
                 else:
                     x_min, x_max = -1, 1
 
@@ -362,13 +356,8 @@ def function_save_datadistribution(data, output_dir='data_distributions'):
                             positive_data if len(positive_data) > 0 else negative_data
 
                 if len(all_values) > 0:
-                    x_min = np.percentile(all_values, 0.5)  # 0.5th percentile
-                    x_max = np.percentile(all_values, 99.5)  # 99.5th percentile
-
-                    # Add 10% padding
-                    range_width = x_max - x_min
-                    x_min -= range_width * 0.1
-                    x_max += range_width * 0.1
+                    x_min = np.min(all_values)  # Full range
+                    x_max = np.max(all_values)  # Full range
                 else:
                     x_min, x_max = -1, 1
 
@@ -431,46 +420,59 @@ def function_save_datadistribution(data, output_dir='data_distributions'):
                 print(f"  Saved {name}: Pos={positive_pct:.1f}%, Neg={negative_pct:.1f}%, Zero={zero_pct:.1f}%")
 
         else:
-            # All-positive data (log scale for m, zeta, k)
+            # All-positive data (m, zeta, k) - create both log and real scale plots
+            # ==== LOG SCALE PLOT ====
             plt.figure(figsize=(10, 6))
-            
+
             threshold = 1e-100
             filtered_data = finite_data[finite_data > threshold]
-            
+
             if len(filtered_data) > 0:
                 log_data = np.log10(filtered_data)
-                
+
                 # Use percentiles
-                x_min = np.percentile(log_data, 0.5) - 0.5
-                x_max = np.percentile(log_data, 99.5) + 0.5
-                
-                plt.hist(log_data, bins=100, range=(x_min, x_max), 
+                x_min = np.min(log_data) - 0.5  # Full range
+                x_max = np.max(log_data) + 0.5  # Full range
+
+                plt.hist(log_data, bins=100, range=(x_min, x_max),
                         density=False, color='blue', alpha=0.7, edgecolor='black')
-                
+
                 outliers = len(finite_data) - len(filtered_data)
                 title = f'Distribution of log10({name})\n(100.0% positive, n={len(filtered_data)})'
                 if outliers > 0:
                     title += f'\n({outliers} outliers < {threshold:.0e} excluded)'
                 plt.title(title)
-                
+
                 print(f"  {name}: log10 range = [{np.min(log_data):.1f}, {np.max(log_data):.1f}], "
                       f"plot range = [{x_min:.1f}, {x_max:.1f}]")
             else:
-                plt.text(0.5, 0.5, f'All values < {threshold:.0e}', 
+                plt.text(0.5, 0.5, f'All values < {threshold:.0e}',
                         ha='center', va='center', transform=plt.gca().transAxes)
                 plt.title(f'Distribution of log10({name})\n(All outliers)')
                 x_min, x_max = -1, 1
-            
+
             plt.xlabel(f'log10({name})')
             plt.ylabel('Count')
             plt.xlim(x_min, x_max)
             plt.grid(axis='y', alpha=0.75)
 
-            filename = os.path.join(output_dir, f'distribution_{name}.png')
-            plt.savefig(filename, dpi=100)
+            filename_log = os.path.join(output_dir, f'distribution_{name}_log.png')
+            plt.savefig(filename_log, dpi=100)
             plt.close()
 
-            print(f"  Saved {name}: 100.0% positive, n={len(finite_data)}")
+            # ==== REAL SCALE PLOT ====
+            plt.figure(figsize=(10, 6))
+            plt.hist(finite_data, bins=100, density=False, color='blue', alpha=0.7, edgecolor='black')
+            plt.title(f'Distribution of {name} (Real Scale)\n(100.0% positive, n={len(finite_data)})')
+            plt.xlabel(f'{name} Value (Real Scale)')
+            plt.ylabel('Count')
+            plt.xlim(left=0)
+            plt.grid(axis='y', alpha=0.75)
+            filename_real = os.path.join(output_dir, f'distribution_{name}_real.png')
+            plt.savefig(filename_real, dpi=100)
+            plt.close()
+
+            print(f"  Saved {name}: 100.0% positive (real and log scale), n={len(finite_data)}")
 
     print("All distribution plots have been saved.")
 
@@ -478,18 +480,22 @@ def function_save_datadistribution(data, output_dir='data_distributions'):
 
 
 def main():
-    n = 1000000
-    
+    n = 100000
+    output_filename = 'newwide_scale_test_vibration_data.npz'
+    output_folder = 'newwide_scale_test_data_distributions'
+
     # np.random.seed(42)
-    
+
     data = np.zeros((n, 9))
     
     print(f"Generating {n} valid samples...")
     error_count = 0
     i = 0
-    j = 0
-    kk = 0
     attempts = 0
+    rejected_overflow = 0
+    rejected_large = 0
+    rejected_small = 0
+    rejected_warnings = 0
     while i < n:
         attempts += 1
         """
@@ -532,45 +538,33 @@ def main():
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")  # Catch all warnings
             warnings.filterwarnings('ignore', category=RuntimeWarning)  # Don't print them
-
+            
             # Use errstate to catch numerical errors like overflow
             with np.errstate(all='raise'):  # Raise exceptions instead of warnings
                 try:
                     x_t, v_t, a_t = analytical_solution(m, c, k, x0, v0, t)
-
-                    # Additional check: if results are exactly zero (likely underflow)
-                    # and time is large, this indicates underflow that may not trigger warning
-                    # has_suspicious_zeros = (x_t == 0 and v_t == 0 and a_t == 0) and t > 100
-
-                    # Debug: print if we catch warnings
-                    # if len(w) > 0 and attempts % 1000 == 0:
-                    #     print(f"Caught {len(w)} warnings at attempt {attempts}")
-
-                    # Check if any warnings were raised or if results are invalid
-                    if len(w) > 0  or \
-                        any(np.isnan([x_t, v_t, a_t])) or \
-                        any(np.isinf([x_t, v_t, a_t])) or \
-                        any(np.abs([x_t, v_t, a_t]) > 1e3):
-
+                    
+                    # Check if any warnings were raised
+                    if len(w) > 0:
                         is_valid = False
-
-                    elif any(np.abs([x_t, v_t, a_t]) < 1e-2):
-                        # only 1% of the data with very small values
-                        j += 1
-                        if np.random.rand() > 0.00:
+                        rejected_warnings += 1
+                    # Check for invalid values (NaN or Inf)
+                    elif any(np.isnan([x_t, v_t, a_t])) or any(np.isinf([x_t, v_t, a_t])):
+                        is_valid = False
+                        rejected_overflow += 1
+                    # Reject if any value is too large (> 1e4)
+                    elif any(np.abs([x_t, v_t, a_t]) > 1e4):
+                        is_valid = False
+                        rejected_large += 1
+                    # Accept only 1% of small values (< 1e-4), reject all extremely small (< 1e-6)
+                    elif any(np.abs([x_t, v_t, a_t]) < 1e-4):
+                        if np.random.rand() > 0.01 or any(np.abs([x_t, v_t, a_t]) < 1e-6):
                             is_valid = False
-
-                        # elif any(np.abs([x_t, v_t, a_t]) < 1e-12):
-                        #     # the one that smaller will be turn to 0
-                        #     x_t = 0.0 if abs(x_t) < 1e-12 else x_t
-                        #     v_t = 0.0 if abs(v_t) < 1e-12 else v_t
-                        #     a_t = 0.0 if abs(a_t) < 1e-12 else a_t
-
-                        else:
-                            kk += 1
-
+                            rejected_small += 1
+                            
                 except Exception:
                     is_valid = False
+                    rejected_overflow += 1
 
         if is_valid:
             if (i + 1) % 10000 == 0:
@@ -591,15 +585,31 @@ def main():
         print("Warning: There are data points with absolute values < 1e-9 but not zero.")
 
     print(f"\nTotal attempts to generate {n} valid samples: {attempts}")
-    
+    print(f"  Rejected (warnings): {rejected_warnings}")
+    print(f"  Rejected (overflow/underflow): {rejected_overflow}")
+    print(f"  Rejected (too large > 1e4): {rejected_large}")
+    print(f"  Rejected (too small < 1e-4): {rejected_small}")
+    print(f"  Acceptance rate: {n/attempts*100:.2f}%")
+
     # Save as npz file
-    np.savez('small_scale_trainval_vibration_data.npz', data=data)
-    print(f"\nData generation complete! Saved {n} samples to 'small_scale_trainval_vibration_data.npz'")
+    np.savez(output_filename, data=data)
+    print(f"\nData generation complete! Saved {n} samples to '{output_filename}'")
     print(f"Data shape: {data.shape}")
     print(f"Columns: [m, zeta, k, t, x0, v0, x(t), v(t), a(t)]")
-    print(data[:5, :])  # Print first 5 samples
+    print("\nFirst 5 samples:")
+    print(data[:5, :])
+
+    # Print statistics
+    print("\n" + "="*60)
+    print("Data Statistics:")
+    print("="*60)
+    for i, name in enumerate(['m', 'zeta', 'k', 't', 'x0', 'v0', 'x_t', 'v_t', 'a_t']):
+        col_data = data[:, i]
+        print(f"{name:5s}: min={np.min(col_data):12.6e}, max={np.max(col_data):12.6e}, "
+              f"mean={np.mean(col_data):12.6e}, std={np.std(col_data):12.6e}")
+    print("="*60)
     # Generate and save data distribution plots
-    function_save_datadistribution(data, output_dir='small_scale_trainval_data_distributions')
+    function_save_datadistribution(data, output_dir=output_folder)
     
     for i in range(n):
         if i % 10000 == 0:
@@ -657,8 +667,6 @@ def main():
                         print(f"  m={m:.6e}, zeta={zeta:.6e}, k={k:.6e}, t={t:.6e}, x0={x0:.6e}, v0={v0:.6e}")
                         print(f"{'='*60}")
                     x_t, v_t, a_t = np.nan, np.nan, np.nan
-    print("Total j values below 1e-6: ", j)
-    print("Total kk values below 1e-5 accepted: ", kk)
 
 
 if __name__ == "__main__":
