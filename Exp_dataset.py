@@ -145,6 +145,7 @@ class Exponential_DataNormalizer:
         is_tensor = torch.is_tensor(X_norm)
         if is_tensor:
             device = X_norm.device
+            original_dtype = X_norm.dtype
             X_norm = X_norm.detach().cpu().numpy()
 
         # Create dictionary from array
@@ -166,7 +167,7 @@ class Exponential_DataNormalizer:
 
         # Convert back to tensor if input was tensor
         if is_tensor:
-            X_denorm = torch.FloatTensor(X_denorm).to(device)
+            X_denorm = torch.tensor(X_denorm, dtype=original_dtype, device=device)
 
         return X_denorm
 
@@ -397,6 +398,7 @@ class Exponential_OutputNormalizer:
         is_tensor = torch.is_tensor(Y_norm)
         if is_tensor:
             device = Y_norm.device
+            original_dtype = Y_norm.dtype
             Y_norm = Y_norm.detach().cpu().numpy()
 
         if self.use_log_normalization:
@@ -442,7 +444,7 @@ class Exponential_OutputNormalizer:
         ], axis=1)
 
         if is_tensor:
-            Y = torch.FloatTensor(Y).to(device)
+            Y = torch.tensor(Y, dtype=original_dtype, device=device)
 
         return Y
 

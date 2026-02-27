@@ -514,7 +514,7 @@ def testdataloaderunchange():
 def main():
     device_index = 0
     train_in_64 = True
-    epochs = 500
+    epochs = 50
 
     # Setup float64 training if requested (MUST be done BEFORE loading data)
     if train_in_64:
@@ -560,8 +560,8 @@ def main():
     device = torch.device(f'cuda:{device_index}' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    model_file_name = 'exp_withlog.pt'#consistency_testOutside_nolog.pt'
-    model_and_result_folder = './exp_withlog'
+    model_file_name = 'exp_test1.pt'#consistency_testOutside_nolog.pt'
+    model_and_result_folder = './exp_test1'
 
     # Create the results folder if it doesn't exist
     if not os.path.exists(model_and_result_folder):
@@ -1755,6 +1755,9 @@ def main():
         data_sampling_step=100,
         figure_folder=model_and_result_folder  # Fixed: use correct parameter name
     )
+
+
+
 
 
 if __name__ == "__main__":
