@@ -16,14 +16,23 @@ class Exponential_DataNormalizer:
     - 't': time [1e-3, 10] - mixed log-uniform/linear uniform
     """
 
-    def __init__(self):
+    def __init__(self, map_range=None):
+        """
+        Args:
+            map_range: Optional list/tuple [lo, hi] (e.g., [-1, 1]).
+                       If provided, z-scored values are linearly mapped to this range.
+                       If None, standard z-score normalization (unbounded).
+        """
         self.log_features = ['t']  # Log-uniform sampled (partially)
         self.linear_features = ['a', 'b']  # Linear uniform sampled
 
+        self.map_range = map_range
         self.log_mean = {}
         self.log_std = {}
         self.linear_mean = {}
         self.linear_std = {}
+        self.original_z_min = {}
+        self.original_z_max = {}
 
     def fit(self, data_dict):
         """
@@ -40,6 +49,19 @@ class Exponential_DataNormalizer:
         for feat in self.linear_features:
             self.linear_mean[feat] = np.mean(data_dict[feat])
             self.linear_std[feat] = np.std(data_dict[feat])
+
+        # Compute z-score bounds for map_range
+        if self.map_range is not None:
+            # Log features: snap to next integer outward
+            for feat in self.log_features:
+                z_values = (np.log10(data_dict[feat]) - self.log_mean[feat]) / self.log_std[feat]
+                self.original_z_min[feat] = np.floor(np.min(z_values))
+                self.original_z_max[feat] = np.ceil(np.max(z_values))
+            # Linear features: use exact min/max (no snapping)
+            for feat in self.linear_features:
+                z_values = (data_dict[feat] - self.linear_mean[feat]) / self.linear_std[feat]
+                self.original_z_min[feat] = np.min(z_values)
+                self.original_z_max[feat] = np.max(z_values)
 
     def transform(self, data_dict, t_zero_threshold=1e-9):
         """Normalize data
@@ -66,6 +88,14 @@ class Exponential_DataNormalizer:
         # Standard normalization for a and b
         for feat in self.linear_features:
             normalized[feat] = (data_dict[feat] - self.linear_mean[feat]) / self.linear_std[feat]
+
+        # Apply map_range if specified
+        if self.map_range is not None:
+            map_lo, map_hi = self.map_range
+            for feat in list(self.log_features) + list(self.linear_features):
+                z_min = self.original_z_min[feat]
+                z_max = self.original_z_max[feat]
+                normalized[feat] = map_lo + (normalized[feat] - z_min) / (z_max - z_min) * (map_hi - map_lo)
 
         return normalized
 
@@ -99,6 +129,14 @@ class Exponential_DataNormalizer:
             normalized_dict: Dictionary with normalized feature arrays
             t_zero_threshold: If denormalized 't' would be below this, set to exactly 0.0
         """
+        # Reverse map_range if specified
+        if self.map_range is not None:
+            map_lo, map_hi = self.map_range
+            for feat in list(self.log_features) + list(self.linear_features):
+                z_min = self.original_z_min[feat]
+                z_max = self.original_z_max[feat]
+                normalized_dict[feat] = z_min + (normalized_dict[feat] - map_lo) / (map_hi - map_lo) * (z_max - z_min)
+
         original = {}
 
         # Inverse log-space normalization for time
@@ -181,14 +219,21 @@ class Exponential_OutputNormalizer:
     Note: Assumes all output values are positive (like absolute magnitudes).
     """
 
-    def __init__(self, use_log_normalization=True):
+    def __init__(self, use_log_normalization=True, map_range=None):
         """
         Args:
             use_log_normalization: If True, use log-space normalization.
                                   If False, use standard normalization.
+            map_range: Optional list/tuple [lo, hi] (e.g., [-1, 1]).
+                       If provided, z-scored values are linearly mapped to this range.
+                       Only applies to continuous values (log-abs or linear), NOT to signs.
+                       If None, standard z-score normalization (unbounded).
         """
         self.use_log_normalization = use_log_normalization
+        self.map_range = map_range
         self.eps = 1e-12 # Small epsilon for numerical stability
+        self.original_z_min = {}
+        self.original_z_max = {}
         if self.use_log_normalization:
             self.log_features = ['x', 'v', 'a']  # All outputs use log normalization
             self.log_mean = {}
@@ -213,11 +258,26 @@ class Exponential_OutputNormalizer:
                 log_values = np.log10(np.abs(values) + self.eps)
                 self.log_mean[feat] = np.mean(log_values)
                 self.log_std[feat] = np.std(log_values)
+
+            # Compute z-score bounds for map_range
+            if self.map_range is not None:
+                for feat in self.log_features:
+                    log_values = np.log10(np.abs(data_dict[feat]) + self.eps)
+                    z_values = (log_values - self.log_mean[feat]) / self.log_std[feat]
+                    self.original_z_min[feat] = np.floor(np.min(z_values))
+                    self.original_z_max[feat] = np.ceil(np.max(z_values))
         else:
             # For linear normalization
             for feat in self.linear_features:
                 self.linear_mean[feat] = np.mean(data_dict[feat])
                 self.linear_std[feat] = np.std(data_dict[feat])
+
+            # Compute z-score bounds for map_range (use exact min/max for linear features)
+            if self.map_range is not None:
+                for feat in self.linear_features:
+                    z_values = (data_dict[feat] - self.linear_mean[feat]) / self.linear_std[feat]
+                    self.original_z_min[feat] = np.min(z_values)
+                    self.original_z_max[feat] = np.max(z_values)
 
     def transform(self, data_dict):
         """
@@ -244,10 +304,28 @@ class Exponential_OutputNormalizer:
                 # Apply log transform to absolute values
                 log_values = np.log10(np.abs(values) + self.eps)
                 normalized[feat] = (log_values - self.log_mean[feat]) / self.log_std[feat]
+
+            # Apply map_range to log-abs z-scores (NOT to signs)
+            if self.map_range is not None:
+                map_lo, map_hi = self.map_range
+                for feat in self.log_features:
+                    z_min = self.original_z_min[feat]
+                    z_max = self.original_z_max[feat]
+                    normalized[feat] = map_lo + (normalized[feat] - z_min) / (z_max - z_min) * (map_hi - map_lo)
+
             return normalized, signs
         else:
             for feat in self.linear_features:
                 normalized[feat] = (data_dict[feat] - self.linear_mean[feat]) / self.linear_std[feat]
+
+            # Apply map_range to linear z-scores
+            if self.map_range is not None:
+                map_lo, map_hi = self.map_range
+                for feat in self.linear_features:
+                    z_min = self.original_z_min[feat]
+                    z_max = self.original_z_max[feat]
+                    normalized[feat] = map_lo + (normalized[feat] - z_min) / (z_max - z_min) * (map_hi - map_lo)
+
             return normalized, None
 
     def inverse_transform(self, normalized_dict, signs_dict=None):
@@ -261,6 +339,15 @@ class Exponential_OutputNormalizer:
         Returns:
             Dictionary with original features
         """
+        # Reverse map_range if specified
+        if self.map_range is not None:
+            map_lo, map_hi = self.map_range
+            features = self.log_features if self.use_log_normalization else self.linear_features
+            for feat in features:
+                z_min = self.original_z_min[feat]
+                z_max = self.original_z_max[feat]
+                normalized_dict[feat] = z_min + (normalized_dict[feat] - map_lo) / (map_hi - map_lo) * (z_max - z_min)
+
         original = {}
 
         if self.use_log_normalization:
@@ -448,6 +535,90 @@ class Exponential_OutputNormalizer:
 
         return Y
 
+
+def generalize_alpha(normalizer, original_alpha, original_beta, feature_name):
+    """
+    Get effective alpha for a feature, accounting for map_range transformation.
+
+    When map_range is applied, the recovery formula becomes:
+        real_value = 10^(beta_eff * t_norm + alpha_eff)
+
+    Derivation (solving the forward mapping for log10(t)):
+        alpha_eff = alpha + beta * (feature_min - map_min * D_ori / D_map)
+
+    where:
+        feature_min = original_z_min[feature_name]
+                      (floor of z-score min for log features, exact min for linear)
+        D_ori       = original_z_max - original_z_min  (span of z-score domain)
+        D_map       = map_hi - map_lo                  (span of mapped domain)
+        map_min     = map_lo
+
+    Args:
+        normalizer: Exponential_DataNormalizer or Exponential_OutputNormalizer instance
+        original_alpha: Original mean value (log_mean for log features, linear_mean for linear)
+        original_beta: Original std value (log_std for log features, linear_std for linear)
+        feature_name: Feature name (e.g., 't', 'a', 'b', 'x', 'v', 'a')
+
+    Returns:
+        float: Effective alpha (adjusted if map_range is applied, original otherwise)
+
+    Example:
+        t_alpha = train_val_inputs_normalizer.log_mean['t']
+        t_beta = train_val_inputs_normalizer.log_std['t']
+        t_alpha = generalize_alpha(train_val_inputs_normalizer, t_alpha, t_beta, 't')
+    """
+    if normalizer.map_range is not None:
+        feature_min = normalizer.original_z_min[feature_name]
+        feature_max = normalizer.original_z_max[feature_name]
+        map_lo, map_hi = normalizer.map_range
+        D_ori = feature_max - feature_min
+        D_map = map_hi - map_lo
+        alpha_eff = original_alpha + original_beta * (feature_min - map_lo * D_ori / D_map)
+        return alpha_eff
+    else:
+        return original_alpha
+
+
+def generalize_beta(normalizer, original_alpha, original_beta, feature_name):
+    """
+    Get effective beta for a feature, accounting for map_range transformation.
+
+    When map_range is applied, the recovery formula becomes:
+        real_value = 10^(beta_eff * t_norm + alpha_eff)
+
+    Derivation (solving the forward mapping for log10(t)):
+        beta_eff = beta * D_ori / D_map
+
+    where:
+        D_ori = original_z_max - original_z_min  (span of z-score domain)
+        D_map = map_hi - map_lo                  (span of mapped domain)
+
+    Args:
+        normalizer: Exponential_DataNormalizer or Exponential_OutputNormalizer instance
+        original_alpha: Original mean value (not used here, kept for consistent interface)
+        original_beta: Original std value (log_std for log features, linear_std for linear)
+        feature_name: Feature name (e.g., 't', 'a', 'b', 'x', 'v', 'a')
+
+    Returns:
+        float: Effective beta (adjusted if map_range is applied, original otherwise)
+
+    Example:
+        t_alpha = train_val_inputs_normalizer.log_mean['t']
+        t_beta = train_val_inputs_normalizer.log_std['t']
+        t_beta = generalize_beta(train_val_inputs_normalizer, t_alpha, t_beta, 't')
+    """
+    if normalizer.map_range is not None:
+        feature_min = normalizer.original_z_min[feature_name]
+        feature_max = normalizer.original_z_max[feature_name]
+        map_lo, map_hi = normalizer.map_range
+        D_ori = feature_max - feature_min
+        D_map = map_hi - map_lo
+        beta_eff = original_beta * D_ori / D_map
+        return beta_eff
+    else:
+        return original_beta
+
+
 class ExponentialDataset(Dataset):
     """PyTorch Dataset for exponential data"""
 
@@ -468,7 +639,7 @@ class ExponentialDataset(Dataset):
         return self.inputs[idx], self.outputs[idx]
 
 
-def load_exponential_data(filepath='exponential_trainval_data.npz', batch_size=32, shuffle_train=True, normalize=True, dtype=torch.float32, inputs_normalizer=None, outputs_normalizer=None):
+def load_exponential_data(filepath='exponential_trainval_data.npz', batch_size=32, shuffle_train=True, normalize=True, dtype=torch.float32, inputs_normalizer=None, outputs_normalizer=None, inputs_map_range=None, outputs_map_range=None):
     """Loads and prepares exponential data from an .npz file.
 
     This function splits the data into training, validation, and test sets,
@@ -489,6 +660,12 @@ def load_exponential_data(filepath='exponential_trainval_data.npz', batch_size=3
         outputs_normalizer (Exponential_OutputNormalizer or None): Pre-fitted output normalizer.
             If provided, this normalizer will be used instead of creating a new one.
             Useful for applying train/val normalization to test data.
+        inputs_map_range (list/tuple or None): Optional [lo, hi] range for input normalization.
+            If provided, z-scored inputs are linearly mapped to this range (e.g., [-1, 1]).
+            Only used when creating a new normalizer (ignored if inputs_normalizer is provided).
+        outputs_map_range (list/tuple or None): Optional [lo, hi] range for output normalization.
+            If provided, z-scored outputs are linearly mapped to this range (e.g., [-1, 1]).
+            Only used when creating a new normalizer (ignored if outputs_normalizer is provided).
 
     Returns:
         tuple: A tuple containing:
@@ -502,6 +679,13 @@ def load_exponential_data(filepath='exponential_trainval_data.npz', batch_size=3
     """
     # Load data
     data = np.load(filepath)
+
+    # If input normalizer is provided then error if inputs_map_range is also provided (to avoid confusion)
+    if inputs_normalizer is not None and inputs_map_range is not None:
+        raise ValueError("Cannot provide both inputs_normalizer and inputs_map_range. Please provide only one to avoid confusion.")
+    # If output normalizer is provided then error if outputs_map_range is also provided (to avoid confusion)
+    if outputs_normalizer is not None and outputs_map_range is not None:
+        raise ValueError("Cannot provide both outputs_normalizer and outputs_map_range. Please provide only one to avoid confusion.")
 
     # Extract the array (npz files can contain multiple arrays)
     if isinstance(data, np.lib.npyio.NpzFile):
@@ -539,11 +723,11 @@ def load_exponential_data(filepath='exponential_trainval_data.npz', batch_size=3
             }
 
             if inputs_normalizer is None:
-                inputs_normalizer = Exponential_DataNormalizer()
+                inputs_normalizer = Exponential_DataNormalizer(map_range=inputs_map_range)
                 inputs_normalizer.fit(train_input_dict)
 
             if outputs_normalizer is None:
-                outputs_normalizer = Exponential_OutputNormalizer(use_log_normalization=True)
+                outputs_normalizer = Exponential_OutputNormalizer(use_log_normalization=True, map_range=outputs_map_range)
                 outputs_normalizer.fit(train_output_dict)
 
         # Use provided or newly fitted normalizers to normalize all splits
