@@ -1,438 +1,692 @@
 """
-Training script for ExponentialSignNN - Sign Classification Network
+Model and Loss Components for Sign Classification Network
 
-This network learns to predict signs of [x_t, v_t, a_t] given:
-- Input: [a, b, t, (1+0.05*r)*abs(x_t), (1+0.05*r)*abs(v_t), (1+0.05*r)*abs(a_t)]
-- Output: sign predictions applied to input magnitudes
-- Loss: SignMSE only (no physics constraints)
+This file contains ONLY classes for sign prediction:
+- ExponentialSignNN: Network that predicts signs from noisy magnitude inputs
+- SignMSELoss: Loss function for sign prediction
+- BaseLossComponent: Abstract base class for loss components
+- ExponentialPINNLoss: Loss wrapper (only supports SignMSE)
 
-Note: This file only uses ExponentialSignNN and SignMSELoss.
-      ExponentialPINN, ExponentialResidualLoss, and ConsistencyLoss classes
-      are NOT used and have been removed from Exp_modelandloss_forsign.py
+REMOVED CLASSES (use Exp_modelandloss.py instead):
+- ExponentialPINN
+- MSELoss
+- ExponentialResidualLoss
+- ConsistencyLoss_auto_diff
+- ConsistencyLoss_finite_diff
 """
 
-from Exp_dataset import *
-from Exp_modelandloss_forsign import *
-from expdatagenerator import *
 import torch
-from tqdm import tqdm
-import matplotlib.pyplot as plt
-import os
+import torch.nn as nn
 import numpy as np
-
-def log_training_results(log_dict, results_folder='./results', filename='training_log.txt', delimiter=', '):
-    """Log training results to a delimited text file."""
-    if not os.path.exists(results_folder):
-        os.makedirs(results_folder)
-
-    log_path = os.path.join(results_folder, filename)
-    epoch = log_dict['epoch']
-    outputs = log_dict['outputs']
-    targets = log_dict['targets']
-    train_loss = log_dict['train_loss']
-
-    if torch.is_tensor(outputs):
-        outputs = outputs.detach().cpu().numpy()
-    if torch.is_tensor(targets):
-        targets = targets.detach().cpu().numpy()
-
-    file_exists = os.path.isfile(log_path)
-
-    with open(log_path, 'a') as f:
-        if not file_exists:
-            header_fields = ["epoch", "output_x", "output_v", "output_a",
-                           "target_x", "target_v", "target_a", "train_loss"]
-            f.write(delimiter.join(header_fields) + "\n")
-
-        data_fields = [f"{epoch}", f"{outputs[0]:.6e}", f"{outputs[1]:.6e}", f"{outputs[2]:.6e}",
-                      f"{targets[0]:.6e}", f"{targets[1]:.6e}", f"{targets[2]:.6e}", f"{train_loss:.6e}"]
-        f.write(delimiter.join(data_fields) + "\n")
-
-    return log_path
+from abc import ABC, abstractmethod
 
 
-def prediction_performance(data_path, model_pt_path, model, normalizer, device, data_sampling_step=1, figure_folder='./figures'):
-    """Generate prediction performance scatter plots."""
-    print(f"\n{'='*60}")
-    print("Generating Prediction Performance Plots")
-    print(f"{'='*60}")
+class ExponentialSignNN(nn.Module):
+    """Sign Classification Network for exponential function
 
-    if not os.path.exists(figure_folder):
-        os.makedirs(figure_folder)
-        print(f"Created folder: {figure_folder}")
+    Learns to predict signs of [x_t, v_t, a_t] given:
+    - Input: [a, b, t, (1+0.05*r)*abs(x_t), (1+0.05*r)*abs(v_t), (1+0.05*r)*abs(a_t)]
+    - Output: sign predictions for [x_t, v_t, a_t]
+    """
 
-    model.load_state_dict(torch.load(model_pt_path))
-    model.eval()
-    print(f"Loaded model from: {model_pt_path}")
+    def __init__(self, hidden_dims=[64, 128, 128, 64], activation='tanh'):
+        super().__init__()
 
-    test_loader, _, _, _, _ = load_exponential_data(
-        filepath=data_path,
-        batch_size=256,
-        normalize=True,
-        shuffle_train=False
-    )
-    print(f"Loaded test data from: {data_path}")
+        # Choose activation function
+        if activation == 'tanh':
+            act = nn.Tanh
+        elif activation == 'swish':
+            act = nn.SiLU
+        elif activation == 'ELU':
+            act = nn.ELU
+        elif activation == 'relu':
+            act = nn.ReLU
+        else:
+            act = nn.GELU
 
-    all_predictions = []
-    all_targets = []
+        # Build sign prediction network
+        layers = []
+        input_dim = 6  # [a, b, t, noisy_mag_x, noisy_mag_v, noisy_mag_a]
 
-    with torch.no_grad():
-        for inputs, targets in test_loader:
-            # Move data to device
-            inputs, targets = inputs.to(device), targets.to(device)
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(input_dim, hidden_dim))
+            # layers.append(act())
+            input_dim = hidden_dim
 
-            # Generate random noise for this batch: r ~ Uniform[-1, 1]
-            N = inputs.size(0)
-            r = torch.rand(N, 3, device=device) * 2 - 1  # Shape: (batch_size, 3)
+        # Final layer: output 3 sign values constrained to [-1, 1]
+        layers.append(nn.Linear(input_dim, 3))
+        layers.append(nn.Tanh())  # Constrain to [-1, 1]
 
-            # Compute noisy magnitudes: (1 + 0.05*r) * abs(targets)
-            noisy_magnitudes = (1 + 0.05 * r) * torch.abs(targets)  # Shape: (batch_size, 3)
+        self.network = nn.Sequential(*layers)
 
-            # Modify inputs: concatenate [a, b, t] with noisy magnitudes
-            inputs_modified = torch.cat([inputs, noisy_magnitudes], dim=1)  # Shape: (batch_size, 6)
+        # Initialize weights
+        self.apply(self._init_weights)
 
-            # Forward pass
-            outputs = model(inputs_modified)
-            all_predictions.append(outputs.cpu().numpy())
-            all_targets.append(targets.cpu().numpy())
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_normal_(m.weight)
+            nn.init.zeros_(m.bias)
 
-    all_predictions = np.concatenate(all_predictions, axis=0)
-    all_targets = np.concatenate(all_targets, axis=0)
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (batch_size, 6)
+               [a, b, t, (1+0.05*r)*abs(x_t), (1+0.05*r)*abs(v_t), (1+0.05*r)*abs(a_t)]
 
-    print(f"Total data points: {len(all_predictions)}")
+        Returns:
+            predictions: Output tensor of shape (batch_size, 3)
+                        Reconstructed signed values: sign_predictions * input_magnitudes
+                        where input_magnitudes are the last 3 inputs
+        """
+        # Get sign predictions from network (Tanh output: [-1, 1])
+        sign_predictions = self.network(x)  # Shape: (batch_size, 3)
 
-    sampled_indices = np.arange(0, len(all_predictions), data_sampling_step)
-    predictions_sampled = all_predictions[sampled_indices]
-    targets_sampled = all_targets[sampled_indices]
+        # Extract input magnitudes (last 3 features)
+        input_magnitudes = x[:, 3:]  # Shape: (batch_size, 3)
 
-    print(f"Sampled data points (step={data_sampling_step}): {len(predictions_sampled)}")
+        # Reconstruct signed values: sign * magnitude
+        predictions = sign_predictions * input_magnitudes
 
-    output_names = ['x', 'v', 'a']
-    output_titles = [
-        'Position Prediction Performance',
-        'Velocity Prediction Performance',
-        'Acceleration Prediction Performance'
-    ]
-
-    for idx, (name, title) in enumerate(zip(output_names, output_titles)):
-        plt.figure(figsize=(8, 8))
-
-        ground_truth = targets_sampled[:, idx]
-        predictions = predictions_sampled[:, idx]
-
-        plt.scatter(ground_truth, predictions, alpha=0.5, s=20)
-
-        min_val = min(ground_truth.min(), predictions.min())
-        max_val = max(ground_truth.max(), predictions.max())
-        plt.plot([min_val, max_val], [min_val, max_val], 'r-', linewidth=2, label='Perfect Prediction (y=x)')
-
-        plt.grid(True, alpha=0.3)
-        plt.xlabel('Ground Truth', fontsize=12)
-        plt.ylabel('Prediction', fontsize=12)
-        plt.title(title, fontsize=14, fontweight='bold')
-        plt.legend()
-        plt.axis('equal')
-
-        filename = f"{name}_prediction.png"
-        filepath = os.path.join(figure_folder, filename)
-        plt.savefig(filepath, dpi=100, bbox_inches='tight')
-        print(f"Saved: {filepath}")
-        plt.close()
-
-    print(f"{'='*60}")
-    print("Prediction performance plots generated successfully!")
-    print(f"{'='*60}\n")
+        return predictions
 
 
-def main():
-    device_index = 0
-    epochs = 200
+class ExponentialSignNN_ver2(nn.Module):
+    """Binary Classification Network for sign prediction using multi-head architecture
 
-    # Data paths
-    Train_Val_data_source = r'E:\Ian\PINNexample\exponential_trainval_data.npz'
-    Test_data_source = r'E:\Ian\PINNexample\exponential_test_data.npz'
-    Plot_data_source = r'E:\Ian\PINNexample\exponential_test_data.npz'
-    data_normalize = True
-    # Load the dataset
-    train_loader, val_loader, _, train_val_inputs_normalizer, train_val_targets_normalizer = load_exponential_data(
-        filepath=Train_Val_data_source,
-        batch_size=512,
-        normalize=data_normalize,
-        shuffle_train=True
-    )
+    Uses sigmoid outputs and BCE loss for sign classification.
+    Learns to predict signs of [x_t, v_t, a_t] given:
+    - Input: [a, b, t, (1+0.05*r)*abs(x_t), (1+0.05*r)*abs(v_t), (1+0.05*r)*abs(a_t)]
+    - Output: 3 binary predictions (positive/negative) for [x_t, v_t, a_t]
+    """
 
-    test_loader, _, _, test_inputs_normalizer, test_targets_normalizer = load_exponential_data(
-        filepath=Test_data_source,
-        batch_size=512,
-        normalize=data_normalize,
-        shuffle_train=False
-    )
+    def __init__(self, hidden_dims=[128, 64, 32], activation='relu'):
+        super().__init__()
 
-    print(f"Data loaders created:")
+        # Choose activation function
+        if activation == 'tanh':
+            act = nn.Tanh
+        elif activation == 'elu':
+            act = nn.ELU
+        elif activation == 'relu':
+            act = nn.ReLU
+        else:
+            act = nn.ReLU
 
-    # Setup device
-    device = torch.device(f'cuda:{device_index}' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+        # Build shared hidden layers
+        layers = []
+        input_dim = 6  # [a, b, t, noisy_mag_x, noisy_mag_v, noisy_mag_a]
 
-    model_save_path = 'exp_model_signnn_classres_64_32_16.pt'
-    results_figure_folder = './exp_results_signnn_classres_64_32_16'
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(input_dim, hidden_dim))
+            layers.append(act())
+            layers.append(nn.BatchNorm1d(hidden_dim))
+            layers.append(nn.Dropout(0.3))
+            input_dim = hidden_dim
 
-    # Create the Exponential Sign NN model
-    # model = ExponentialSignNN_ver2(hidden_dims=[64, 32, 16],
-    #                                activation='relu').to(device)
-    model = ExponentialSignNN_ver3(hidden_dims=[64, 32, 16],
-                                   activation='relu').to(device)
+        self.shared_layers = nn.Sequential(*layers)
 
-    # Configure losses - only SignBCE
-    loss_config = {
-        "SignBCE": {"weight": 1.0}
-    }
+        # Output heads (one for each of the 3 outputs)
+        num_outputs = 3
+        self.output_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(input_dim, 16),
+                act(),
+                nn.Linear(16, 1),
+                nn.Sigmoid()
+            )
+            for _ in range(num_outputs)
+        ])
 
-    # Safety check: Ensure only SignMSE or SignBCE is configured
-    allowed_losses = {"SignMSE", "SignBCE"}
-    configured_losses = set(loss_config.keys())
-    if not configured_losses.issubset(allowed_losses):
-        raise ValueError(f"Only SignMSE or SignBCE loss is supported. Found: {configured_losses}")
+        # Initialize weights
+        self.apply(self._init_weights)
 
-    loss_fn = ExponentialPINNLoss(model, loss_config)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
-    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=np.max([epochs//20,1]), eta_min=1e-9)
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_normal_(m.weight)
+            nn.init.zeros_(m.bias)
 
-    # Training loop for Sign Classification Network
-    # Input data shape: (batch_size, 6) -> [a, b, t, noisy_mag_x, noisy_mag_v, noisy_mag_a]
-    # Target data shape: (batch_size, 3) -> [(1+0.05*r)*x_t, (1+0.05*r)*v_t, (1+0.05*r)*a_t]
-    best_combined_loss = float('inf')
-    for epoch in range(epochs):
-        print(f"\nEpoch {epoch+1}/{epochs}")
-        model.train()
-        train_loss = 0.0
-        train_loss_components = {}
-        train_sign_accuracy = 0.0
-        train_samples = 0
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (batch_size, 6)
+               [a, b, t, (1+0.05*r)*abs(x_t), (1+0.05*r)*abs(v_t), (1+0.05*r)*abs(a_t)]
 
-        # Training progress bar
-        train_pbar = tqdm(train_loader, desc=f"Training", leave=False)
-        for inputs, targets in train_pbar:
-            # Move data to device
-            inputs, targets = inputs.to(device), targets.to(device)
+        Returns:
+            predictions: Output tensor of shape (batch_size, 3)
+                        Reconstructed signed values: sign_from_probs * input_magnitudes
+        """
+        # Shared feature extraction
+        shared_features = self.shared_layers(x)
 
-            optimizer.zero_grad()
+        # Three independent binary classifiers (sigmoid outputs in [0, 1])
+        outputs = [head(shared_features) for head in self.output_heads]
 
-            # Generate random noise for this batch: r ~ Uniform[-1, 1]
-            N = inputs.size(0)
-            r = torch.rand(N, 3, device=device) * 2 - 1  # Shape: (batch_size, 3)
+        # Concatenate to [batch_size, 3]
+        probs = torch.cat(outputs, dim=1)
 
-            # Compute noisy magnitudes: (1 + 0.05*r) * abs(targets)
-            noisy_magnitudes = (1 + 0.05 * r) *torch.abs(targets)  # Shape: (batch_size, 3)
+        # Store probabilities for loss computation
+        self.last_sign_probs = probs
 
-            # Modify inputs: concatenate [a, b, t] with noisy magnitudes
-            inputs_modified = torch.cat([inputs, noisy_magnitudes], dim=1)  # Shape: (batch_size, 6)
+        # Convert probabilities to signs: [0, 1] -> [-1, 1]
+        signs = 2 * probs - 1
 
-            # Compute target values: (1 + 0.05*r) * targets (signed values)
-            targets_modified = (1 + 0.05 * r) * targets  # Shape: (batch_size, 3)
+        # Extract input magnitudes (last 3 features)
+        input_magnitudes = x[:, 3:]  # Shape: (batch_size, 3)
 
-            # Forward pass
-            outputs = model(inputs_modified)
+        # Reconstruct signed values: sign * magnitude
+        predictions = signs * input_magnitudes
 
-            # Prepare loss arguments
-            loss_args = {}
-            if loss_fn.has_loss("SignMSE"):
-                loss_args["SignMSE"] = (outputs, targets_modified)
-            if loss_fn.has_loss("SignBCE"):
-                # Get sigmoid probabilities stored by model
-                sigmoid_probs = model.last_sign_probs
-                loss_args["SignBCE"] = (sigmoid_probs, targets_modified)
+        return predictions
 
-            # Compute loss
-            loss, loss_dict = loss_fn(loss_args)
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item() * inputs.size(0)
 
-            # Compute sign accuracy
-            with torch.no_grad():
-                pred_signs = torch.sign(outputs)
-                target_signs = torch.sign(targets_modified)
-                sign_accuracy = (pred_signs == target_signs).float().mean()
-                train_sign_accuracy += sign_accuracy.item() * inputs.size(0)
-                train_samples += inputs.size(0)
+class ResidualBlock(nn.Module):
+    """Residual block with two linear layers and skip connection
 
-            # Accumulate loss components
-            for key, value in loss_dict.items():
-                if key not in train_loss_components:
-                    train_loss_components[key] = 0.0
-                train_loss_components[key] += value * inputs.size(0)
+    Architecture: x → fc1 → act → BN → dropout → fc2 → BN → dropout → (+shortcut) → act
+    """
 
-            # Update progress bar with current loss and sign accuracy
-            train_pbar.set_postfix({'loss': f'{loss.item():.4e}', 'sign_acc': f'{sign_accuracy.item():.4f}'})
+    def __init__(self, in_dim, mid_dim, out_dim, activation, dropout=0.3):
+        super().__init__()
 
-        # Print the last output and last ground truth of the inputs and targets
-        print("Last batch - input_mags:", inputs_modified[-1, 3:].detach().cpu().numpy(), "outputs:", outputs[-1].detach().cpu().numpy(), "targets:", targets_modified[-1].detach().cpu().numpy())
+        # First layer: in_dim → mid_dim
+        self.fc1 = nn.Linear(in_dim, mid_dim)
+        self.act1 = activation()
+        self.bn1 = nn.BatchNorm1d(mid_dim)
+        self.dropout1 = nn.Dropout(dropout)
 
-        train_loss /= len(train_loader.dataset)
-        train_sign_accuracy /= train_samples
+        # Second layer: mid_dim → out_dim
+        self.fc2 = nn.Linear(mid_dim, out_dim)
+        self.bn2 = nn.BatchNorm1d(out_dim)
+        self.dropout2 = nn.Dropout(dropout)
 
-        # Calculate average loss components
-        for key in train_loss_components:
-            train_loss_components[key] /= len(train_loader.dataset)
+        # Shortcut connection: in_dim → out_dim
+        if in_dim != out_dim:
+            self.shortcut = nn.Linear(in_dim, out_dim)
+        else:
+            self.shortcut = nn.Identity()
 
-        # Log training results to file (before validation)
-        log_dict = {
-            'epoch': epoch + 1,
-            'outputs': outputs[-1],  # Last batch last sample
-            'targets': targets[-1],
-            'train_loss': train_loss
+        # Activation after residual addition
+        self.act2 = activation()
+
+    def forward(self, x):
+        # Main path
+        out = self.fc1(x)
+        out = self.act1(out)
+        out = self.bn1(out)
+        out = self.dropout1(out)
+
+        out = self.fc2(out)
+        out = self.bn2(out)
+        out = self.dropout2(out)
+
+        # Shortcut path
+        shortcut = self.shortcut(x)
+
+        # Residual addition
+        out = out + shortcut
+        out = self.act2(out)
+
+        return out
+
+
+class ExponentialSignNN_ver3(nn.Module):
+    """Binary Classification Network with Residual Connections
+
+    Adds residual blocks to ExponentialSignNN_ver2 architecture.
+    - If hidden_dims has <= 2 layers: No residual connections (simple sequential)
+    - If hidden_dims has > 2 layers: Group layers in pairs for residual blocks
+
+    Uses sigmoid outputs and BCE loss for sign classification.
+    """
+
+    def __init__(self, hidden_dims=[128, 64, 32], activation='relu', dropout=0.3):
+        super().__init__()
+
+        # Choose activation function
+        if activation == 'tanh':
+            act = nn.Tanh
+        elif activation == 'elu':
+            act = nn.ELU
+        elif activation == 'relu':
+            act = nn.ReLU
+        else:
+            act = nn.ReLU
+
+        input_dim = 6  # [a, b, t, noisy_mag_x, noisy_mag_v, noisy_mag_a]
+
+        # Decide whether to use residual blocks
+        if len(hidden_dims) <= 2:
+            # Simple sequential layers (no residual)
+            self.use_residual = False
+            layers = []
+            for hidden_dim in hidden_dims:
+                layers.append(nn.Linear(input_dim, hidden_dim))
+                layers.append(act())
+                layers.append(nn.BatchNorm1d(hidden_dim))
+                layers.append(nn.Dropout(dropout))
+                input_dim = hidden_dim
+            self.shared_layers = nn.Sequential(*layers)
+        else:
+            # Build residual blocks
+            self.use_residual = True
+            self.blocks = nn.ModuleList()
+
+            # Pair up hidden_dims for residual blocks
+            # Example: [128, 64, 32] → pairs: [(6,128,64)], remaining: [32]
+            # Example: [128, 64, 32, 16] → pairs: [(6,128,64), (64,32,16)]
+            dims = [input_dim] + hidden_dims
+            i = 0
+            while i + 2 < len(dims):
+                # Create residual block for dims[i] → dims[i+1] → dims[i+2]
+                block = ResidualBlock(dims[i], dims[i+1], dims[i+2], act, dropout)
+                self.blocks.append(block)
+                i += 2
+
+            # Handle remaining layer if odd number
+            if i + 1 < len(dims):
+                # Add simple layer: dims[i] → dims[i+1]
+                remaining_layer = nn.Sequential(
+                    nn.Linear(dims[i], dims[i+1]),
+                    act(),
+                    nn.BatchNorm1d(dims[i+1]),
+                    nn.Dropout(dropout)
+                )
+                self.blocks.append(remaining_layer)
+                input_dim = dims[i+1]
+            else:
+                input_dim = dims[i]
+
+        # Output heads (one for each of the 3 outputs)
+        num_outputs = 3
+        self.output_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(input_dim, 16),
+                act(),
+                nn.Linear(16, 1),
+                nn.Sigmoid()
+            )
+            for _ in range(num_outputs)
+        ])
+
+        # Initialize weights
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_normal_(m.weight)
+            nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (batch_size, 6)
+               [a, b, t, (1+0.05*r)*abs(x_t), (1+0.05*r)*abs(v_t), (1+0.05*r)*abs(a_t)]
+
+        Returns:
+            predictions: Output tensor of shape (batch_size, 3)
+                        Reconstructed signed values: sign_from_probs * input_magnitudes
+        """
+        # Save original input to extract magnitudes later
+        original_input = x
+
+        # Shared feature extraction
+        if self.use_residual:
+            # Pass through residual blocks
+            for block in self.blocks:
+                x = block(x)
+            shared_features = x
+        else:
+            # Pass through sequential layers
+            shared_features = self.shared_layers(x)
+
+        # Three independent binary classifiers (sigmoid outputs in [0, 1])
+        outputs = [head(shared_features) for head in self.output_heads]
+
+        # Concatenate to [batch_size, 3]
+        probs = torch.cat(outputs, dim=1)
+
+        # Store probabilities for loss computation
+        self.last_sign_probs = probs
+
+        # Convert probabilities to signs: [0, 1] -> [-1, 1]
+        signs = 2 * probs - 1
+
+        # Extract input magnitudes from original input (last 3 features)
+        input_magnitudes = original_input[:, 3:]  # Shape: (batch_size, 3)
+
+        # Reconstruct signed values: sign * magnitude
+        predictions = signs * input_magnitudes
+
+        return predictions
+
+
+class ExponentialSignNN_ver4(nn.Module):
+    """Binary Classification Network with Residual Connections (3-input version)
+
+    Modified version of ExponentialSignNN_ver3 that:
+    - Takes only 3 inputs: [a, b, t] (no magnitude inputs)
+    - Outputs sign predictions directly (not multiplied by magnitudes)
+    - Uses identity tensor instead of input magnitudes
+
+    Uses sigmoid outputs and BCE loss for sign classification.
+    """
+
+    def __init__(self, hidden_dims=[128, 64, 32], activation='relu', dropout=0.3):
+        super().__init__()
+
+        # Choose activation function
+        if activation == 'tanh':
+            act = nn.Tanh
+        elif activation == 'elu':
+            act = nn.ELU
+        elif activation == 'relu':
+            act = nn.ReLU
+        else:
+            act = nn.ReLU
+
+        input_dim = 3  # [a, b, t] only
+
+        # Decide whether to use residual blocks
+        if len(hidden_dims) <= 2:
+            # Simple sequential layers (no residual)
+            self.use_residual = False
+            layers = []
+            for hidden_dim in hidden_dims:
+                layers.append(nn.Linear(input_dim, hidden_dim))
+                layers.append(act())
+                layers.append(nn.BatchNorm1d(hidden_dim))
+                layers.append(nn.Dropout(dropout))
+                input_dim = hidden_dim
+            self.shared_layers = nn.Sequential(*layers)
+        else:
+            # Build residual blocks
+            self.use_residual = True
+            self.blocks = nn.ModuleList()
+
+            # Pair up hidden_dims for residual blocks
+            # Example: [128, 64, 32] → pairs: [(3,128,64)], remaining: [32]
+            # Example: [128, 64, 32, 16] → pairs: [(3,128,64), (64,32,16)]
+            dims = [input_dim] + hidden_dims
+            i = 0
+            while i + 2 < len(dims):
+                # Create residual block for dims[i] → dims[i+1] → dims[i+2]
+                block = ResidualBlock(dims[i], dims[i+1], dims[i+2], act, dropout)
+                self.blocks.append(block)
+                i += 2
+
+            # Handle remaining layer if odd number
+            if i + 1 < len(dims):
+                # Add simple layer: dims[i] → dims[i+1]
+                remaining_layer = nn.Sequential(
+                    nn.Linear(dims[i], dims[i+1]),
+                    act(),
+                    nn.BatchNorm1d(dims[i+1]),
+                    nn.Dropout(dropout)
+                )
+                self.blocks.append(remaining_layer)
+                input_dim = dims[i+1]
+            else:
+                input_dim = dims[i]
+
+        # Output heads (one for each of the 3 outputs)
+        num_outputs = 3
+        self.output_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(input_dim, 16),
+                act(),
+                nn.Linear(16, 1),
+                nn.Sigmoid()
+            )
+            for _ in range(num_outputs)
+        ])
+
+        # Initialize weights
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_normal_(m.weight)
+            nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (batch_size, 3)
+               [a, b, t]
+
+        Returns:
+            predictions: Output tensor of shape (batch_size, 3)
+                        Sign predictions: values in [-1, 1]
+        """
+        # Shared feature extraction
+        if self.use_residual:
+            # Pass through residual blocks
+            for block in self.blocks:
+                x = block(x)
+            shared_features = x
+        else:
+            # Pass through sequential layers
+            shared_features = self.shared_layers(x)
+
+        # Three independent binary classifiers (sigmoid outputs in [0, 1])
+        outputs = [head(shared_features) for head in self.output_heads]
+
+        # Concatenate to [batch_size, 3]
+        probs = torch.cat(outputs, dim=1)
+
+        # Store probabilities for loss computation
+        self.last_sign_probs = probs
+
+        # Convert probabilities to signs: [0, 1] -> [-1, 1]
+        signs = 2 * probs - 1
+
+        # Return signs directly (no magnitude multiplication)
+        predictions = signs
+
+        return predictions
+
+
+class BaseLossComponent(ABC, nn.Module):
+    """Abstract base class for loss components"""
+
+    def __init__(self, weight=1.0, name="base"):
+        super().__init__()
+        self.weight = weight
+        self.name = name
+        self.enabled = weight > 0
+
+    @abstractmethod
+    def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None):
+        pass
+
+    def forward(self, predictions, targets, inputs, norm_params=None, inputs_real=None):
+        if not self.enabled:
+            return torch.tensor(0.0, device=predictions.device)
+        loss = self.compute(predictions, targets, inputs, norm_params, inputs_real)
+        return self.weight * loss
+
+    def __repr__(self):
+        status = "✓" if self.enabled else "✗"
+        return f"{self.name:20s}: weight={self.weight:.3f} {status}"
+
+
+class SignMSELoss(BaseLossComponent):
+    """Sign MSE loss - only compares signs of predictions vs targets"""
+
+    def __init__(self, weight=1.0):
+        super().__init__(weight=weight, name="Sign MSE Loss")
+
+    def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None):
+        """
+        Compute sign MSE between predictions and targets
+
+        Args:
+            predictions: (batch_size, 3) - Predicted signed values (sign * magnitude)
+            targets: (batch_size, 3) - Target signed values
+
+        Returns:
+            loss: Scalar tensor - MSE between normalized signs
+        """
+        eps = 1e-10
+
+        # Extract signs from targets
+        target_signs = torch.sign(targets).float()  # Shape: [batch, 3], values: -1, 0, +1
+
+        # Extract signs from predictions (normalize to [-1, 1])
+        pred_signs = predictions / (torch.abs(predictions) + eps)  # Normalize to [-1, 1]
+
+        # Compute sign MSE loss
+        sign_mse_loss =torch.sqrt(torch.mean((pred_signs - target_signs) ** 2))
+
+        return sign_mse_loss
+
+
+class SignBCELoss(BaseLossComponent):
+    """Sign BCE loss - uses binary cross entropy for sign classification"""
+
+    def __init__(self, weight=1.0):
+        super().__init__(weight=weight, name="Sign BCE Loss")
+        self.criterion = nn.BCELoss()
+
+    def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None):
+        """
+        Compute sign BCE between sigmoid probabilities and target signs
+
+        Args:
+            predictions: Not used (placeholder for signature compatibility)
+            targets: (batch_size, num_outputs) - Target signed values
+            inputs: (batch_size, num_outputs) - Sigmoid probabilities from model.last_sign_probs
+
+        Returns:
+            loss: Scalar tensor - Sum of BCE losses for all outputs
+        """
+        # Get sigmoid probabilities (stored by model during forward pass)
+        sigmoid_probs = inputs  # Shape: [batch, num_outputs], values in [0, 1]
+
+        # Convert target signs to binary labels: {-1, +1} -> {0, 1}
+        # Zeros are treated as positive (label=1.0)
+        # Use targets.dtype to match the dtype (float32 or float64)
+        target_signs = torch.sign(targets).to(dtype=targets.dtype)  # Shape: [batch, num_outputs], values: -1, 0, +1
+        labels = (target_signs >= 0).to(dtype=targets.dtype)  # Shape: [batch, num_outputs], values: 0 or 1
+
+        # Compute BCE for each output and sum
+        num_outputs = sigmoid_probs.shape[1]
+        total_bce_loss = sum(
+            self.criterion(sigmoid_probs[:, i], labels[:, i])
+            for i in range(num_outputs)
+        )
+
+        return total_bce_loss
+
+
+class ExponentialPINNLoss(nn.Module):
+    """
+    Loss function wrapper for Sign Classification Network
+
+    Usage:
+        # Configuration
+        loss_config = {
+            "SignMSE": {"weight": 1.0},  # For ExponentialSignNN
+            "SignBCE": {"weight": 1.0}   # For ExponentialSignNN_ver2
         }
-        log_training_results(log_dict, results_folder=results_figure_folder, filename='training_explog.txt')
 
-        # Validation loop
-        model.eval()
-        val_loss = 0.0
-        val_loss_components = {}
-        val_sign_accuracy = 0.0
-        val_samples = 0
+        # Create loss function
+        loss_fn = ExponentialPINNLoss(model, loss_config)
 
-        with torch.no_grad():
-            # Validation progress bar
-            val_pbar = tqdm(val_loader, desc=f"Validation", leave=False)
-            for inputs, targets in val_pbar:
-                # Move data to device
-                inputs, targets = inputs.to(device), targets.to(device)
+        # In training loop (for SignMSE)
+        loss_args = {"SignMSE": (outputs, targets)}
+        # OR (for SignBCE)
+        loss_args = {"SignBCE": (sigmoid_probs, targets)}
 
-                # Generate random noise for this batch: r ~ Uniform[-1, 1]
-                N = inputs.size(0)
-                r = torch.rand(N, 3, device=device) * 2 - 1  # Shape: (batch_size, 3)
+        total_loss, loss_summary = loss_fn(loss_args)
+    """
 
-                # Compute noisy magnitudes: (1 + 0.05*r) * abs(targets)
-                noisy_magnitudes = (1 + 0.05 * r) * torch.abs(targets)  # Shape: (batch_size, 3)
+    def __init__(self, model, loss_config):
+        super().__init__()
 
-                # Modify inputs: concatenate [a, b, t] with noisy magnitudes
-                inputs_modified = torch.cat([inputs, noisy_magnitudes], dim=1)  # Shape: (batch_size, 6)
+        self.model = model
+        self.loss_config = loss_config
+        self.loss_components = {}
 
-                # Compute target values: (1 + 0.05*r) * targets (signed values)
-                targets_modified = (1 + 0.05 * r) * targets  # Shape: (batch_size, 3)
+        # Initialize SignMSE loss if requested
+        if self._should_enable("SignMSE"):
+            config = self.loss_config.get("SignMSE")
+            weight = config.get("weight", 1.0)
+            self.loss_components["SignMSE"] = SignMSELoss(weight=weight)
 
-                # Forward pass
-                outputs = model(inputs_modified)
+        # Initialize SignBCE loss if requested
+        if self._should_enable("SignBCE"):
+            config = self.loss_config.get("SignBCE")
+            weight = config.get("weight", 1.0)
+            self.loss_components["SignBCE"] = SignBCELoss(weight=weight)
 
-                # Prepare loss arguments
-                loss_args = {}
-                if loss_fn.has_loss("SignMSE"):
-                    loss_args["SignMSE"] = (outputs, targets_modified)
-                if loss_fn.has_loss("SignBCE"):
-                    # Get sigmoid probabilities stored by model
-                    sigmoid_probs = model.last_sign_probs
-                    loss_args["SignBCE"] = (sigmoid_probs, targets_modified)
+        # Print configuration
+        self._print_config()
 
-                # Compute loss
-                loss, loss_dict = loss_fn(loss_args)
-                val_loss += loss.item() * inputs.size(0)
+    def _should_enable(self, loss_name):
+        """Check if a loss should be enabled"""
+        config = self.loss_config.get(loss_name, None)
+        if config is None:
+            return False
+        if config.get("weight", 0) == 0:
+            return False
+        return True
 
-                # Compute sign accuracy
-                pred_signs = torch.sign(outputs)
-                target_signs = torch.sign(targets_modified)
-                sign_accuracy = (pred_signs == target_signs).float().mean()
-                val_sign_accuracy += sign_accuracy.item() * inputs.size(0)
-                val_samples += inputs.size(0)
+    def has_loss(self, loss_name):
+        """Check if a loss component is enabled"""
+        return loss_name in self.loss_components
 
-                # Accumulate loss components
-                for key, value in loss_dict.items():
-                    if key not in val_loss_components:
-                        val_loss_components[key] = 0.0
-                    val_loss_components[key] += value * inputs.size(0)
+    def forward(self, loss_args):
+        """
+        Compute total loss from arguments dictionary
 
-                # Update progress bar with current loss and sign accuracy
-                val_pbar.set_postfix({'loss': f'{loss.item():.4e}', 'sign_acc': f'{sign_accuracy.item():.4f}'})
+        Args:
+            loss_args: Dictionary with loss arguments
+                {
+                    "SignMSE": (outputs, targets),
+                    "SignBCE": (sigmoid_probs, targets)
+                }
 
-        val_loss /= len(val_loader.dataset)
+        Returns:
+            total_loss: Scalar tensor
+            loss_summary: Dictionary with individual loss values
+        """
+        total_loss = 0.0
+        loss_summary = {}
 
-        # Calculate average loss components
-        for key in val_loss_components:
-            val_loss_components[key] /= len(val_loader.dataset)
+        # SignMSE Loss
+        if "SignMSE" in self.loss_components and "SignMSE" in loss_args:
+            outputs, targets = loss_args["SignMSE"]
+            sign_mse_value = self.loss_components["SignMSE"](
+                outputs, targets, None, None, None
+            )
+            total_loss += sign_mse_value
+            loss_summary["sign_mse_loss"] = sign_mse_value.item()
 
-        lr_scheduler.step()
+        # SignBCE Loss
+        if "SignBCE" in self.loss_components and "SignBCE" in loss_args:
+            sigmoid_probs, targets = loss_args["SignBCE"]
+            sign_bce_value = self.loss_components["SignBCE"](
+                None, targets, sigmoid_probs, None, None
+            )
+            total_loss += sign_bce_value
+            loss_summary["sign_bce_loss"] = sign_bce_value.item()
 
-        # Print epoch summary
-        print(f"Epoch [{epoch+1}/{epochs}] - Model: {os.path.basename(model_save_path)}")
-        print(f"  Train: Loss={train_loss:.4e}, Sign Acc={train_sign_accuracy:.4f}")
-        print(f"  Val  : Loss={val_loss:.4e}, Sign Acc={val_sign_accuracy:.4f}")
+        loss_summary["total"] = total_loss.item()
 
-        # Save the model if combined loss (train + val) has improved
-        combined_loss = train_loss + val_loss
-        if combined_loss < best_combined_loss:
-            best_combined_loss = combined_loss
-            torch.save(model.state_dict(), model_save_path)
-            print(f"New best model saved with combined loss: {combined_loss:.4e} (train: {train_loss:.4e}, val: {val_loss:.4e})")
+        return total_loss, loss_summary
 
-    # Testing loop
-    print("\nRunning test evaluation on the best model...")
-    # Load the best model for testing
-    model.load_state_dict(torch.load(model_save_path))
-    model.eval()
-    test_loss = 0.0
-    test_sign_accuracy = 0.0
-    test_samples = 0
+    def _print_config(self):
+        """Print loss configuration"""
+        print(f"\n{'='*60}")
+        print("Sign Classification Network Loss Configuration:")
+        print(f"{'='*60}")
 
-    with torch.no_grad():
-        # Test progress bar
-        test_pbar = tqdm(test_loader, desc="Testing", leave=True)
-        for inputs, targets in test_pbar:
-            # Move data to device
-            inputs, targets = inputs.to(device), targets.to(device)
+        for loss_name in ["SignMSE", "SignBCE"]:
+            if loss_name in self.loss_components:
+                weight = self.loss_config.get(loss_name).get("weight", 1.0)
+                print(f"  ✓ {loss_name:20s}: weight={weight:.3f}")
+            else:
+                print(f"  ✗ {loss_name:20s}: disabled")
 
-            # Generate random noise for this batch: r ~ Uniform[-1, 1]
-            N = inputs.size(0)
-            r = torch.rand(N, 3, device=device) * 2 - 1  # Shape: (batch_size, 3)
-
-            # Compute noisy magnitudes: (1 + 0.05*r) * abs(targets)
-            noisy_magnitudes = (1 + 0.05 * r) * torch.abs(targets)  # Shape: (batch_size, 3)
-
-            # Modify inputs: concatenate [a, b, t] with noisy magnitudes
-            inputs_modified = torch.cat([inputs, noisy_magnitudes], dim=1)  # Shape: (batch_size, 6)
-
-            # Compute target values: (1 + 0.05*r) * targets (signed values)
-            targets_modified = (1 + 0.05 * r) * targets  # Shape: (batch_size, 3)
-
-            # Forward pass
-            outputs = model(inputs_modified)
-
-            # Prepare loss arguments
-            loss_args = {}
-            if loss_fn.has_loss("SignMSE"):
-                loss_args["SignMSE"] = (outputs, targets_modified)
-            if loss_fn.has_loss("SignBCE"):
-                # Get sigmoid probabilities stored by model
-                sigmoid_probs = model.last_sign_probs
-                loss_args["SignBCE"] = (sigmoid_probs, targets_modified)
-
-            # Compute loss
-            loss, loss_dict = loss_fn(loss_args)
-            test_loss += loss.item() * inputs.size(0)
-
-            # Compute sign accuracy
-            pred_signs = torch.sign(outputs)
-            target_signs = torch.sign(targets_modified)
-            sign_accuracy = (pred_signs == target_signs).float().mean()
-            test_sign_accuracy += sign_accuracy.item() * inputs.size(0)
-            test_samples += inputs.size(0)
-
-            # Update progress bar with current loss and sign accuracy
-            test_pbar.set_postfix({'loss': f'{loss.item():.4e}', 'sign_acc': f'{sign_accuracy.item():.4f}'})
-
-    test_loss /= len(test_loader.dataset)
-    test_sign_accuracy /= test_samples
-    print(f"\nTest Loss: {test_loss:.4e}, Test Sign Accuracy: {test_sign_accuracy:.4f}")
-
-    # Generate prediction performance plots
-    prediction_performance(
-        data_path=Plot_data_source,
-        model_pt_path=model_save_path,
-        model=model,
-        normalizer=train_val_inputs_normalizer,
-        device=device,
-        data_sampling_step=100,
-        figure_folder=results_figure_folder
-    )
-
-if __name__ == "__main__":
-    main()
+        print(f"{'='*60}\n")

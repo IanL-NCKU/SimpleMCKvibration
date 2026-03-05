@@ -2,6 +2,28 @@ import torch
 import torch.nn as nn
 import numpy as np
 from abc import ABC, abstractmethod
+from Exp_dataset import generalize_alpha, generalize_beta
+
+class SignWithHardTanh(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        # 1. Forward pass: use sign function for binarization
+        ctx.save_for_backward(x)
+        return torch.sign(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # 2. Backward pass: load x and compute HardTanh derivative (Rectangular gradient)
+        x, = ctx.saved_tensors
+        
+        # HardTanh(-1, 1) derivative: 1 between [-1, 1], 0 elsewhere
+        # This is equivalent to (x < 1) & (x > -1)
+        grad_input = grad_output.clone()
+        grad_input[x.abs() > 1.0] = 0
+        
+        # Gradient value remains 1
+        # return grad_input * 1.0  # Which is just grad_input
+        return grad_input
 
 
 class ResidualBlock(nn.Module):
@@ -667,15 +689,15 @@ class ExponentialPINN_ver3(nn.Module):
         # Build fine-tune network (if enabled)
         if self.use_finetune:
             finetune_layers = []
-            finetune_input_dim = 6  # [a, b, t, x_base, v_base, a_base]
-
+            finetune_input_dim = 9  # [a, b, t, sign_prob_x, sign_prob_v, sign_prob_a, mag_x, mag_v, mag_a]
+            finetune_act = nn.Tanh
             for hidden_dim in finetune_hidden_dims:
                 finetune_layers.append(nn.Linear(finetune_input_dim, hidden_dim))
-                finetune_layers.append(act())
+                finetune_layers.append(finetune_act())
                 finetune_input_dim = hidden_dim
 
             finetune_layers.append(nn.Linear(finetune_input_dim, 3))
-            finetune_layers.append(nn.Softplus())
+            # finetune_layers.append(nn.Tanh())
 
             self.finetune_network = nn.Sequential(*finetune_layers)
         else:
@@ -698,10 +720,36 @@ class ExponentialPINN_ver3(nn.Module):
         # Initialize weights
         self.apply(self._init_weights)
 
+        # Freeze finetune network initially (will be unfrozen later in training)
+        # if self.use_finetune:
+        #     self.freeze_finetune_network()
+
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             nn.init.xavier_normal_(m.weight)
             nn.init.zeros_(m.bias)
+
+    def freeze_finetune_network(self):
+        """Freeze finetune network parameters to prevent optimization"""
+        if self.finetune_network is not None:
+            for param in self.finetune_network.parameters():
+                param.requires_grad = False
+
+    def unfreeze_finetune_network(self):
+        """Unfreeze finetune network parameters to enable optimization"""
+        if self.finetune_network is not None:
+            for param in self.finetune_network.parameters():
+                param.requires_grad = True
+
+    def freeze_magnitude_network(self):
+        """Freeze magnitude network (main network) parameters to prevent optimization"""
+        for param in self.network.parameters():
+            param.requires_grad = False
+
+    def unfreeze_magnitude_network(self):
+        """Unfreeze magnitude network (main network) parameters to enable optimization"""
+        for param in self.network.parameters():
+            param.requires_grad = True
 
     def forward(self, x):
         """
@@ -713,9 +761,10 @@ class ExponentialPINN_ver3(nn.Module):
             mag_preds: Magnitude predictions (batch_size, 3)
             logabs_sign_pred: Sign predictions for log-abs values (batch_size, 3)
             real_sign_pred: Sign predictions for real values (batch_size, 3)
+            ft_cal: Calibration factors (batch_size, 3) - ones if use_finetune=False
         """
         output = self.network(x)
-
+        ln10 = np.log(10.0)  # Python float, PyTorch handles device automatically
         # Step 1: Convert network output to real space (base predictions)
         if self.use_log_output:
             # Network outputs: [sign_x, log_x, sign_v, log_v, sign_a, log_a]
@@ -729,7 +778,7 @@ class ExponentialPINN_ver3(nn.Module):
             log_a = output[:, 5:6]
 
             # Transform to real space: x = sign * 10^log = sign * exp(log * ln(10))
-            ln10 = np.log(10.0)  # Python float, PyTorch handles device automatically
+            
             x_pred_base = sign_x * torch.exp(log_x * ln10)
             v_pred_base = sign_v * torch.exp(log_v * ln10)
             a_pred_base = sign_a * torch.exp(log_a * ln10)
@@ -739,27 +788,12 @@ class ExponentialPINN_ver3(nn.Module):
             v_pred_base = output[:, 1:2]
             a_pred_base = output[:, 2:3]
 
-        # Step 2: Apply fine-tuning (independent of log_output setting)
-        if self.use_finetune:
-            # Ensure concatenation doesn't break gradient flow
-            base_preds = torch.cat([x_pred_base, v_pred_base, a_pred_base], dim=1)
-            finetune_input = torch.cat([x, base_preds], dim=1)
-
-            finetune_raw = self.finetune_network(finetune_input)
-            finetune_corrections = self.finetune_scale * finetune_raw
-
-            # Apply multiplicative correction
-            x_pred = x_pred_base * (1 + finetune_corrections[:, 0:1])
-            v_pred = v_pred_base * (1 + finetune_corrections[:, 1:2])
-            a_pred = a_pred_base * (1 + finetune_corrections[:, 2:3])
-        else:
-            x_pred = x_pred_base
-            v_pred = v_pred_base
-            a_pred = a_pred_base
+        # Step 2: Compute base magnitude predictions
+        # mag_preds is just base predictions, NO calibration applied in forward pass
+        mag_preds = torch.cat([x_pred_base, v_pred_base, a_pred_base], dim=1)
 
         # Step 3: Apply logabs sign network
         # Prepare input: concatenate [a, b, t] + current magnitude predictions (detached)
-        mag_preds = torch.cat([x_pred, v_pred, a_pred], dim=1)
         logabs_sign_input = torch.cat([x, mag_preds.detach()], dim=1)  # Shape: [batch, 6]
 
         # Get logabs sign predictions from ExponentialSignNN_ver3
@@ -774,8 +808,20 @@ class ExponentialPINN_ver3(nn.Module):
         # Store sigmoid probabilities for real sign BCE loss computation
         self.real_last_sign_probs = self.real_sign_network.last_sign_probs
 
-        # Return magnitude and both sign predictions separately
-        return mag_preds, logabs_sign_pred, real_sign_pred
+        # Step 5: Compute calibration factors (independent network with selective detach)
+        if self.use_finetune:
+            # Selectively detach: keep x attached for consistency loss gradients, detach sign_probs and mag_preds to prevent ft_cal_loss from tuning them
+            finetune_input = torch.cat([x, self.logabs_last_sign_probs.detach(), mag_preds.detach()], dim=1)  # Shape: [batch, 9]
+            
+            ft_cal_raw = self.finetune_network(finetune_input)/self.finetune_scale  # Shape: [batch, 3]
+            # use tanh to constrain calibration factors to (-1, 1)
+            ft_cal = ln10* torch.tanh(ft_cal_raw)
+        else:
+            # Return zeros when finetune disabled (identity calibration)
+            ft_cal = torch.zeros_like(mag_preds)
+
+        # Return magnitude, both sign predictions, and calibration factors separately
+        return mag_preds, logabs_sign_pred, real_sign_pred, ft_cal
 
 
 class BaseLossComponent(ABC, nn.Module):
@@ -788,13 +834,13 @@ class BaseLossComponent(ABC, nn.Module):
         self.enabled = weight > 0
 
     @abstractmethod
-    def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None, real_sign_probs=None):
+    def compute(self, predictions, targets, **kwargs):
         pass
 
-    def forward(self, predictions, targets, inputs, norm_params=None, inputs_real=None, real_sign_probs=None):
+    def forward(self, predictions, targets, **kwargs):
         if not self.enabled:
             return torch.tensor(0.0, device=predictions.device)
-        loss = self.compute(predictions, targets, inputs, norm_params, inputs_real, real_sign_probs)
+        loss = self.compute(predictions, targets, **kwargs)
         return self.weight * loss
 
     def __repr__(self):
@@ -805,28 +851,34 @@ class BaseLossComponent(ABC, nn.Module):
 class MSELoss(BaseLossComponent):
     """Mean Squared Error loss between predictions and targets"""
 
-    def __init__(self, weight=1.0, use_relative=False, use_log=False, sign_bce_weight=1.0, real_sign_bce_weight=1.0):
+    def __init__(self, weight=1.0, use_relative=False, use_log=False, sign_bce_weight=1.0, real_sign_bce_weight=1.0, ft_cal_weight=1.0, use_finetune_loss=True):
         super().__init__(weight=weight, name="MSE Loss")
         self.use_relative = use_relative
         self.use_log = use_log
+        self.ft_cal_weight = ft_cal_weight
+        self.use_finetune_loss = use_finetune_loss
         # Create SignBCELoss instances for both logabs and real sign loss computation
         self.logabs_sign_bce_loss = SignBCELoss(weight=sign_bce_weight) if sign_bce_weight > 0 else None
         self.real_sign_bce_loss = SignBCELoss(weight=real_sign_bce_weight) if real_sign_bce_weight > 0 else None
+        # Create L1Loss for ft_cal calibration loss (MAE)
+        self.ft_cal_criterion = nn.L1Loss()
 
-    def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None, real_sign_probs=None):
+    def compute(self, predictions, targets, logabs_sigmoid_probs=None,
+                real_sign_probs=None, ft_cal=None, **kwargs):
         """
-        Compute MSE between predictions and targets with dual sign BCE losses
+        Compute MSE between predictions and targets with dual sign BCE losses and ft_cal loss
 
         Args:
             predictions: (batch_size, 3) - mag_preds (positive magnitudes)
             targets: (batch_size, 6) - complete targets [real_signs (0-2), logabs_values (3-5)]
-            inputs: (batch_size, 3) - logabs_sign_probs (sigmoid probabilities for logabs signs)
+            logabs_sigmoid_probs: (batch_size, 3) - logabs_sign_probs (sigmoid probabilities for logabs signs)
             real_sign_probs: (batch_size, 3) - real_sign_probs (sigmoid probabilities for real signs)
+            ft_cal: (batch_size, 3) - calibration factors from finetune network
 
         Returns:
             loss: Scalar tensor
         """
-        eps = 1e-10
+        eps = 1e-12
 
         if self.use_log:
             # Extract logabs targets (columns 3-5) for magnitude loss
@@ -846,8 +898,7 @@ class MSELoss(BaseLossComponent):
 
             # Compute logabs sign BCE loss
             logabs_sign_bce_value = 0.0
-            if self.logabs_sign_bce_loss is not None and inputs is not None:
-                logabs_sigmoid_probs = inputs  # This is logabs_last_sign_probs passed from training loop
+            if self.logabs_sign_bce_loss is not None and logabs_sigmoid_probs is not None:
                 logabs_sign_bce_value = self.logabs_sign_bce_loss(logabs_sigmoid_probs, logabs_targets)
 
             # Compute real sign BCE loss
@@ -856,13 +907,31 @@ class MSELoss(BaseLossComponent):
                 real_sign_targets = targets[:, :3]  # Extract real signs (columns 0-2)
                 real_sign_bce_value = self.real_sign_bce_loss(real_sign_probs, real_sign_targets)
 
+            # Compute ft_cal loss (additive calibration in log-space)
+            ft_cal_loss_value = 0.0
+            if self.use_finetune_loss and self.ft_cal_weight > 0 and ft_cal is not None:
+                # Use torch.sign on logabs_sign_probs (shifted to [-1, 1] range)
+                # logabs_sigmoid_probs is in [0, 1], shift to [-0.5, 0.5] then use sign
+                logabs_sign = torch.sign(logabs_sigmoid_probs - 0.5)
+
+                # Additive calibration: calibrated = signed_mag_preds + ft_cal
+                # signed_mag_preds = (logabs_sign * predictions).detach()
+                unsigned_mag_preds = predictions.detach() 
+                calibrated_preds = unsigned_mag_preds + ft_cal  # Only ft_cal has gradient
+
+                # MAE loss using nn.L1Loss
+                ft_cal_loss_value = self.ft_cal_criterion(torch.abs(calibrated_preds), torch.abs(logabs_targets))
+                # ft_cal_loss_value = self.ft_cal_criterion(torch.abs(calibrated_preds)/torch.abs(logabs_targets), logabs_targets*0 + 1.0)
+                ft_cal_loss_value = self.ft_cal_weight * ft_cal_loss_value
+
             # Store component losses for detailed reporting
             self.last_magnitude_loss = magnitude_loss.item()
             self.last_logabs_sign_bce_loss = logabs_sign_bce_value.item() if isinstance(logabs_sign_bce_value, torch.Tensor) else logabs_sign_bce_value
             self.last_real_sign_bce_loss = real_sign_bce_value.item() if isinstance(real_sign_bce_value, torch.Tensor) else real_sign_bce_value
+            self.last_ft_cal_loss = ft_cal_loss_value.item() if isinstance(ft_cal_loss_value, torch.Tensor) else ft_cal_loss_value
 
-            # Combine all losses: magnitude + logabs sign + real sign
-            loss = magnitude_loss + logabs_sign_bce_value + real_sign_bce_value
+            # Combine all losses: magnitude + logabs sign + real sign + ft_cal
+            loss = magnitude_loss + logabs_sign_bce_value + real_sign_bce_value + ft_cal_loss_value
         else:
             # Standard MSE (not log-space)
             if self.use_relative:
@@ -932,302 +1001,1832 @@ class ExponentialResidualLoss(BaseLossComponent):
         super().__init__(weight=weight, name="Exponential Residual Loss")
         self.use_relative = use_relative
 
-    def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None, real_sign_probs=None):
+    def compute(self, predictions, targets, inputs_real=None, output_normalizer=None, **kwargs):
         """
         Enforce exponential physics equation:
         (1/(2a))*a_t + 0.5*v_t - a*x_t = 0
 
         Args:
-            predictions: (batch_size, 3) - [x_t, v_t, a_t] in real space
+            predictions: (batch_size, 6) - [real_signs (0-2), logabs_values (3-5)] in NORMALIZED log-space
+            targets: Not used (for signature compatibility)
             inputs_real: (batch_size, 3) - [a, b, t] in real space
-            real_sign_probs: Not used (for signature compatibility)
+            output_normalizer: Normalizer instance for manual denormalization
         """
         if inputs_real is None:
             raise ValueError("ExponentialResidualLoss requires inputs_real to be provided")
+        if output_normalizer is None:
+            raise ValueError("ExponentialResidualLoss requires output_normalizer to be provided")
 
-        x_pred = predictions[:, 0]
-        v_pred = predictions[:, 1]
-        a_pred = predictions[:, 2]
+        # Manual denormalization to preserve gradients
+        real_signs = predictions[:, :3]  # (batch_size, 3)
+        logabs_normalized = predictions[:, 3:]  # (batch_size, 3)
+
+        # Extract normalizer statistics as tensors (vectorized)
+        device = predictions.device
+        dtype = predictions.dtype
+
+        # Create tensors for log_mean and log_std for [x, v, a]
+        log_mean = torch.tensor([
+            output_normalizer.log_mean['x'],
+            output_normalizer.log_mean['v'],
+            output_normalizer.log_mean['a']
+        ], device=device, dtype=dtype)  # (3,)
+
+        log_std = torch.tensor([
+            output_normalizer.log_std['x'],
+            output_normalizer.log_std['v'],
+            output_normalizer.log_std['a']
+        ], device=device, dtype=dtype)  # (3,)
+
+        # Denormalize logabs values (vectorized, preserves gradients)
+        logabs_denorm = logabs_normalized * log_std + log_mean  # (batch_size, 3)
+
+        # Convert to real space: real_value = sign * 10^logabs (vectorized)
+        ln10 = torch.tensor(np.log(10.0), device=device, dtype=dtype)
+        # real_values = torch.sign(real_signs) * torch.exp(logabs_denorm * ln10)  # (batch_size, 3)
+        real_values = SignWithHardTanh.apply(real_signs) * torch.exp(logabs_denorm * ln10)  # (batch_size, 3)
+
+        # Extract x, v, a predictions
+        x_pred = real_values[:, 0]#.detach()  # Detach position to prevent gradient issues
+        v_pred = real_values[:, 1]#.detach()  # Detach velocity to prevent gradient issues
+        a_pred = real_values[:, 2]#.detach()  # Detach acceleration to prevent gradient issues
 
         # Extract parameters
         a = inputs_real[:, 0]  # exponential rate
 
-        eps = 1e-10
+        eps = 1e-12
 
         # Physics residual: (1/(2a))*a_t + 0.5*v_t - a*x_t = 0
-        residual = (1.0 / (2.0 * a + eps)) * a_pred + 0.5 * v_pred - a * x_pred
+        residual =(1.0 / (2.0 * a + eps)) * a_pred + 0.5 * v_pred - a * x_pred
+        # residual = torch.log(torch.abs((1.0 / (2.0 * a + eps)) * a_pred)) - torch.log(torch.abs(0.5 * v_pred - a * x_pred)) \
+        #             + torch.log(torch.abs(a * x_pred)) - torch.log(torch.abs((1.0 / (2.0 * a + eps)) * a_pred + 0.5 * v_pred))\
+        #             + torch.log(torch.abs(0.5 * v_pred)) - torch.log(torch.abs(a * x_pred - (1.0 / (2.0 * a + eps)) * a_pred))
 
         if self.use_relative:
             # Scale-invariant relative residual
-            scale = torch.abs(a * x_pred) + eps
+            # Normalize by target's acceleration term: (1/(2a))*a_target
+            # Denormalize targets to get a_target
+            target_real_signs = targets[:, :3]
+            target_logabs_normalized = targets[:, 3:]
+            target_logabs_denorm = target_logabs_normalized * log_std + log_mean
+            target_real_values = target_real_signs * torch.exp(target_logabs_denorm * ln10)
+            a_target = target_real_values[:, 2].detach()  # Detach target to prevent gradient issues
+
+            scale = torch.abs((1.0 / (2.0 * a + eps)) * a_target) + eps
             residual = residual / scale
+        # residual = torch.log(torch.abs(residual) + 1)
+        # return torch.mean(torch.abs(residual))
+        return torch.mean(torch.log(torch.square(residual) + 1))
 
-        return torch.mean(residual ** 2)
 
-
-class ConsistencyLoss_auto_diff(BaseLossComponent):
+class ConsistencyLoss_auto_diff_magver(BaseLossComponent):
     """
-    Derivative consistency: ensure v=dx/dt, a=dv/dt using automatic differentiation
+    Derivative consistency using VERIFIED formulas for log-normalized space training.
 
-    Handles log-normalized time transformation:
-    t_model = (log10(t_real) - mean) / std
+    Ensures v=dx/dt and a=dv/dt using autograd on log-normalized model outputs.
+    Uses verified transformation formulas from check_dataset_consistency() in Exp_dataset.py.
 
-    Chain rule for derivatives:
-    dx/dt_real = dx/dt_model * dt_model/dt_real
-    where dt_model/dt_real = 1 / (std * t_real * ln(10))
+    Key features:
+    - Model outputs UNSIGNED magnitudes (positive from Softplus) in normalized log-space
+    - Applies logabs signs from targets[:, 3:] to create SIGNED normalized log-space predictions
+    - Computes derivatives of UNSIGNED magnitudes via autograd in normalized space
+    - Applies verified denormalization formulas with SIGNED predictions for theory values
+    - Supports both log-space MSE and regular MSE via use_log parameter
     """
 
-    def __init__(self, weight=1.0, model=None, t_threshold=1e-6, use_log=True):
+    def __init__(self, weight=1.0, model=None, t_threshold=1e-6, use_log=False, input_grad_outside=False):
         super().__init__(weight=weight, name="Consistency Loss (auto)")
         self.model = model
         self.t_threshold = t_threshold
         self.use_log = use_log
+        self.input_grad_outside = input_grad_outside
 
     def set_model(self, model):
         """Set the model reference for gradient computation"""
         self.model = model
 
-    def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None, real_sign_probs=None):
+    def compute(self, predictions, targets, inputs=None, inputs_normalizer=None,
+                outputs_normalizer=None, ft_cal=None, valid_mask=None, **kwargs):
         """
-        Enforces consistency between position, velocity, and acceleration
-        using automatic differentiation with log-normalized time.
+        Enforces derivative consistency using verified formulas for log-normalized training.
 
         Args:
+            predictions: If input_grad_outside=True, this is mag_preds from training loop
+                        If input_grad_outside=False, not used (we compute fresh predictions)
+            targets: (batch_size, 6) - [real_sign_x, real_sign_v, real_sign_a, x', v', a']
+                     where [:, 0:3] are real space signs (±1)
+                     and [:, 3:6] are SIGNED normalized log-space values (can be ±)
             inputs: (batch_size, 3) - [a, b, t] NORMALIZED
-            norm_params: Dictionary with 'normalizer' key containing normalizer instance
-            inputs_real: (batch_size, 3) - [a, b, t] in REAL space
-            real_sign_probs: Not used (for signature compatibility)
+            inputs_normalizer: Normalizer for inputs (contains t normalization params)
+            outputs_normalizer: Normalizer for outputs (contains x, v, a normalization params)
+            ft_cal: (batch_size, 3) - Finetune calibration outputs [ft_x, ft_v, ft_a] in normalized log-space
+            valid_mask: If input_grad_outside=True, boolean mask for valid samples (t_real > threshold)
+                       If input_grad_outside=False, not used (computed internally)
 
         Returns:
-            loss: Scalar tensor measuring consistency error
+            loss: Scalar tensor measuring derivative consistency error
         """
-        if self.model is None:
-            raise ValueError("Model not set. Call set_model() before using ConsistencyLoss_auto_diff")
+        if inputs_normalizer is None or outputs_normalizer is None:
+            raise ValueError("Both inputs_normalizer and outputs_normalizer must be provided")
 
-        if inputs_real is None:
-            raise ValueError("ConsistencyLoss_auto_diff requires inputs_real to be provided")
+        device = inputs.device
+        dtype = inputs.dtype
+        eps = 1e-12
 
-        if norm_params is None or 'normalizer' not in norm_params:
-            raise ValueError("norm_params with 'normalizer' must be provided for ConsistencyLoss_auto_diff")
+        # Get normalization parameters (needed for both modes)
+        beta_x = generalize_beta(outputs_normalizer, outputs_normalizer.log_mean['x'], outputs_normalizer.log_std['x'], 'x')
+        beta_v = generalize_beta(outputs_normalizer, outputs_normalizer.log_mean['v'], outputs_normalizer.log_std['v'], 'v')
+        beta_a = generalize_beta(outputs_normalizer, outputs_normalizer.log_mean['a'], outputs_normalizer.log_std['a'], 'a')
+        alpha_x = generalize_alpha(outputs_normalizer, outputs_normalizer.log_mean['x'], outputs_normalizer.log_std['x'], 'x')
+        alpha_v = generalize_alpha(outputs_normalizer, outputs_normalizer.log_mean['v'], outputs_normalizer.log_std['v'], 'v')
+        alpha_a = generalize_alpha(outputs_normalizer, outputs_normalizer.log_mean['a'], outputs_normalizer.log_std['a'], 'a')
+        t_alpha = generalize_alpha(inputs_normalizer, inputs_normalizer.log_mean['t'], inputs_normalizer.log_std['t'], 't')
+        t_beta = generalize_beta(inputs_normalizer, inputs_normalizer.log_mean['t'], inputs_normalizer.log_std['t'], 't')
+        ln10 = torch.log(torch.tensor(10.0, device=device, dtype=dtype))
 
-        normalizer = norm_params['normalizer']
+        # ======================
+        # MODE SELECTION: Compute mag_x, mag_v, mag_a and their derivatives
+        # ======================
+        if self.input_grad_outside:
+            # MODE 1: Gradients computed in training loop
+            # Use mag_preds from training loop (predictions parameter)
+            # Use valid_mask passed from training loop
 
-        # Get t_real from inputs_real
-        t_real = inputs_real[:, 2]  # Note: index 2 for exponential data (not 3)
+            if predictions is None:
+                raise ValueError("When input_grad_outside=True, predictions (mag_preds) must be provided")
+            if ft_cal is None:
+                raise ValueError("When input_grad_outside=True, ft_cal must be provided")
+            if valid_mask is None:
+                raise ValueError("When input_grad_outside=True, valid_mask must be provided")
 
-        # Filter out samples where t_real ≈ 0 (to avoid division by zero)
-        valid_mask = t_real > self.t_threshold
+            # Filter to valid samples
+            mag_preds_valid = predictions[valid_mask]
+            inputs_valid = inputs[valid_mask]
+            targets_valid = targets[valid_mask]
+            ft_cal_valid = ft_cal[valid_mask]
 
-        if valid_mask.sum() == 0:
-            # No valid samples (all t≈0)
-            return torch.tensor(0.0, device=inputs.device)
+            # Compute t_real for valid samples
+            t_normalized_valid = inputs_valid[:, 2]
+            t_real_valid = torch.exp((t_beta * t_normalized_valid + t_alpha) * ln10)
 
-        # Filter to valid samples only
-        inputs_valid = inputs[valid_mask]
-        t_real_valid = t_real[valid_mask]
+            # STEP 1: Get unsigned magnitude predictions and compute derivatives separately
+            # Detect phase
+            is_phase1 = torch.all(torch.abs(ft_cal_valid) < eps)
 
-        # Get the time std from normalizer (or use 1.0 if no normalization)
-        if normalizer is not None:
-            t_std = normalizer.log_std['t']  # std of log10(t) values
+            # STEP 1a: Compute values (for loss calculation)
+            mag_x = mag_preds_valid[:, 0] + ft_cal_valid[:, 0]
+            mag_v = mag_preds_valid[:, 1] + ft_cal_valid[:, 1]
+            mag_a = mag_preds_valid[:, 2] + ft_cal_valid[:, 2]
+            # mag_x = mag_preds_valid[:, 0]
+            # mag_v = mag_preds_valid[:, 1]
+            # mag_a = mag_preds_valid[:, 2]
+            # STEP 1b: Compute derivatives separately, then sum
+            # Always compute derivatives of mag_preds components
+            dx_mag_dt = torch.autograd.grad(
+                outputs=mag_preds_valid[:, 0],
+                inputs=inputs,
+                grad_outputs=torch.ones_like(mag_preds_valid[:, 0]),
+                create_graph=True,
+                retain_graph=True,
+                allow_unused=True
+            )[0][valid_mask, 2]  # Gradient w.r.t. t_normalized, filter by valid_mask
+
+            dv_mag_dt = torch.autograd.grad(
+                outputs=mag_preds_valid[:, 1],
+                inputs=inputs,
+                grad_outputs=torch.ones_like(mag_preds_valid[:, 1]),
+                create_graph=True,
+                retain_graph=True,
+                allow_unused=True
+            )[0][valid_mask, 2]  # Gradient w.r.t. t_normalized, filter by valid_mask
+
+            if is_phase1:
+                # Phase 1: Only use mag derivatives (ft_cal is zeros)
+                dx_prime_dt_prime = torch.abs(dx_mag_dt)
+                dv_prime_dt_prime = torch.abs(dv_mag_dt)
+            else:
+                # Phase 2: Compute ft_cal derivatives and add them
+                dx_ft_dt = torch.autograd.grad(
+                    outputs=ft_cal_valid[:, 0],
+                    inputs=inputs,
+                    grad_outputs=torch.ones_like(ft_cal_valid[:, 0]),
+                    create_graph=True,
+                    retain_graph=True,
+                    allow_unused=True
+                )[0][valid_mask, 2]  # Gradient w.r.t. t_normalized, filter by valid_mask
+
+                dv_ft_dt = torch.autograd.grad(
+                    outputs=ft_cal_valid[:, 1],
+                    inputs=inputs,
+                    grad_outputs=torch.ones_like(ft_cal_valid[:, 1]),
+                    create_graph=True,
+                    retain_graph=True,
+                    allow_unused=True
+                )[0][valid_mask, 2]  # Gradient w.r.t. t_normalized, filter by valid_mask
+
+                # Sum derivatives (linearity: d(f+g)/dt = df/dt + dg/dt)
+                dx_prime_dt_prime = torch.abs(dx_mag_dt) + dx_ft_dt
+                dv_prime_dt_prime = torch.abs(dv_mag_dt) + dv_ft_dt
+                # dx_prime_dt_prime = torch.abs(dx_mag_dt)
+                # dv_prime_dt_prime = torch.abs(dv_mag_dt)
         else:
-            # No normalization: dt_model/dt_real = 1
-            # chain_rule_factor = 1 / (t_std * t_real * ln(10))
-            # To make chain_rule_factor = 1, we need: t_std * t_real * ln(10) = 1
-            # So: t_std = 1 / (t_real * ln(10))
-            # But t_std should be a scalar, so we just set it to make chain_rule = 1
-            # Actually, easier approach: we'll handle this in chain_rule_factor calculation
-            t_std = torch.tensor(1.0, device=inputs.device, dtype=inputs.dtype)
+            # MODE 2: Gradients computed inside consistency loss (current approach)
+            # Call model internally with inputs_with_grad
 
-        # Don't use .detach() to preserve gradient linkage
-        inputs_with_grad = inputs_valid.clone().requires_grad_(True)
+            if self.model is None:
+                raise ValueError("When input_grad_outside=False, model must be set via set_model()")
+            if ft_cal is None:
+                raise ValueError("When input_grad_outside=False, ft_cal must be provided")
 
-        # Forward pass with gradient tracking
-        predictions_with_grad = self.model(inputs_with_grad)
+            # Denormalize inputs to get t_real
+            t_normalized = inputs[:, 2]
+            t_real = torch.exp((t_beta * t_normalized + t_alpha) * ln10)
 
-        # Extract predictions (these are in REAL space)
-        x_pred = predictions_with_grad[:, 0]
-        v_pred = predictions_with_grad[:, 1]
-        a_pred = predictions_with_grad[:, 2]
+            # Filter out samples where t_real ≈ 0 (to avoid division by zero)
+            valid_mask = t_real > self.t_threshold
 
-        # Compute dx/dt_model using autograd (gradient w.r.t. t_normalized at index 2)
-        dx_dt_model = torch.autograd.grad(
-            outputs=x_pred,
-            inputs=inputs_with_grad,
-            grad_outputs=torch.ones_like(x_pred),
-            create_graph=True,
-            retain_graph=True,
-            allow_unused=True
-        )[0][:, 2]  # Take only the gradient w.r.t. t_normalized (index 2)
+            if valid_mask.sum() == 0:
+                return torch.tensor(0.0, device=device)
 
-        # Compute dv/dt_model using autograd
-        dv_dt_model = torch.autograd.grad(
-            outputs=v_pred,
-            inputs=inputs_with_grad,
-            grad_outputs=torch.ones_like(v_pred),
-            create_graph=True,
-            retain_graph=True,
-            allow_unused=True
-        )[0][:, 2]  # Take only the gradient w.r.t. t_normalized (index 2)
+            # Filter to valid samples
+            inputs_valid = inputs[valid_mask]
+            targets_valid = targets[valid_mask]
+            t_real_valid = t_real[valid_mask]
+            ft_cal_valid = ft_cal[valid_mask]
 
-        # Apply chain rule to transform from model domain to real domain
-        if normalizer is not None:
-            # With normalization: t_model = (log10(t_real) - mean) / std
-            # dt_model/dt_real = 1 / (std * t_real * ln(10))
-            ln10 = torch.tensor(np.log(10), device=inputs.device, dtype=inputs.dtype)
-            chain_rule_factor = 1.0 / (t_std * t_real_valid * ln10)
-        else:
-            # Without normalization: t_model = t_real, so dt_model/dt_real = 1
-            chain_rule_factor = torch.tensor(1.0, device=inputs.device, dtype=inputs.dtype)
+            # Enable gradient tracking on inputs
+            inputs_with_grad = inputs_valid.clone().requires_grad_(True)
 
-        # Transform gradients to real domain
-        dx_dt_real = dx_dt_model * chain_rule_factor
-        dv_dt_real = dv_dt_model * chain_rule_factor
+            # Forward pass to get model outputs
+            # Model returns tuple: (mag_preds, logabs_sign_pred, real_sign_pred, ft_cal_from_model)
+            mag_preds_internal, _, _, ft_preds_internal = self.model(inputs_with_grad)
 
-        # Compute consistency losses
-        # v_pred should equal dx/dt_real
-        loss_v_consistency = torch.mean((v_pred - dx_dt_real) ** 2)
+            # STEP 1: Get unsigned magnitude predictions and compute derivatives separately
+            # Detect phase
+            is_phase1 = torch.all(torch.abs(ft_cal_valid) < eps)
 
-        # a_pred should equal dv/dt_real
-        loss_a_consistency = torch.mean((a_pred - dv_dt_real) ** 2)
+            # STEP 1a: Compute values (for loss calculation)
+            mag_x = mag_preds_internal[:, 0] + ft_preds_internal[:, 0]
+            mag_v = mag_preds_internal[:, 1] + ft_preds_internal[:, 1]
+            mag_a = mag_preds_internal[:, 2] + ft_preds_internal[:, 2]
+            # mag_x = mag_preds_internal[:, 0]
+            # mag_v = mag_preds_internal[:, 1]
+            # mag_a = mag_preds_internal[:, 2]
 
-        # Total consistency loss
-        total_loss = loss_v_consistency + loss_a_consistency
+            # STEP 1b: Compute derivatives separately, then sum
+            # Always compute derivatives of mag_preds_internal components
+            dx_mag_dt = torch.autograd.grad(
+                outputs=mag_preds_internal[:, 0],
+                inputs=inputs_with_grad,
+                grad_outputs=torch.ones_like(mag_preds_internal[:, 0]),
+                create_graph=True,
+                retain_graph=True,
+                allow_unused=True
+            )[0][:, 2]  # Gradient w.r.t. t_normalized (index 2)
 
-        # Apply log transformation if enabled
+            dv_mag_dt = torch.autograd.grad(
+                outputs=mag_preds_internal[:, 1],
+                inputs=inputs_with_grad,
+                grad_outputs=torch.ones_like(mag_preds_internal[:, 1]),
+                create_graph=True,
+                retain_graph=True,
+                allow_unused=True
+            )[0][:, 2]  # Gradient w.r.t. t_normalized (index 2)
+
+            if is_phase1:
+                # Phase 1: Only use mag derivatives (finetune network untrained)
+                dx_prime_dt_prime = torch.abs(dx_mag_dt)
+                dv_prime_dt_prime = torch.abs(dv_mag_dt)
+            else:
+                # Phase 2: Compute ft_preds derivatives and add them
+                dx_ft_dt = torch.autograd.grad(
+                    outputs=ft_preds_internal[:, 0],
+                    inputs=inputs_with_grad,
+                    grad_outputs=torch.ones_like(ft_preds_internal[:, 0]),
+                    create_graph=True,
+                    retain_graph=True,
+                    allow_unused=True
+                )[0][:, 2]  # Gradient w.r.t. t_normalized (index 2)
+
+                dv_ft_dt = torch.autograd.grad(
+                    outputs=ft_preds_internal[:, 1],
+                    inputs=inputs_with_grad,
+                    grad_outputs=torch.ones_like(ft_preds_internal[:, 1]),
+                    create_graph=True,
+                    retain_graph=True,
+                    allow_unused=True
+                )[0][:, 2]  # Gradient w.r.t. t_normalized (index 2)
+
+                # Sum derivatives (linearity: d(f+g)/dt = df/dt + dg/dt)
+                dx_prime_dt_prime = torch.abs(dx_mag_dt) + dx_ft_dt
+                dv_prime_dt_prime = torch.abs(dv_mag_dt) + dv_ft_dt
+                # dx_prime_dt_prime = torch.abs(dx_mag_dt)
+                # dv_prime_dt_prime = torch.abs(dv_mag_dt)
+        # ======================
+        # COMMON CODE: Apply signs and compute theory values
+        # ======================
+        # STEP 3: Apply logabs signs (from targets[:, 3:]) → SIGNED normalized log-space predictions
+        # targets[:, 3:] contains SIGNED normalized log-space values (can be ±)
+        logabs_targets = targets_valid[:, 3:]  # [x', v', a'] in normalized log-space (signed)
+        logabs_sign = torch.sign(logabs_targets)  # Extract signs from logabs targets
+
+        x_pred = logabs_sign[:, 0] * mag_x  # Signed normalized log-space
+        v_pred = logabs_sign[:, 1] * mag_v  # Signed normalized log-space
+
+        # STEP 4: DETACH derivatives and SIGNED predictions for transformation
+        x_pred_detached = x_pred.detach()  # SIGNED normalized log-space
+        v_pred_detached = v_pred.detach()  # SIGNED normalized log-space
+        dx_dt_detached = dx_prime_dt_prime.detach()
+        dv_dt_detached = dv_prime_dt_prime.detach()
+
+        # STEP 5: Denormalize SIGNED predictions to real space
+        # This matches dataset: x_prime is signed in normalized space
+        x_real = torch.exp((beta_x * x_pred_detached + alpha_x) * ln10)
+        v_real = torch.exp((beta_v * v_pred_detached + alpha_v) * ln10)
+
+        # STEP 6: Compute theory values using VERIFIED FORMULA
+        common_factor_v = (beta_x / t_beta) * (x_real / (t_real_valid + eps))
+        v_theory = torch.abs(common_factor_v * dx_dt_detached)
+
+        common_factor_a = (beta_v / t_beta) * (v_real / (t_real_valid + eps))
+        a_theory = torch.abs(common_factor_a * dv_dt_detached)
+
+        # STEP 7: Normalize theory back to log-normalized space
+        v_theory_normalized = (torch.log10(v_theory + eps) - alpha_v) / beta_v
+        a_theory_normalized = (torch.log10(a_theory + eps) - alpha_a) / beta_a
+
+        # STEP 8: DETACH theory targets (act as ground truth)
+        v_theory_normalized = v_theory_normalized.detach()
+        a_theory_normalized = a_theory_normalized.detach()
+
+        # STEP 9: Compute loss (log-space MSE or regular MSE based on use_log)
         if self.use_log:
-            eps = 1e-10
-            total_loss = torch.log(total_loss + eps)
+            # Log-space MSE (matching MSELoss format)
+            log_mag_v = torch.log(torch.abs(mag_v) + eps)
+            log_v_theory = torch.log(torch.abs(v_theory_normalized) + eps)
+            v_consistency_loss = torch.mean((log_mag_v - log_v_theory) ** 2)
+
+            log_mag_a = torch.log(torch.abs(mag_a) + eps)
+            log_a_theory = torch.log(torch.abs(a_theory_normalized) + eps)
+            a_consistency_loss = torch.mean((log_mag_a - log_a_theory) ** 2)
+        else:
+            # Regular MSE
+            v_consistency_loss = torch.mean(((torch.abs(mag_v) - torch.abs(v_theory_normalized))/torch.abs(mag_v)) ** 2)
+            a_consistency_loss = torch.mean(((torch.abs(mag_a) - torch.abs(a_theory_normalized))/torch.abs(mag_a)) ** 2)
+
+        # STEP 10: Total consistency loss
+        total_loss = v_consistency_loss + a_consistency_loss
 
         return total_loss
+'''
 
 
-class ConsistencyLoss_finite_diff(BaseLossComponent):
+class ConsistencyLoss_auto_diff_derivagrad_ver0(BaseLossComponent):
     """
-    Derivative consistency using finite differences
+    REVERSE GRADIENT FLOW: Derivative consistency with trainable theory values.
 
-    Computes 6 loss components:
-    1. v from x (finite diff) vs v_pred
-    2. a from v (finite diff) vs a_pred
-    3. a from x (finite diff, 2nd derivative) vs a_pred
-    4. v from x (finite diff) vs v_target
-    5. a from v (finite diff) vs a_target
-    6. a from x (finite diff, 2nd derivative) vs a_target
+    Ensures v=dx/dt and a=dv/dt by training DERIVATIVES to produce theory matching GROUND TRUTH TARGETS.
+    Uses verified transformation formulas from check_dataset_consistency() in Exp_dataset.py.
+
+    Key features (REVERSE gradient flow with target comparison):
+    - Model outputs UNSIGNED magnitudes (positive from Softplus) in normalized log-space
+    - Applies logabs signs from targets[:, 3:] to create SIGNED normalized log-space predictions
+    - Computes derivatives of UNSIGNED magnitudes via autograd with create_graph=True
+    - TARGETS (v_target, a_target) from ground truth → fixed reference values
+    - THEORY VALUES (v_theory, a_theory) have GRADIENTS → trainable via derivatives
+    - Loss trains derivatives to produce theory that matches ground truth targets
+    - Supports both log-space MSE and regular MSE via use_log parameter
+
+    Gradient Flow Direction:
+    - ver0: Train predictions → match fixed theory (theory detached)
+    - ConsistencyLoss_auto_diff: Train derivatives → produce theory matching fixed predictions
+    - THIS VERSION: Train derivatives → produce theory matching ground truth targets
     """
 
-    def __init__(self, weight=1.0, use_relative=False, t_threshold=1e-6,
-                 use_log=True,
-                 weight_v_x_pred=1.0,
-                 weight_a_v_pred=1.0,
-                 weight_a_x_pred=1.0,
-                 weight_v_x_target=1.0,
-                 weight_a_v_target=1.0,
-                 weight_a_x_target=1.0):
-        super().__init__(weight=weight, name="Consistency Loss (finite)")
-        self.use_relative = use_relative
+    def __init__(self, weight=1.0, model=None, t_threshold=1e-6, use_log=False, input_grad_outside=False):
+        super().__init__(weight=weight, name="Consistency Loss (auto)")
+        self.model = model
         self.t_threshold = t_threshold
         self.use_log = use_log
+        self.input_grad_outside = input_grad_outside
 
-        # Individual component weights
-        self.weight_v_x_pred = weight_v_x_pred
-        self.weight_a_v_pred = weight_a_v_pred
-        self.weight_a_x_pred = weight_a_x_pred
-        self.weight_v_x_target = weight_v_x_target
-        self.weight_a_v_target = weight_a_v_target
-        self.weight_a_x_target = weight_a_x_target
+    def set_model(self, model):
+        """Set the model reference for gradient computation"""
+        self.model = model
 
-    def compute(self, predictions, targets, inputs, norm_params=None, inputs_real=None, real_sign_probs=None):
+    def compute(self, predictions, targets, inputs=None, inputs_normalizer=None,
+                outputs_normalizer=None, ft_cal=None, valid_mask=None, **kwargs):
         """
-        Compute finite difference consistency loss
+        Enforces derivative consistency using verified formulas for log-normalized training.
 
         Args:
-            predictions: (batch_size, 3) - [x, v, a] at time t
-            targets: (batch_size, 3) - [x, v, a] ground truth at time t
-            inputs: Not used
-            norm_params: Not used
-            inputs_real: (4*batch_size, 3) - predictions at perturbed times
-                        [t-2Δt, t-Δt, t+Δt, t+2Δt] stacked
-            real_sign_probs: Not used (for signature compatibility)
+            predictions: If input_grad_outside=True, this is mag_preds from training loop
+                        If input_grad_outside=False, not used (we compute fresh predictions)
+            targets: (batch_size, 6) - [real_sign_x, real_sign_v, real_sign_a, x', v', a']
+                     where [:, 0:3] are real space signs (±1)
+                     and [:, 3:6] are SIGNED normalized log-space values (can be ±)
+            inputs: (batch_size, 3) - [a, b, t] NORMALIZED
+            inputs_normalizer: Normalizer for inputs (contains t normalization params)
+            outputs_normalizer: Normalizer for outputs (contains x, v, a normalization params)
+            ft_cal: (batch_size, 3) - Finetune calibration outputs [ft_x, ft_v, ft_a] in normalized log-space
+            valid_mask: If input_grad_outside=True, boolean mask for valid samples (t_real > threshold)
+                       If input_grad_outside=False, not used (computed internally)
 
         Returns:
-            total_loss: Scalar tensor representing the natural log of the total loss.
+            loss: Scalar tensor measuring derivative consistency error
         """
-        if inputs_real is None:
-            raise ValueError("ConsistencyLoss_finite_diff requires inputs_real (outputs_dt) to be provided")
+        if inputs_normalizer is None or outputs_normalizer is None:
+            raise ValueError("Both inputs_normalizer and outputs_normalizer must be provided")
 
-        N = predictions.shape[0]
-        eps = 1e-10
+        device = inputs.device
+        dtype = inputs.dtype
+        eps = 1e-12
 
-        # Extract predictions at different time points
-        # inputs_real is actually outputs_dt with shape (4N, 3)
-        outputs_dt = inputs_real
+        # Get normalization parameters (needed for both modes)
+        beta_x = generalize_beta(outputs_normalizer, outputs_normalizer.log_mean['x'], outputs_normalizer.log_std['x'], 'x')
+        beta_v = generalize_beta(outputs_normalizer, outputs_normalizer.log_mean['v'], outputs_normalizer.log_std['v'], 'v')
+        beta_a = generalize_beta(outputs_normalizer, outputs_normalizer.log_mean['a'], outputs_normalizer.log_std['a'], 'a')
+        alpha_x = generalize_alpha(outputs_normalizer, outputs_normalizer.log_mean['x'], outputs_normalizer.log_std['x'], 'x')
+        alpha_v = generalize_alpha(outputs_normalizer, outputs_normalizer.log_mean['v'], outputs_normalizer.log_std['v'], 'v')
+        alpha_a = generalize_alpha(outputs_normalizer, outputs_normalizer.log_mean['a'], outputs_normalizer.log_std['a'], 'a')
+        t_alpha = generalize_alpha(inputs_normalizer, inputs_normalizer.log_mean['t'], inputs_normalizer.log_std['t'], 't')
+        t_beta = generalize_beta(inputs_normalizer, inputs_normalizer.log_mean['t'], inputs_normalizer.log_std['t'], 't')
+        ln10 = torch.log(torch.tensor(10.0, device=device, dtype=dtype))
 
-        x_t = predictions[:, 0:1]
-        v_t = predictions[:, 1:2]
-        a_t = predictions[:, 2:3]
+        # ======================
+        # MODE SELECTION: Compute mag_x, mag_v, mag_a and their derivatives
+        # ======================
+        if self.input_grad_outside:
+            # MODE 1: Gradients computed in training loop
+            # Use mag_preds from training loop (predictions parameter)
+            # Use valid_mask passed from training loop
 
-        x_t_minus_minus = outputs_dt[0:N, 0:1]      # t - 2Δt
-        x_t_minus = outputs_dt[N:2*N, 0:1]          # t - Δt
-        x_t_plus = outputs_dt[2*N:3*N, 0:1]         # t + Δt
-        x_t_plus_plus = outputs_dt[3*N:4*N, 0:1]    # t + 2Δt
+            if predictions is None:
+                raise ValueError("When input_grad_outside=True, predictions (mag_preds) must be provided")
+            if ft_cal is None:
+                raise ValueError("When input_grad_outside=True, ft_cal must be provided")
+            if valid_mask is None:
+                raise ValueError("When input_grad_outside=True, valid_mask must be provided")
 
-        v_t_minus = outputs_dt[N:2*N, 1:2]          # t - Δt
-        v_t_plus = outputs_dt[2*N:3*N, 1:2]         # t + Δt
+            # Filter to valid samples
+            mag_preds_valid = predictions[valid_mask]
+            inputs_valid = inputs[valid_mask]
+            targets_valid = targets[valid_mask]
+            ft_cal_valid = ft_cal[valid_mask]
 
-        # Extract targets
-        # Debug: ensure targets is a tensor
-        if not isinstance(targets, torch.Tensor):
-            raise TypeError(f"targets must be a torch.Tensor, got {type(targets)}")
+            # Compute t_real for valid samples
+            t_normalized_valid = inputs_valid[:, 2]
+            t_real_valid = torch.exp((t_beta * t_normalized_valid + t_alpha) * ln10)
 
-        x_target = targets[:, 0:1]
-        v_target = targets[:, 1:2]
-        a_target = targets[:, 2:3]
+            # STEP 1: Get unsigned magnitude predictions and compute derivatives separately
+            # Detect phase
+            is_phase1 = torch.all(torch.abs(ft_cal_valid) < eps)
 
-        t_delta = self.t_threshold
+            # STEP 1a: Compute values (for loss calculation)
+            mag_x = mag_preds_valid[:, 0] + ft_cal_valid[:, 0]
+            mag_v = mag_preds_valid[:, 1] + ft_cal_valid[:, 1]
+            mag_a = mag_preds_valid[:, 2] + ft_cal_valid[:, 2]
 
-        # Compute finite difference derivatives
-        # Component 1 & 4: v from x using central difference
-        v_fd_from_x = (x_t_plus - x_t_minus) / (2 * t_delta)
+            # STEP 1b: Compute derivatives separately, then sum
+            # Always compute derivatives of mag_preds components
+            dx_mag_dt = torch.autograd.grad(
+                outputs=mag_preds_valid[:, 0],
+                inputs=inputs,
+                grad_outputs=torch.ones_like(mag_preds_valid[:, 0]),
+                create_graph=True,
+                retain_graph=True,
+                allow_unused=True
+            )[0][valid_mask, 2]  # Gradient w.r.t. t_normalized, filter by valid_mask
 
-        # Component 2 & 5: a from v using central difference
-        a_fd_from_v = (v_t_plus - v_t_minus) / (2 * t_delta)
+            dv_mag_dt = torch.autograd.grad(
+                outputs=mag_preds_valid[:, 1],
+                inputs=inputs,
+                grad_outputs=torch.ones_like(mag_preds_valid[:, 1]),
+                create_graph=True,
+                retain_graph=True,
+                allow_unused=True
+            )[0][valid_mask, 2]  # Gradient w.r.t. t_normalized, filter by valid_mask
 
-        # Component 3 & 6: a from x using second derivative
-        v_t_plus_temp = (x_t_plus_plus - x_t) / (2 * t_delta)
-        v_t_minus_temp = (x_t - x_t_minus_minus) / (2 * t_delta)
-        a_fd_from_x = (v_t_plus_temp - v_t_minus_temp) / (2 * t_delta)
+            if is_phase1:
+                # Phase 1: Only use mag derivatives (ft_cal is zeros)
+                dx_prime_dt_prime = torch.abs(dx_mag_dt)
+                dv_prime_dt_prime = torch.abs(dv_mag_dt)
+            else:
+                # Phase 2: Compute ft_cal derivatives and add them
+                dx_ft_dt = torch.autograd.grad(
+                    outputs=ft_cal_valid[:, 0],
+                    inputs=inputs,
+                    grad_outputs=torch.ones_like(ft_cal_valid[:, 0]),
+                    create_graph=True,
+                    retain_graph=True,
+                    allow_unused=True
+                )[0][valid_mask, 2]  # Gradient w.r.t. t_normalized, filter by valid_mask
 
-        # Compute squared differences for all 6 components
-        diff_1 = (v_fd_from_x - v_t) ** 2        # v from x vs v_pred
-        diff_2 = (a_fd_from_v - a_t) ** 2        # a from v vs a_pred
-        diff_3 = (a_fd_from_x - a_t) ** 2        # a from x vs a_pred
-        diff_4 = (v_fd_from_x - v_target) ** 2   # v from x vs v_target
-        diff_5 = (a_fd_from_v - a_target) ** 2   # a from v vs a_target
-        diff_6 = (a_fd_from_x - a_target) ** 2   # a from x vs a_target
+                dv_ft_dt = torch.autograd.grad(
+                    outputs=ft_cal_valid[:, 1],
+                    inputs=inputs,
+                    grad_outputs=torch.ones_like(ft_cal_valid[:, 1]),
+                    create_graph=True,
+                    retain_graph=True,
+                    allow_unused=True
+                )[0][valid_mask, 2]  # Gradient w.r.t. t_normalized, filter by valid_mask
 
-        # Apply normalization if use_relative is True
-        if self.use_relative:
-            diff_1 = diff_1 / (v_target ** 2 + eps)
-            diff_2 = diff_2 / (a_target ** 2 + eps)
-            diff_3 = diff_3 / (a_target ** 2 + eps)
-            diff_4 = diff_4 / (v_target ** 2 + eps)
-            diff_5 = diff_5 / (a_target ** 2 + eps)
-            diff_6 = diff_6 / (a_target ** 2 + eps)
+                # Sum derivatives (linearity: d(f+g)/dt = df/dt + dg/dt)
+                dx_prime_dt_prime = torch.abs(dx_mag_dt) + dx_ft_dt
+                dv_prime_dt_prime = torch.abs(dv_mag_dt) + dv_ft_dt
 
-        # Compute weighted sum of all components
-        total_loss = (
-            self.weight_v_x_pred * torch.mean(diff_1) +
-            self.weight_a_v_pred * torch.mean(diff_2) +
-            self.weight_a_x_pred * torch.mean(diff_3) +
-            self.weight_v_x_target * torch.mean(diff_4) +
-            self.weight_a_v_target * torch.mean(diff_5) +
-            self.weight_a_x_target * torch.mean(diff_6)
-        )
+        else:
+            # MODE 2: Gradients computed inside consistency loss (current approach)
+            # Call model internally with inputs_with_grad
 
-        # Apply log transformation if enabled
+            if self.model is None:
+                raise ValueError("When input_grad_outside=False, model must be set via set_model()")
+            if ft_cal is None:
+                raise ValueError("When input_grad_outside=False, ft_cal must be provided")
+
+            # Denormalize inputs to get t_real
+            t_normalized = inputs[:, 2]
+            t_real = torch.exp((t_beta * t_normalized + t_alpha) * ln10)
+
+            # Filter out samples where t_real ≈ 0 (to avoid division by zero)
+            valid_mask = t_real > self.t_threshold
+
+            if valid_mask.sum() == 0:
+                return torch.tensor(0.0, device=device)
+
+            # Filter to valid samples
+            inputs_valid = inputs[valid_mask]
+            targets_valid = targets[valid_mask]
+            t_real_valid = t_real[valid_mask]
+            ft_cal_valid = ft_cal[valid_mask]
+
+            # Enable gradient tracking on inputs
+            inputs_with_grad = inputs_valid.clone().requires_grad_(True)
+
+            # Forward pass to get model outputs
+            # Model returns tuple: (mag_preds, logabs_sign_pred, real_sign_pred, ft_cal_from_model)
+            mag_preds_internal, _, _, ft_preds_internal = self.model(inputs_with_grad)
+
+            # STEP 1: Get unsigned magnitude predictions and compute derivatives separately
+            # Detect phase
+            is_phase1 = torch.all(torch.abs(ft_cal_valid) < eps)
+
+            # STEP 1a: Compute values (for loss calculation)
+            mag_x = mag_preds_internal[:, 0] + ft_preds_internal[:, 0]
+            mag_v = mag_preds_internal[:, 1] + ft_preds_internal[:, 1]
+            mag_a = mag_preds_internal[:, 2] + ft_preds_internal[:, 2]
+
+            # STEP 1b: Compute derivatives separately, then sum
+            # Always compute derivatives of mag_preds_internal components
+            dx_mag_dt = torch.autograd.grad(
+                outputs=mag_preds_internal[:, 0],
+                inputs=inputs_with_grad,
+                grad_outputs=torch.ones_like(mag_preds_internal[:, 0]),
+                create_graph=True,
+                retain_graph=True,
+                allow_unused=True
+            )[0][:, 2]  # Gradient w.r.t. t_normalized (index 2)
+
+            dv_mag_dt = torch.autograd.grad(
+                outputs=mag_preds_internal[:, 1],
+                inputs=inputs_with_grad,
+                grad_outputs=torch.ones_like(mag_preds_internal[:, 1]),
+                create_graph=True,
+                retain_graph=True,
+                allow_unused=True
+            )[0][:, 2]  # Gradient w.r.t. t_normalized (index 2)
+
+            if is_phase1:
+                # Phase 1: Only use mag derivatives (finetune network untrained)
+                dx_prime_dt_prime = torch.abs(dx_mag_dt)
+                dv_prime_dt_prime = torch.abs(dv_mag_dt)
+            else:
+                # Phase 2: Compute ft_preds derivatives and add them
+                dx_ft_dt = torch.autograd.grad(
+                    outputs=ft_preds_internal[:, 0],
+                    inputs=inputs_with_grad,
+                    grad_outputs=torch.ones_like(ft_preds_internal[:, 0]),
+                    create_graph=True,
+                    retain_graph=True,
+                    allow_unused=True
+                )[0][:, 2]  # Gradient w.r.t. t_normalized (index 2)
+
+                dv_ft_dt = torch.autograd.grad(
+                    outputs=ft_preds_internal[:, 1],
+                    inputs=inputs_with_grad,
+                    grad_outputs=torch.ones_like(ft_preds_internal[:, 1]),
+                    create_graph=True,
+                    retain_graph=True,
+                    allow_unused=True
+                )[0][:, 2]  # Gradient w.r.t. t_normalized (index 2)
+
+                # Sum derivatives (linearity: d(f+g)/dt = df/dt + dg/dt)
+                dx_prime_dt_prime = torch.abs(dx_mag_dt) + dx_ft_dt
+                dv_prime_dt_prime = torch.abs(dv_mag_dt) + dv_ft_dt
+
+        # ======================
+        # COMMON CODE: Apply signs and compute theory values
+        # ======================
+        # STEP 3: Apply logabs signs (from targets[:, 3:]) → SIGNED normalized log-space predictions
+        # targets[:, 3:] contains SIGNED normalized log-space values (can be ±)
+        logabs_targets = targets_valid[:, 3:]  # [x', v', a'] in normalized log-space (signed)
+        logabs_sign = torch.sign(logabs_targets)  # Extract signs from logabs targets
+
+        x_pred = logabs_sign[:, 0] * mag_x  # Signed normalized log-space
+        v_pred = logabs_sign[:, 1] * mag_v  # Signed normalized log-space
+
+        # STEP 4: DETACH SIGNED predictions for transformation (keep derivatives WITH gradients)
+        x_pred_detached = x_pred.detach()  # SIGNED normalized log-space
+        v_pred_detached = v_pred.detach()  # SIGNED normalized log-space
+        dx_dt_with_grad = dx_prime_dt_prime  # Keep gradients for backprop!
+        dv_dt_with_grad = dv_prime_dt_prime  # Keep gradients for backprop!
+
+        # STEP 5: Denormalize SIGNED predictions to real space
+        # This matches dataset: x_prime is signed in normalized space
+        x_real = torch.exp((beta_x * x_pred_detached + alpha_x) * ln10)
+        v_real = torch.exp((beta_v * v_pred_detached + alpha_v) * ln10)
+
+        # STEP 6: Compute theory values using VERIFIED FORMULA (WITH gradients for backprop)
+        common_factor_v = (beta_x / t_beta) * (x_real / (t_real_valid + eps))
+        v_theory = torch.abs(common_factor_v * dx_dt_with_grad)
+
+        common_factor_a = (beta_v / t_beta) * (v_real / (t_real_valid + eps))
+        a_theory = torch.abs(common_factor_a * dv_dt_with_grad)
+
+        # STEP 7: Normalize theory back to log-normalized space (KEEP gradients!)
+        v_theory_normalized = (torch.log10(v_theory + eps) - alpha_v) / beta_v
+        a_theory_normalized = (torch.log10(a_theory + eps) - alpha_a) / beta_a
+
+        # STEP 8: Theory values now TRAINABLE (no detach - gradients flow through derivatives!)
+
+        # Extract ground truth targets (v' and a' in normalized log-space)
+        v_target = targets_valid[:, 4]  # v' target (SIGNED normalized log-space)
+        a_target = targets_valid[:, 5]  # a' target (SIGNED normalized log-space)
+
+        # STEP 9: Compute loss (log-space MSE or regular MSE based on use_log) - REVERSED gradient flow
         if self.use_log:
-            total_loss = torch.log(total_loss + eps)
+            # Log-space MSE - train derivatives to produce theory matching ground truth targets
+            log_v_target = torch.log(torch.abs(v_target) + eps)  # Target (ground truth)
+            log_v_theory = torch.log(torch.abs(v_theory_normalized) + eps)  # Theory has gradients!
+            v_consistency_loss = torch.mean((log_v_theory - log_v_target) ** 2)
+
+            log_a_target = torch.log(torch.abs(a_target) + eps)  # Target (ground truth)
+            log_a_theory = torch.log(torch.abs(a_theory_normalized) + eps)  # Theory has gradients!
+            a_consistency_loss = torch.mean((log_a_theory - log_a_target) ** 2)
+        else:
+            # Regular MSE - train derivatives to produce theory matching ground truth targets
+            v_consistency_loss = torch.mean(((torch.abs(v_theory_normalized) - torch.abs(v_target))/torch.abs(v_theory_normalized)) ** 2)
+            a_consistency_loss = torch.mean(((torch.abs(a_theory_normalized) - torch.abs(a_target))/torch.abs(a_theory_normalized)) ** 2)
+
+        # STEP 10: Total consistency loss
+        total_loss = v_consistency_loss + a_consistency_loss
 
         return total_loss
+
+
+class ConsistencyLoss_auto_diff_ver1(BaseLossComponent):
+    """
+    TRIANGULAR CONSISTENCY LOSS: Train predictions with triangular constraint.
+
+    Ensures consistency between THREE values: predictions (mag_v), theory (from derivatives), and targets.
+    Uses triangular loss to train predictions considering both theory and targets.
+
+    Key features:
+    - Model outputs UNSIGNED magnitudes (positive from Softplus) in normalized log-space
+    - Applies logabs signs from targets[:, 3:] to create SIGNED normalized log-space predictions
+    - Computes derivatives of UNSIGNED magnitudes via autograd with create_graph=True
+    - Derivatives are immediately DETACHED after computation
+    - PREDICTIONS (mag_v, mag_a) have GRADIENTS → trainable
+    - THEORY VALUES (v_theory, a_theory) are DETACHED → fixed (computed from derivatives)
+    - TARGETS (v_target, a_target) from ground truth → fixed reference
+    - Loss is triangular: (pred-theory)² + (theory-target)² + (pred-target)²
+    - Trains predictions to simultaneously match BOTH theory and target
+
+    Gradient Flow Direction:
+    - ver0: Train predictions → match fixed theory only
+    - THIS VERSION: Train predictions → match BOTH fixed theory AND targets (triangular)
+
+    Loss Formula:
+        L = (mag_v - v_theory)² + (v_theory - v_target)² + (mag_v - v_target)²
+
+    Where only mag_v has gradients. The triangular structure encourages:
+    1. Predictions to match theory (derivative consistency)
+    2. Theory to be close to targets (theory accuracy check)
+    3. Predictions to match targets directly (supervised learning)
+    """
+
+    def __init__(self, weight=1.0, model=None, t_threshold=1e-6, use_log=False, input_grad_outside=False):
+        super().__init__(weight=weight, name="Consistency Loss (auto ver1)")
+        self.model = model
+        self.t_threshold = t_threshold
+        self.use_log = use_log
+        self.input_grad_outside = input_grad_outside
+
+    def set_model(self, model):
+        """Set the model reference for gradient computation"""
+        self.model = model
+
+    def compute(self, predictions, targets, inputs=None, inputs_normalizer=None,
+                outputs_normalizer=None, ft_cal=None, valid_mask=None, **kwargs):
+        """
+        Enforces triangular consistency using verified formulas for log-normalized training.
+
+        Args:
+            predictions: If input_grad_outside=True, this is mag_preds from training loop
+                        If input_grad_outside=False, not used (we compute fresh predictions)
+            targets: (batch_size, 6) - [real_sign_x, real_sign_v, real_sign_a, x', v', a']
+                     where [:, 0:3] are real space signs (±1)
+                     and [:, 3:6] are SIGNED normalized log-space values (can be ±)
+            inputs: (batch_size, 3) - [a, b, t] NORMALIZED
+            inputs_normalizer: Normalizer for inputs (contains t normalization params)
+            outputs_normalizer: Normalizer for outputs (contains x, v, a normalization params)
+            ft_cal: (batch_size, 3) - Finetune calibration outputs [ft_x, ft_v, ft_a] in normalized log-space
+            valid_mask: If input_grad_outside=True, boolean mask for valid samples (t_real > threshold)
+                       If input_grad_outside=False, not used (computed internally)
+
+        Returns:
+            loss: Scalar tensor measuring triangular consistency error
+        """
+        if inputs_normalizer is None or outputs_normalizer is None:
+            raise ValueError("Both inputs_normalizer and outputs_normalizer must be provided")
+
+        device = inputs.device
+        dtype = inputs.dtype
+        eps = 1e-12
+
+        # Get normalization parameters (needed for both modes)
+        beta_x = generalize_beta(outputs_normalizer, outputs_normalizer.log_mean['x'], outputs_normalizer.log_std['x'], 'x')
+        beta_v = generalize_beta(outputs_normalizer, outputs_normalizer.log_mean['v'], outputs_normalizer.log_std['v'], 'v')
+        beta_a = generalize_beta(outputs_normalizer, outputs_normalizer.log_mean['a'], outputs_normalizer.log_std['a'], 'a')
+        alpha_x = generalize_alpha(outputs_normalizer, outputs_normalizer.log_mean['x'], outputs_normalizer.log_std['x'], 'x')
+        alpha_v = generalize_alpha(outputs_normalizer, outputs_normalizer.log_mean['v'], outputs_normalizer.log_std['v'], 'v')
+        alpha_a = generalize_alpha(outputs_normalizer, outputs_normalizer.log_mean['a'], outputs_normalizer.log_std['a'], 'a')
+        t_alpha = generalize_alpha(inputs_normalizer, inputs_normalizer.log_mean['t'], inputs_normalizer.log_std['t'], 't')
+        t_beta = generalize_beta(inputs_normalizer, inputs_normalizer.log_mean['t'], inputs_normalizer.log_std['t'], 't')
+        ln10 = torch.log(torch.tensor(10.0, device=device, dtype=dtype))
+
+        # ======================
+        # MODE SELECTION: Compute mag_x, mag_v, mag_a and their derivatives
+        # ======================
+        if self.input_grad_outside:
+            # MODE 1: Gradients computed in training loop
+            # Use mag_preds from training loop (predictions parameter)
+            # Use valid_mask passed from training loop
+
+            if predictions is None:
+                raise ValueError("When input_grad_outside=True, predictions (mag_preds) must be provided")
+            if ft_cal is None:
+                raise ValueError("When input_grad_outside=True, ft_cal must be provided")
+            if valid_mask is None:
+                raise ValueError("When input_grad_outside=True, valid_mask must be provided")
+
+            # Filter to valid samples
+            mag_preds_valid = predictions[valid_mask]
+            inputs_valid = inputs[valid_mask]
+            targets_valid = targets[valid_mask]
+            ft_cal_valid = ft_cal[valid_mask]
+
+            # Compute t_real for valid samples
+            t_normalized_valid = inputs_valid[:, 2]
+            t_real_valid = torch.exp((t_beta * t_normalized_valid + t_alpha) * ln10)
+
+            # STEP 1: Get unsigned magnitude predictions and compute derivatives separately
+            # Detect phase
+            is_phase1 = torch.all(torch.abs(ft_cal_valid) < eps)
+
+            # STEP 1a: Compute values (for loss calculation)
+            mag_x = mag_preds_valid[:, 0] + ft_cal_valid[:, 0]
+            mag_v = mag_preds_valid[:, 1] + ft_cal_valid[:, 1]
+            mag_a = mag_preds_valid[:, 2] + ft_cal_valid[:, 2]
+
+            # STEP 1b: Compute derivatives separately, then sum
+            # Always compute derivatives of mag_preds components
+            dx_mag_dt = torch.autograd.grad(
+                outputs=mag_preds_valid[:, 0],
+                inputs=inputs,
+                grad_outputs=torch.ones_like(mag_preds_valid[:, 0]),
+                create_graph=True,
+                retain_graph=True,
+                allow_unused=True
+            )[0][valid_mask, 2]  # Gradient w.r.t. t_normalized, filter by valid_mask
+
+            dv_mag_dt = torch.autograd.grad(
+                outputs=mag_preds_valid[:, 1],
+                inputs=inputs,
+                grad_outputs=torch.ones_like(mag_preds_valid[:, 1]),
+                create_graph=True,
+                retain_graph=True,
+                allow_unused=True
+            )[0][valid_mask, 2]  # Gradient w.r.t. t_normalized, filter by valid_mask
+
+            if is_phase1:
+                # Phase 1: Only use mag derivatives (ft_cal is zeros)
+                dx_prime_dt_prime = torch.abs(dx_mag_dt)
+                dv_prime_dt_prime = torch.abs(dv_mag_dt)
+            else:
+                # Phase 2: Compute ft_cal derivatives and add them
+                dx_ft_dt = torch.autograd.grad(
+                    outputs=ft_cal_valid[:, 0],
+                    inputs=inputs,
+                    grad_outputs=torch.ones_like(ft_cal_valid[:, 0]),
+                    create_graph=True,
+                    retain_graph=True,
+                    allow_unused=True
+                )[0][valid_mask, 2]  # Gradient w.r.t. t_normalized, filter by valid_mask
+
+                dv_ft_dt = torch.autograd.grad(
+                    outputs=ft_cal_valid[:, 1],
+                    inputs=inputs,
+                    grad_outputs=torch.ones_like(ft_cal_valid[:, 1]),
+                    create_graph=True,
+                    retain_graph=True,
+                    allow_unused=True
+                )[0][valid_mask, 2]  # Gradient w.r.t. t_normalized, filter by valid_mask
+
+                # Sum derivatives (linearity: d(f+g)/dt = df/dt + dg/dt)
+                dx_prime_dt_prime = torch.abs(dx_mag_dt) + dx_ft_dt
+                dv_prime_dt_prime = torch.abs(dv_mag_dt) + dv_ft_dt
+
+        else:
+            # MODE 2: Gradients computed inside consistency loss (current approach)
+            # Call model internally with inputs_with_grad
+
+            if self.model is None:
+                raise ValueError("When input_grad_outside=False, model must be set via set_model()")
+            if ft_cal is None:
+                raise ValueError("When input_grad_outside=False, ft_cal must be provided")
+
+            # Denormalize inputs to get t_real
+            t_normalized = inputs[:, 2]
+            t_real = torch.exp((t_beta * t_normalized + t_alpha) * ln10)
+
+            # Filter out samples where t_real ≈ 0 (to avoid division by zero)
+            valid_mask = t_real > self.t_threshold
+
+            if valid_mask.sum() == 0:
+                return torch.tensor(0.0, device=device)
+
+            # Filter to valid samples
+            inputs_valid = inputs[valid_mask]
+            targets_valid = targets[valid_mask]
+            t_real_valid = t_real[valid_mask]
+            ft_cal_valid = ft_cal[valid_mask]
+
+            # Enable gradient tracking on inputs
+            inputs_with_grad = inputs_valid.clone().requires_grad_(True)
+
+            # Forward pass to get model outputs
+            # Model returns tuple: (mag_preds, logabs_sign_pred, real_sign_pred, ft_cal_from_model)
+            mag_preds_internal, _, _, ft_preds_internal = self.model(inputs_with_grad)
+
+            # STEP 1: Get unsigned magnitude predictions and compute derivatives separately
+            # Detect phase
+            is_phase1 = torch.all(torch.abs(ft_cal_valid) < eps)
+
+            # STEP 1a: Compute values (for loss calculation)
+            mag_x = mag_preds_internal[:, 0] + ft_preds_internal[:, 0]
+            mag_v = mag_preds_internal[:, 1] + ft_preds_internal[:, 1]
+            mag_a = mag_preds_internal[:, 2] + ft_preds_internal[:, 2]
+
+            # STEP 1b: Compute derivatives separately, then sum
+            # Always compute derivatives of mag_preds_internal components
+            dx_mag_dt = torch.autograd.grad(
+                outputs=mag_preds_internal[:, 0],
+                inputs=inputs_with_grad,
+                grad_outputs=torch.ones_like(mag_preds_internal[:, 0]),
+                create_graph=True,
+                retain_graph=True,
+                allow_unused=True
+            )[0][:, 2]  # Gradient w.r.t. t_normalized (index 2)
+
+            dv_mag_dt = torch.autograd.grad(
+                outputs=mag_preds_internal[:, 1],
+                inputs=inputs_with_grad,
+                grad_outputs=torch.ones_like(mag_preds_internal[:, 1]),
+                create_graph=True,
+                retain_graph=True,
+                allow_unused=True
+            )[0][:, 2]  # Gradient w.r.t. t_normalized (index 2)
+
+            if is_phase1:
+                # Phase 1: Only use mag derivatives (finetune network untrained)
+                dx_prime_dt_prime = torch.abs(dx_mag_dt)
+                dv_prime_dt_prime = torch.abs(dv_mag_dt)
+            else:
+                # Phase 2: Compute ft_preds derivatives and add them
+                dx_ft_dt = torch.autograd.grad(
+                    outputs=ft_preds_internal[:, 0],
+                    inputs=inputs_with_grad,
+                    grad_outputs=torch.ones_like(ft_preds_internal[:, 0]),
+                    create_graph=True,
+                    retain_graph=True,
+                    allow_unused=True
+                )[0][:, 2]  # Gradient w.r.t. t_normalized (index 2)
+
+                dv_ft_dt = torch.autograd.grad(
+                    outputs=ft_preds_internal[:, 1],
+                    inputs=inputs_with_grad,
+                    grad_outputs=torch.ones_like(ft_preds_internal[:, 1]),
+                    create_graph=True,
+                    retain_graph=True,
+                    allow_unused=True
+                )[0][:, 2]  # Gradient w.r.t. t_normalized (index 2)
+
+                # Sum derivatives (linearity: d(f+g)/dt = df/dt + dg/dt)
+                dx_prime_dt_prime = torch.abs(dx_mag_dt) + dx_ft_dt
+                dv_prime_dt_prime = torch.abs(dv_mag_dt) + dv_ft_dt
+
+        # ======================
+        # COMMON CODE: Apply signs and compute theory values
+        # ======================
+        # STEP 3: Apply logabs signs (from targets[:, 3:]) → SIGNED normalized log-space predictions
+        # targets[:, 3:] contains SIGNED normalized log-space values (can be ±)
+        logabs_targets = targets_valid[:, 3:]  # [x', v', a'] in normalized log-space (signed)
+        logabs_sign = torch.sign(logabs_targets)  # Extract signs from logabs targets
+
+        x_pred = logabs_sign[:, 0] * mag_x  # Signed normalized log-space
+        v_pred = logabs_sign[:, 1] * mag_v  # Signed normalized log-space
+
+        # STEP 4: Keep predictions WITH gradients, but DETACH derivatives
+        x_pred_detached = x_pred.detach()  # Detached for denormalization
+        v_pred_detached = v_pred.detach()  # Detached for denormalization
+        dx_dt_detached = dx_prime_dt_prime.detach()  # DETACH derivatives - theory won't have gradients
+        dv_dt_detached = dv_prime_dt_prime.detach()  # DETACH derivatives - theory won't have gradients
+
+        # STEP 5: Denormalize SIGNED predictions to real space
+        # This matches dataset: x_prime is signed in normalized space
+        x_real = torch.exp((beta_x * x_pred_detached + alpha_x) * ln10)
+        v_real = torch.exp((beta_v * v_pred_detached + alpha_v) * ln10)
+
+        # STEP 6: Compute theory values using VERIFIED FORMULA (derivatives detached - no gradients!)
+        common_factor_v = (beta_x / t_beta) * (x_real / (t_real_valid + eps))
+        v_theory = torch.abs(common_factor_v * dx_dt_detached)
+
+        common_factor_a = (beta_v / t_beta) * (v_real / (t_real_valid + eps))
+        a_theory = torch.abs(common_factor_a * dv_dt_detached)
+
+        # STEP 7: Normalize theory back to log-normalized space (no gradients - derivatives detached)
+        v_theory_normalized = (torch.log10(v_theory + eps) - alpha_v) / beta_v
+        a_theory_normalized = (torch.log10(a_theory + eps) - alpha_a) / beta_a
+
+        # STEP 8: Extract ground truth targets (v' and a' in normalized log-space)
+        v_target = targets_valid[:, 4]  # v' target (SIGNED normalized log-space)
+        a_target = targets_valid[:, 5]  # a' target (SIGNED normalized log-space)
+
+        # # STEP 9: Compute TRIANGULAR loss - all three values contribute
+        # if self.use_log:
+        #     # Log-space MAE - triangular consistency between pred, theory, and target
+        #     log_mag_v = torch.log(torch.abs(mag_v) + eps)  # Prediction has gradients!
+        #     log_v_theory = torch.log(torch.abs(v_theory_normalized) + eps)  # Theory DETACHED (no gradients)
+        #     log_v_target = torch.log(torch.abs(v_target) + eps)  # Target (ground truth)
+
+        #     # Triangular loss: |pred-theory| + |theory-target| + |pred-target|
+        #     # Only mag_v has gradients - trains predictions to match both theory and target
+        #     v_consistency_loss = torch.mean(
+        #     torch.abs(log_mag_v - log_v_theory) +
+        #     torch.abs(log_v_theory - log_v_target) +
+        #     torch.abs(log_mag_v - log_v_target)
+        #     )
+
+        #     log_mag_a = torch.log(torch.abs(mag_a) + eps)  # Prediction has gradients!
+        #     log_a_theory = torch.log(torch.abs(a_theory_normalized) + eps)  # Theory DETACHED (no gradients)
+        #     log_a_target = torch.log(torch.abs(a_target) + eps)  # Target (ground truth)
+
+        #     # Triangular loss: |pred-theory| + |theory-target| + |pred-target|
+        #     # Only mag_a has gradients - trains predictions to match both theory and target
+        #     a_consistency_loss = torch.mean(
+        #     torch.abs(log_mag_a - log_a_theory) +
+        #     torch.abs(log_a_theory - log_a_target) +
+        #     torch.abs(log_mag_a - log_a_target)
+        #     )
+        # else:
+        #     # Regular MAE - triangular consistency
+        #     v_consistency_loss = torch.mean(
+        #     torch.abs((torch.abs(mag_v) - torch.abs(v_theory_normalized)) / torch.abs(mag_v)) +
+        #     torch.abs((torch.abs(v_theory_normalized) - torch.abs(v_target)) / torch.abs(v_theory_normalized)) +
+        #     torch.abs((torch.abs(mag_v) - torch.abs(v_target)) / torch.abs(mag_v))
+        #     )
+
+        #     a_consistency_loss = torch.mean(
+        #     torch.abs((torch.abs(mag_a) - torch.abs(a_theory_normalized)) / torch.abs(mag_a)) +
+        #     torch.abs((torch.abs(a_theory_normalized) - torch.abs(a_target)) / torch.abs(a_theory_normalized)) +
+        #     torch.abs((torch.abs(mag_a) - torch.abs(a_target)) / torch.abs(mag_a))
+        #     )
+
+        # STEP 9: Compute TRIANGULAR loss - all three values contribute
+        if self.use_log:
+            # Log-space MSE - triangular consistency between pred, theory, and target
+            log_mag_v = torch.log(torch.abs(mag_v) + eps)  # Prediction has gradients!
+            log_v_theory = torch.log(torch.abs(v_theory_normalized) + eps)  # Theory DETACHED (no gradients)
+            log_v_target = torch.log(torch.abs(v_target) + eps)  # Target (ground truth)
+
+            # Triangular loss: (pred-theory)² + (theory-target)² + (pred-target)²
+            # Only mag_v has gradients - trains predictions to match both theory and target
+            v_consistency_loss = torch.mean(
+                (log_mag_v - log_v_theory) ** 2 +
+                (log_v_theory - log_v_target) ** 2 +
+                (log_mag_v - log_v_target) ** 2
+            )
+
+            log_mag_a = torch.log(torch.abs(mag_a) + eps)  # Prediction has gradients!
+            log_a_theory = torch.log(torch.abs(a_theory_normalized) + eps)  # Theory DETACHED (no gradients)
+            log_a_target = torch.log(torch.abs(a_target) + eps)  # Target (ground truth)
+
+            # Triangular loss: (pred-theory)² + (theory-target)² + (pred-target)²
+            # Only mag_a has gradients - trains predictions to match both theory and target
+            a_consistency_loss = torch.mean(
+                (log_mag_a - log_a_theory) ** 2 +
+                (log_a_theory - log_a_target) ** 2 +
+                (log_mag_a - log_a_target) ** 2
+            )
+        else:
+            # Regular MSE - triangular consistency
+            v_consistency_loss = torch.mean(
+                ((torch.abs(mag_v) - torch.abs(v_theory_normalized))/torch.abs(mag_v)) ** 2 +
+                ((torch.abs(v_theory_normalized) - torch.abs(v_target))/torch.abs(v_theory_normalized)) ** 2 +
+                ((torch.abs(mag_v) - torch.abs(v_target))/torch.abs(mag_v)) ** 2
+            )
+
+            a_consistency_loss = torch.mean(
+                ((torch.abs(mag_a) - torch.abs(a_theory_normalized))/torch.abs(mag_a)) ** 2 +
+                ((torch.abs(a_theory_normalized) - torch.abs(a_target))/torch.abs(a_theory_normalized)) ** 2 +
+                ((torch.abs(mag_a) - torch.abs(a_target))/torch.abs(mag_a)) ** 2
+            )
+
+        # STEP 10: Total consistency loss
+        total_loss = v_consistency_loss + a_consistency_loss
+
+        return total_loss
+
+class ConsistencyLoss_auto_diff_ver2(BaseLossComponent):
+    """
+    TRIANGULAR CONSISTENCY LOSS with GRADIENT RESCALING: Train predictions with triangular constraint and ft derivative control.
+
+    Identical to ver1 but adds gradient rescaling to prevent finetune network from dominating in Phase 2.
+
+    Key features (same as ver1):
+    - Model outputs UNSIGNED magnitudes (positive from Softplus) in normalized log-space
+    - Applies logabs signs from targets[:, 3:] to create SIGNED normalized log-space predictions
+    - Computes derivatives of UNSIGNED magnitudes via autograd with create_graph=True
+    - Derivatives are immediately DETACHED after computation
+    - PREDICTIONS (mag_v, mag_a) have GRADIENTS → trainable
+    - THEORY VALUES (v_theory, a_theory) are DETACHED → fixed (computed from derivatives)
+    - TARGETS (v_target, a_target) from ground truth → fixed reference
+    - Loss is triangular: (pred-theory)² + (theory-target)² + (pred-target)²
+
+    NEW in ver2:
+    - GRADIENT RESCALING: In Phase 2, ft derivatives are clamped to ±(|dx_mag| + |dx_mag|)
+    - Prevents finetune network from overwhelming magnitude network
+    - Scaling factor is detached to avoid affecting gradient magnitude
+
+    Gradient Flow Direction:
+    - Same as ver1: Train predictions → match BOTH fixed theory AND targets (triangular)
+    - ver2 adds: Constrained ft derivative contribution in Phase 2
+
+    Loss Formula (same as ver1):
+        L = (mag_v - v_theory)² + (v_theory - v_target)² + (mag_v - v_target)²
+
+    Where only mag_v has gradients. The triangular structure encourages:
+    1. Predictions to match theory (derivative consistency)
+    2. Theory to be close to targets (theory accuracy check)
+    3. Predictions to match targets directly (supervised learning)
+    """
+
+    def __init__(self, weight=1.0, model=None, t_threshold=1e-6, use_log=False, input_grad_outside=False):
+        super().__init__(weight=weight, name="Consistency Loss (auto ver2)")
+        self.model = model
+        self.t_threshold = t_threshold
+        self.use_log = use_log
+        self.input_grad_outside = input_grad_outside
+
+    def set_model(self, model):
+        """Set the model reference for gradient computation"""
+        self.model = model
+
+    def compute(self, predictions, targets, inputs=None, inputs_normalizer=None,
+                outputs_normalizer=None, ft_cal=None, valid_mask=None, **kwargs):
+        """
+        Enforces triangular consistency using verified formulas for log-normalized training.
+        Includes gradient rescaling for ft derivatives in Phase 2.
+
+        Args:
+            predictions: If input_grad_outside=True, this is mag_preds from training loop
+                        If input_grad_outside=False, not used (we compute fresh predictions)
+            targets: (batch_size, 6) - [real_sign_x, real_sign_v, real_sign_a, x', v', a']
+                     where [:, 0:3] are real space signs (±1)
+                     and [:, 3:6] are SIGNED normalized log-space values (can be ±)
+            inputs: (batch_size, 3) - [a, b, t] NORMALIZED
+            inputs_normalizer: Normalizer for inputs (contains t normalization params)
+            outputs_normalizer: Normalizer for outputs (contains x, v, a normalization params)
+            ft_cal: (batch_size, 3) - Finetune calibration outputs [ft_x, ft_v, ft_a] in normalized log-space
+            valid_mask: If input_grad_outside=True, boolean mask for valid samples (t_real > threshold)
+                       If input_grad_outside=False, not used (computed internally)
+
+        Returns:
+            loss: Scalar tensor measuring triangular consistency error
+        """
+        if inputs_normalizer is None or outputs_normalizer is None:
+            raise ValueError("Both inputs_normalizer and outputs_normalizer must be provided")
+
+        device = inputs.device
+        dtype = inputs.dtype
+        eps = 1e-12
+
+        # Get normalization parameters (needed for both modes)
+        beta_x = generalize_beta(outputs_normalizer, outputs_normalizer.log_mean['x'], outputs_normalizer.log_std['x'], 'x')
+        beta_v = generalize_beta(outputs_normalizer, outputs_normalizer.log_mean['v'], outputs_normalizer.log_std['v'], 'v')
+        beta_a = generalize_beta(outputs_normalizer, outputs_normalizer.log_mean['a'], outputs_normalizer.log_std['a'], 'a')
+        alpha_x = generalize_alpha(outputs_normalizer, outputs_normalizer.log_mean['x'], outputs_normalizer.log_std['x'], 'x')
+        alpha_v = generalize_alpha(outputs_normalizer, outputs_normalizer.log_mean['v'], outputs_normalizer.log_std['v'], 'v')
+        alpha_a = generalize_alpha(outputs_normalizer, outputs_normalizer.log_mean['a'], outputs_normalizer.log_std['a'], 'a')
+        t_alpha = generalize_alpha(inputs_normalizer, inputs_normalizer.log_mean['t'], inputs_normalizer.log_std['t'], 't')
+        t_beta = generalize_beta(inputs_normalizer, inputs_normalizer.log_mean['t'], inputs_normalizer.log_std['t'], 't')
+        ln10 = torch.log(torch.tensor(10.0, device=device, dtype=dtype))
+
+        # ======================
+        # MODE SELECTION: Compute mag_x, mag_v, mag_a and their derivatives
+        # ======================
+        if self.input_grad_outside:
+            # MODE 1: Gradients computed in training loop
+            # Use mag_preds from training loop (predictions parameter)
+            # Use valid_mask passed from training loop
+
+            if predictions is None:
+                raise ValueError("When input_grad_outside=True, predictions (mag_preds) must be provided")
+            if ft_cal is None:
+                raise ValueError("When input_grad_outside=True, ft_cal must be provided")
+            if valid_mask is None:
+                raise ValueError("When input_grad_outside=True, valid_mask must be provided")
+
+            # Filter to valid samples
+            mag_preds_valid = predictions[valid_mask]
+            inputs_valid = inputs[valid_mask]
+            targets_valid = targets[valid_mask]
+            ft_cal_valid = ft_cal[valid_mask]
+
+            # Compute t_real for valid samples
+            t_normalized_valid = inputs_valid[:, 2]
+            t_real_valid = torch.exp((t_beta * t_normalized_valid + t_alpha) * ln10)
+
+            # STEP 1: Get unsigned magnitude predictions and compute derivatives separately
+            # Detect phase
+            is_phase1 = torch.all(torch.abs(ft_cal_valid) < eps)
+
+            # STEP 1a: Compute values (for loss calculation)
+            mag_x = mag_preds_valid[:, 0] + ft_cal_valid[:, 0]
+            mag_v = mag_preds_valid[:, 1] + ft_cal_valid[:, 1]
+            mag_a = mag_preds_valid[:, 2] + ft_cal_valid[:, 2]
+
+            # STEP 1b: Compute derivatives separately, then sum
+            # Always compute derivatives of mag_preds components
+            dx_mag_dt = torch.autograd.grad(
+                outputs=mag_preds_valid[:, 0],
+                inputs=inputs,
+                grad_outputs=torch.ones_like(mag_preds_valid[:, 0]),
+                create_graph=True,
+                retain_graph=True,
+                allow_unused=True
+            )[0][valid_mask, 2]  # Gradient w.r.t. t_normalized, filter by valid_mask
+
+            dv_mag_dt = torch.autograd.grad(
+                outputs=mag_preds_valid[:, 1],
+                inputs=inputs,
+                grad_outputs=torch.ones_like(mag_preds_valid[:, 1]),
+                create_graph=True,
+                retain_graph=True,
+                allow_unused=True
+            )[0][valid_mask, 2]  # Gradient w.r.t. t_normalized, filter by valid_mask
+
+            if is_phase1:
+                # Phase 1: Only use mag derivatives (ft_cal is zeros)
+                dx_prime_dt_prime = torch.abs(dx_mag_dt)
+                dv_prime_dt_prime = torch.abs(dv_mag_dt)
+            else:
+                # Phase 2: Compute ft_cal derivatives and add them WITH RESCALING
+                dx_ft_dt = torch.autograd.grad(
+                    outputs=ft_cal_valid[:, 0],
+                    inputs=inputs,
+                    grad_outputs=torch.ones_like(ft_cal_valid[:, 0]),
+                    create_graph=True,
+                    retain_graph=True,
+                    allow_unused=True
+                )[0][valid_mask, 2]  # Gradient w.r.t. t_normalized, filter by valid_mask
+
+                dv_ft_dt = torch.autograd.grad(
+                    outputs=ft_cal_valid[:, 1],
+                    inputs=inputs,
+                    grad_outputs=torch.ones_like(ft_cal_valid[:, 1]),
+                    create_graph=True,
+                    retain_graph=True,
+                    allow_unused=True
+                )[0][valid_mask, 2]  # Gradient w.r.t. t_normalized, filter by valid_mask
+
+                # RESCALING CONSTRAINT: Prevent ft derivatives from dominating
+                # Compute target derivatives first for rescaling bound
+                # Extract targets
+                x_target = targets_valid[:, 3]  # x' target (SIGNED normalized log-space)
+                v_target = targets_valid[:, 4]  # v' target (SIGNED normalized log-space)
+                a_target = targets_valid[:, 5]  # a' target (SIGNED normalized log-space)
+
+                # Denormalize targets to real space
+                x_target_real = torch.exp((beta_x * x_target + alpha_x) * ln10)
+                v_target_real = torch.exp((beta_v * v_target + alpha_v) * ln10)
+                a_target_real = torch.exp((beta_a * a_target + alpha_a) * ln10)
+
+                # Compute common factors from targets
+                common_factor_v_target = (beta_x / t_beta) * (x_target_real / (t_real_valid + eps))
+                common_factor_a_target = (beta_v / t_beta) * (v_target_real / (t_real_valid + eps))
+
+                # Invert to get target derivatives (for bound calculation only)
+                dx_dt_target = v_target_real / (common_factor_v_target + eps)
+                dv_dt_target = a_target_real / (common_factor_a_target + eps)
+
+                # Calculate scale factor (DETACHED - no gradients affect scaling)
+                # Bound: |dx_mag| + |dx_target|
+                # Scale: bound / |dx_ft| when |dx_ft| exceeds bound
+                with torch.no_grad():
+                    bound_x = torch.abs(dx_mag_dt) + torch.abs(dx_dt_target)
+                    bound_v = torch.abs(dv_mag_dt) + torch.abs(dv_dt_target)
+
+                    # When |dx_ft| > bound: scale = bound / |dx_ft| to bring it down to bound
+                    # When |dx_ft| <= bound: scale = 1.0 (no rescaling)
+                    scale_x = torch.clamp(bound_x / (torch.abs(dx_ft_dt) + eps), max=1.0)
+                    scale_v = torch.clamp(bound_v / (torch.abs(dv_ft_dt) + eps), max=1.0)
+
+                # Apply scaling (gradients flow through dx_ft_dt, scale is detached)
+                dx_ft_dt_stable = dx_ft_dt #* scale_x
+                dv_ft_dt_stable = dv_ft_dt #* scale_v
+
+                # Sum derivatives with rescaled ft components
+                dx_prime_dt_prime = torch.abs(dx_mag_dt) + dx_ft_dt_stable
+                dv_prime_dt_prime = torch.abs(dv_mag_dt) + dv_ft_dt_stable
+
+        else:
+            # MODE 2: Gradients computed inside consistency loss (current approach)
+            # Call model internally with inputs_with_grad
+
+            if self.model is None:
+                raise ValueError("When input_grad_outside=False, model must be set via set_model()")
+            if ft_cal is None:
+                raise ValueError("When input_grad_outside=False, ft_cal must be provided")
+
+            # Denormalize inputs to get t_real
+            t_normalized = inputs[:, 2]
+            t_real = torch.exp((t_beta * t_normalized + t_alpha) * ln10)
+
+            # Filter out samples where t_real ≈ 0 (to avoid division by zero)
+            valid_mask = t_real > self.t_threshold
+
+            if valid_mask.sum() == 0:
+                return torch.tensor(0.0, device=device)
+
+            # Filter to valid samples
+            inputs_valid = inputs[valid_mask]
+            targets_valid = targets[valid_mask]
+            t_real_valid = t_real[valid_mask]
+            ft_cal_valid = ft_cal[valid_mask]
+
+            # Enable gradient tracking on inputs
+            inputs_with_grad = inputs_valid.clone().requires_grad_(True)
+
+            # Forward pass to get model outputs
+            # Model returns tuple: (mag_preds, logabs_sign_pred, real_sign_pred, ft_cal_from_model)
+            mag_preds_internal, _, _, ft_preds_internal = self.model(inputs_with_grad)
+
+            # STEP 1: Get unsigned magnitude predictions and compute derivatives separately
+            # Detect phase
+            is_phase1 = torch.all(torch.abs(ft_cal_valid) < eps)
+
+            # STEP 1a: Compute values (for loss calculation)
+            mag_x = mag_preds_internal[:, 0] + ft_preds_internal[:, 0]
+            mag_v = mag_preds_internal[:, 1] + ft_preds_internal[:, 1]
+            mag_a = mag_preds_internal[:, 2] + ft_preds_internal[:, 2]
+
+            # STEP 1b: Compute derivatives separately, then sum
+            # Always compute derivatives of mag_preds_internal components
+            dx_mag_dt = torch.autograd.grad(
+                outputs=mag_preds_internal[:, 0],
+                inputs=inputs_with_grad,
+                grad_outputs=torch.ones_like(mag_preds_internal[:, 0]),
+                create_graph=True,
+                retain_graph=True,
+                allow_unused=True
+            )[0][:, 2]  # Gradient w.r.t. t_normalized (index 2)
+
+            dv_mag_dt = torch.autograd.grad(
+                outputs=mag_preds_internal[:, 1],
+                inputs=inputs_with_grad,
+                grad_outputs=torch.ones_like(mag_preds_internal[:, 1]),
+                create_graph=True,
+                retain_graph=True,
+                allow_unused=True
+            )[0][:, 2]  # Gradient w.r.t. t_normalized (index 2)
+
+            if is_phase1:
+                # Phase 1: Only use mag derivatives (finetune network untrained)
+                dx_prime_dt_prime = torch.abs(dx_mag_dt)
+                dv_prime_dt_prime = torch.abs(dv_mag_dt)
+            else:
+                # Phase 2: Compute ft_preds derivatives and add them WITH RESCALING
+                dx_ft_dt = torch.autograd.grad(
+                    outputs=ft_preds_internal[:, 0],
+                    inputs=inputs_with_grad,
+                    grad_outputs=torch.ones_like(ft_preds_internal[:, 0]),
+                    create_graph=True,
+                    retain_graph=True,
+                    allow_unused=True
+                )[0][:, 2]  # Gradient w.r.t. t_normalized (index 2)
+
+                dv_ft_dt = torch.autograd.grad(
+                    outputs=ft_preds_internal[:, 1],
+                    inputs=inputs_with_grad,
+                    grad_outputs=torch.ones_like(ft_preds_internal[:, 1]),
+                    create_graph=True,
+                    retain_graph=True,
+                    allow_unused=True
+                )[0][:, 2]  # Gradient w.r.t. t_normalized (index 2)
+
+                # RESCALING CONSTRAINT: Prevent ft derivatives from dominating
+                # Compute target derivatives first for rescaling bound
+                # Extract targets
+                x_target = targets_valid[:, 3]  # x' target (SIGNED normalized log-space)
+                v_target = targets_valid[:, 4]  # v' target (SIGNED normalized log-space)
+                a_target = targets_valid[:, 5]  # a' target (SIGNED normalized log-space)
+
+                # Denormalize targets to real space
+                x_target_real = torch.exp((beta_x * x_target + alpha_x) * ln10)
+                v_target_real = torch.exp((beta_v * v_target + alpha_v) * ln10)
+                a_target_real = torch.exp((beta_a * a_target + alpha_a) * ln10)
+
+                # Compute common factors from targets
+                common_factor_v_target = (beta_x / t_beta) * (x_target_real / (t_real_valid + eps))
+                common_factor_a_target = (beta_v / t_beta) * (v_target_real / (t_real_valid + eps))
+
+                # Invert to get target derivatives (for bound calculation only)
+                dx_dt_target = v_target_real / (common_factor_v_target + eps)
+                dv_dt_target = a_target_real / (common_factor_a_target + eps)
+
+                # Calculate scale factor (DETACHED - no gradients affect scaling)
+                # Bound: |dx_mag| + |dx_target|
+                # Scale: bound / |dx_ft| when |dx_ft| exceeds bound
+                with torch.no_grad():
+                    bound_x = torch.abs(dx_mag_dt) + torch.abs(dx_dt_target)
+                    bound_v = torch.abs(dv_mag_dt) + torch.abs(dv_dt_target)
+
+                    # When |dx_ft| > bound: scale = bound / |dx_ft| to bring it down to bound
+                    # When |dx_ft| <= bound: scale = 1.0 (no rescaling)
+                    scale_x = torch.clamp(bound_x / (torch.abs(dx_ft_dt) + eps), max=1.0)
+                    scale_v = torch.clamp(bound_v / (torch.abs(dv_ft_dt) + eps), max=1.0)
+
+                # Apply scaling (gradients flow through dx_ft_dt, scale is detached)
+                dx_ft_dt_stable = dx_ft_dt #* scale_x
+                dv_ft_dt_stable = dv_ft_dt #* scale_v
+
+                # Sum derivatives with rescaled ft components
+                dx_prime_dt_prime = torch.abs(dx_mag_dt) + dx_ft_dt_stable
+                dv_prime_dt_prime = torch.abs(dv_mag_dt) + dv_ft_dt_stable
+
+        # ======================
+        # COMMON CODE: Apply signs and compute theory values
+        # ======================
+        # STEP 3: Apply logabs signs (from targets[:, 3:]) → SIGNED normalized log-space predictions
+        # targets[:, 3:] contains SIGNED normalized log-space values (can be ±)
+        logabs_targets = targets_valid[:, 3:]  # [x', v', a'] in normalized log-space (signed)
+        logabs_sign = torch.sign(logabs_targets)  # Extract signs from logabs targets
+
+        x_pred = logabs_sign[:, 0] * mag_x  # Signed normalized log-space
+        v_pred = logabs_sign[:, 1] * mag_v  # Signed normalized log-space
+
+        # STEP 4: Keep predictions WITH gradients, but DETACH derivatives
+        x_pred_detached = x_pred.detach()  # Detached for denormalization
+        v_pred_detached = v_pred.detach()  # Detached for denormalization
+        dx_dt_detached = dx_prime_dt_prime.detach()  # DETACH derivatives - theory won't have gradients
+        dv_dt_detached = dv_prime_dt_prime.detach()  # DETACH derivatives - theory won't have gradients
+
+        # STEP 5: Denormalize SIGNED predictions to real space
+        # This matches dataset: x_prime is signed in normalized space
+        x_real = torch.exp((beta_x * x_pred_detached + alpha_x) * ln10)
+        v_real = torch.exp((beta_v * v_pred_detached + alpha_v) * ln10)
+
+        # STEP 6: Compute theory values using VERIFIED FORMULA (derivatives detached - no gradients!)
+        common_factor_v = (beta_x / t_beta) * (x_real / (t_real_valid + eps))
+        v_theory = torch.abs(common_factor_v * dx_dt_detached)
+
+        common_factor_a = (beta_v / t_beta) * (v_real / (t_real_valid + eps))
+        a_theory = torch.abs(common_factor_a * dv_dt_detached)
+
+        # STEP 7: Normalize theory back to log-normalized space (no gradients - derivatives detached)
+        v_theory_normalized = (torch.log10(v_theory + eps) - alpha_v) / beta_v
+        a_theory_normalized = (torch.log10(a_theory + eps) - alpha_a) / beta_a
+
+        # STEP 8: Extract ground truth targets (v' and a' in normalized log-space)
+        v_target = targets_valid[:, 4]  # v' target (SIGNED normalized log-space)
+        a_target = targets_valid[:, 5]  # a' target (SIGNED normalized log-space)
+        
+        # STEP 9: Compute TRIANGULAR loss - all three values contribute
+        if self.use_log:
+            # Log-space MSE - triangular consistency between pred, theory, and target
+            log_mag_v = torch.log(torch.abs(mag_v) + eps)  # Prediction has gradients!
+            log_v_theory = torch.log(torch.abs(v_theory_normalized) + eps)  # Theory DETACHED (no gradients)
+            log_v_target = torch.log(torch.abs(v_target) + eps)  # Target (ground truth)
+
+            # Triangular loss: (pred-theory)² + (theory-target)² + (pred-target)²
+            # Only mag_v has gradients - trains predictions to match both theory and target
+            v_consistency_loss = torch.mean(
+                (log_mag_v - log_v_theory) ** 2 +
+                (log_v_theory - log_v_target) ** 2 +
+                (log_mag_v - log_v_target) ** 2
+            )
+
+            log_mag_a = torch.log(torch.abs(mag_a) + eps)  # Prediction has gradients!
+            log_a_theory = torch.log(torch.abs(a_theory_normalized) + eps)  # Theory DETACHED (no gradients)
+            log_a_target = torch.log(torch.abs(a_target) + eps)  # Target (ground truth)
+
+            # Triangular loss: (pred-theory)² + (theory-target)² + (pred-target)²
+            # Only mag_a has gradients - trains predictions to match both theory and target
+            a_consistency_loss = torch.mean(
+                (log_mag_a - log_a_theory) ** 2 +
+                (log_a_theory - log_a_target) ** 2 +
+                (log_mag_a - log_a_target) ** 2
+            )
+        else:
+            # Regular MSE - triangular consistency
+            v_consistency_loss = torch.mean(
+                ((torch.abs(mag_v) - torch.abs(v_theory_normalized))/torch.abs(mag_v)) ** 2 +
+                ((torch.abs(v_theory_normalized) - torch.abs(v_target))/torch.abs(v_theory_normalized)) ** 2 +
+                ((torch.abs(mag_v) - torch.abs(v_target))/torch.abs(mag_v)) ** 2
+            )
+
+            a_consistency_loss = torch.mean(
+                ((torch.abs(mag_a) - torch.abs(a_theory_normalized))/torch.abs(mag_a)) ** 2 +
+                ((torch.abs(a_theory_normalized) - torch.abs(a_target))/torch.abs(a_theory_normalized)) ** 2 +
+                ((torch.abs(mag_a) - torch.abs(a_target))/torch.abs(mag_a)) ** 2
+            )
+        
+        
+        """
+        # STEP 9: Compute TRIANGULAR loss - all three values contribute
+        if self.use_log:
+
+
+            # Regular MSE - triangular consistency
+            v_consistency_loss = torch.mean(
+                torch.log(torch.abs(((torch.abs(mag_v) - torch.abs(v_theory_normalized))/torch.abs(mag_v))+1)) +
+                torch.log(torch.abs(((torch.abs(v_theory_normalized) - torch.abs(v_target))/torch.abs(v_theory_normalized))+1)) +
+                torch.log(torch.abs(((torch.abs(mag_v) - torch.abs(v_target))/torch.abs(mag_v))+1))
+            )
+
+            a_consistency_loss = torch.mean(
+                torch.log(torch.abs(((torch.abs(mag_a) - torch.abs(a_theory_normalized))/torch.abs(mag_a))+1)) +
+                torch.log(torch.abs(((torch.abs(a_theory_normalized) - torch.abs(a_target))/torch.abs(a_theory_normalized))+1)) +
+                torch.log(torch.abs(((torch.abs(mag_a) - torch.abs(a_target))/torch.abs(mag_a))+1))
+            )
+    
+        else:
+            # Regular MSE - triangular consistency
+            v_consistency_loss = torch.mean(
+                ((torch.abs(mag_v) - torch.abs(v_theory_normalized))/torch.abs(mag_v)) ** 2 +
+                ((torch.abs(v_theory_normalized) - torch.abs(v_target))/torch.abs(v_theory_normalized)) ** 2 +
+                ((torch.abs(mag_v) - torch.abs(v_target))/torch.abs(mag_v)) ** 2
+            )
+
+            a_consistency_loss = torch.mean(
+                ((torch.abs(mag_a) - torch.abs(a_theory_normalized))/torch.abs(mag_a)) ** 2 +
+                ((torch.abs(a_theory_normalized) - torch.abs(a_target))/torch.abs(a_theory_normalized)) ** 2 +
+                ((torch.abs(mag_a) - torch.abs(a_target))/torch.abs(mag_a)) ** 2
+            )
+
+        """
+        # STEP 10: Total consistency loss
+        total_loss = v_consistency_loss + a_consistency_loss
+
+        return total_loss
+    
+'''
+class ConsistencyLoss_auto_diff(BaseLossComponent):
+    """
+    Derivative consistency using VERIFIED formulas for log-normalized space training.
+
+    Ensures v=dx/dt and a=dv/dt using autograd on log-normalized model outputs.
+    Uses verified transformation formulas from check_dataset_consistency() in Exp_dataset.py.
+
+    Key features:
+    - Model outputs UNSIGNED magnitudes (positive from Softplus) in normalized log-space
+    - Applies logabs signs from targets[:, 3:] to create SIGNED normalized log-space predictions
+    - Computes derivatives of UNSIGNED magnitudes via autograd in normalized space
+    - Applies verified denormalization formulas with SIGNED predictions for theory values
+    - Supports both log-space MSE and regular MSE via use_log parameter
+    """
+
+    def __init__(self, weight=1.0, model=None, t_threshold=1e-6, use_log=False, input_grad_outside=False):
+        super().__init__(weight=weight, name="Consistency Loss (auto)")
+        self.model = model
+        self.t_threshold = t_threshold
+        self.use_log = use_log
+        self.input_grad_outside = input_grad_outside
+
+    def set_model(self, model):
+        """Set the model reference for gradient computation"""
+        self.model = model
+
+    def compute(self, predictions, targets, inputs=None, inputs_normalizer=None,
+                outputs_normalizer=None, ft_cal=None, valid_mask=None, **kwargs):
+        """
+        Enforces derivative consistency using verified formulas for log-normalized training.
+
+        Args:
+            predictions: If input_grad_outside=True, this is mag_preds from training loop
+                        If input_grad_outside=False, not used (we compute fresh predictions)
+            targets: (batch_size, 6) - [real_sign_x, real_sign_v, real_sign_a, x', v', a']
+                     where [:, 0:3] are real space signs (±1)
+                     and [:, 3:6] are SIGNED normalized log-space values (can be ±)
+            inputs: (batch_size, 3) - [a, b, t] NORMALIZED
+            inputs_normalizer: Normalizer for inputs (contains t normalization params)
+            outputs_normalizer: Normalizer for outputs (contains x, v, a normalization params)
+            ft_cal: (batch_size, 3) - Finetune calibration outputs [ft_x, ft_v, ft_a] in normalized log-space
+            valid_mask: If input_grad_outside=True, boolean mask for valid samples (t_real > threshold)
+                       If input_grad_outside=False, not used (computed internally)
+
+        Returns:
+            loss: Scalar tensor measuring derivative consistency error
+        """
+        if inputs_normalizer is None or outputs_normalizer is None:
+            raise ValueError("Both inputs_normalizer and outputs_normalizer must be provided")
+
+        device = inputs.device
+        dtype = inputs.dtype
+        eps = 1e-12
+
+        # Get normalization parameters (needed for both modes)
+        beta_x = generalize_beta(outputs_normalizer, outputs_normalizer.log_mean['x'], outputs_normalizer.log_std['x'], 'x')
+        beta_v = generalize_beta(outputs_normalizer, outputs_normalizer.log_mean['v'], outputs_normalizer.log_std['v'], 'v')
+        beta_a = generalize_beta(outputs_normalizer, outputs_normalizer.log_mean['a'], outputs_normalizer.log_std['a'], 'a')
+        alpha_x = generalize_alpha(outputs_normalizer, outputs_normalizer.log_mean['x'], outputs_normalizer.log_std['x'], 'x')
+        alpha_v = generalize_alpha(outputs_normalizer, outputs_normalizer.log_mean['v'], outputs_normalizer.log_std['v'], 'v')
+        alpha_a = generalize_alpha(outputs_normalizer, outputs_normalizer.log_mean['a'], outputs_normalizer.log_std['a'], 'a')
+        t_alpha = generalize_alpha(inputs_normalizer, inputs_normalizer.log_mean['t'], inputs_normalizer.log_std['t'], 't')
+        t_beta = generalize_beta(inputs_normalizer, inputs_normalizer.log_mean['t'], inputs_normalizer.log_std['t'], 't')
+        ln10 = torch.log(torch.tensor(10.0, device=device, dtype=dtype))
+
+        # ======================
+        # MODE SELECTION: Compute mag_x, mag_v, mag_a and their derivatives
+        # ======================
+        if self.input_grad_outside:
+            # MODE 1: Gradients computed in training loop
+            # Use mag_preds from training loop (predictions parameter)
+            # Use valid_mask passed from training loop
+
+            if predictions is None:
+                raise ValueError("When input_grad_outside=True, predictions (mag_preds) must be provided")
+            if ft_cal is None:
+                raise ValueError("When input_grad_outside=True, ft_cal must be provided")
+            if valid_mask is None:
+                raise ValueError("When input_grad_outside=True, valid_mask must be provided")
+
+            # Filter to valid samples
+            mag_preds_valid = predictions[valid_mask]
+            inputs_valid = inputs[valid_mask]
+            targets_valid = targets[valid_mask]
+            ft_cal_valid = ft_cal[valid_mask]
+
+            # Compute t_real for valid samples
+            t_normalized_valid = inputs_valid[:, 2]
+            t_real_valid = torch.exp((t_beta * t_normalized_valid + t_alpha) * ln10)
+
+            # STEP 1: Get unsigned magnitude predictions and compute derivatives separately
+            # Detect phase
+            is_phase1 = torch.all(torch.abs(ft_cal_valid) < eps)
+
+            # STEP 1b: Compute derivatives separately, then sum
+            # Always compute derivatives of mag_preds components
+            dx_mag_dt = torch.autograd.grad(
+                outputs=mag_preds_valid[:, 0],
+                inputs=inputs,
+                grad_outputs=torch.ones_like(mag_preds_valid[:, 0]),
+                create_graph=True,
+                retain_graph=True,
+                allow_unused=True
+            )[0][valid_mask, 2]  # Gradient w.r.t. t_normalized, filter by valid_mask
+
+            dv_mag_dt = torch.autograd.grad(
+                outputs=mag_preds_valid[:, 1],
+                inputs=inputs,
+                grad_outputs=torch.ones_like(mag_preds_valid[:, 1]),
+                create_graph=True,
+                retain_graph=True,
+                allow_unused=True
+            )[0][valid_mask, 2]  # Gradient w.r.t. t_normalized, filter by valid_mask
+
+            if is_phase1:
+                # Phase 1: Only use mag derivatives (ft_cal is zeros)
+                dx_prime_dt_prime = torch.abs(dx_mag_dt)
+                dv_prime_dt_prime = torch.abs(dv_mag_dt)
+            else:
+                # Phase 2: Compute ft_cal derivatives and add them
+                dx_ft_dt = torch.autograd.grad(
+                    outputs=ft_cal_valid[:, 0],
+                    inputs=inputs,
+                    grad_outputs=torch.ones_like(ft_cal_valid[:, 0]),
+                    create_graph=True,
+                    retain_graph=True,
+                    allow_unused=True
+                )[0][valid_mask, 2]  # Gradient w.r.t. t_normalized, filter by valid_mask
+
+                dv_ft_dt = torch.autograd.grad(
+                    outputs=ft_cal_valid[:, 1],
+                    inputs=inputs,
+                    grad_outputs=torch.ones_like(ft_cal_valid[:, 1]),
+                    create_graph=True,
+                    retain_graph=True,
+                    allow_unused=True
+                )[0][valid_mask, 2]  # Gradient w.r.t. t_normalized, filter by valid_mask
+
+                # Sum derivatives (linearity: d(f+g)/dt = df/dt + dg/dt)
+                dx_prime_dt_prime = torch.abs(dx_mag_dt) + dx_ft_dt
+                dv_prime_dt_prime = torch.abs(dv_mag_dt) + dv_ft_dt
+                # dx_prime_dt_prime = torch.abs(dx_mag_dt)
+                # dv_prime_dt_prime = torch.abs(dv_mag_dt)
+        else:
+            # MODE 2: Gradients computed inside consistency loss (current approach)
+            # Call model internally with inputs_with_grad
+
+            if self.model is None:
+                raise ValueError("When input_grad_outside=False, model must be set via set_model()")
+            if ft_cal is None:
+                raise ValueError("When input_grad_outside=False, ft_cal must be provided")
+
+            # Denormalize inputs to get t_real
+            t_normalized = inputs[:, 2]
+            t_real = torch.exp((t_beta * t_normalized + t_alpha) * ln10)
+
+            # Filter out samples where t_real ≈ 0 (to avoid division by zero)
+            valid_mask = t_real > self.t_threshold
+
+            if valid_mask.sum() == 0:
+                return torch.tensor(0.0, device=device)
+
+            # Filter to valid samples
+            inputs_valid = inputs[valid_mask]
+            targets_valid = targets[valid_mask]
+            t_real_valid = t_real[valid_mask]
+            ft_cal_valid = ft_cal[valid_mask]
+
+            # Enable gradient tracking on inputs
+            inputs_with_grad = inputs_valid.clone().requires_grad_(True)
+
+            # Forward pass to get model outputs
+            # Model returns tuple: (mag_preds, logabs_sign_pred, real_sign_pred, ft_cal_from_model)
+            mag_preds_internal, _, _, ft_preds_internal = self.model(inputs_with_grad)
+
+            # STEP 1: Get unsigned magnitude predictions and compute derivatives separately
+            # Detect phase
+            is_phase1 = torch.all(torch.abs(ft_cal_valid) < eps)
+
+
+            # STEP 1b: Compute derivatives separately, then sum
+            # Always compute derivatives of mag_preds_internal components
+            dx_mag_dt = torch.autograd.grad(
+                outputs=mag_preds_internal[:, 0],
+                inputs=inputs_with_grad,
+                grad_outputs=torch.ones_like(mag_preds_internal[:, 0]),
+                create_graph=True,
+                retain_graph=True,
+                allow_unused=True
+            )[0][:, 2]  # Gradient w.r.t. t_normalized (index 2)
+
+            dv_mag_dt = torch.autograd.grad(
+                outputs=mag_preds_internal[:, 1],
+                inputs=inputs_with_grad,
+                grad_outputs=torch.ones_like(mag_preds_internal[:, 1]),
+                create_graph=True,
+                retain_graph=True,
+                allow_unused=True
+            )[0][:, 2]  # Gradient w.r.t. t_normalized (index 2)
+
+            if is_phase1:
+                # Phase 1: Only use mag derivatives (finetune network untrained)
+                dx_prime_dt_prime = torch.abs(dx_mag_dt)
+                dv_prime_dt_prime = torch.abs(dv_mag_dt)
+            else:
+                # Phase 2: Compute ft_preds derivatives and add them
+                dx_ft_dt = torch.autograd.grad(
+                    outputs=ft_preds_internal[:, 0],
+                    inputs=inputs_with_grad,
+                    grad_outputs=torch.ones_like(ft_preds_internal[:, 0]),
+                    create_graph=True,
+                    retain_graph=True,
+                    allow_unused=True
+                )[0][:, 2]  # Gradient w.r.t. t_normalized (index 2)
+
+                dv_ft_dt = torch.autograd.grad(
+                    outputs=ft_preds_internal[:, 1],
+                    inputs=inputs_with_grad,
+                    grad_outputs=torch.ones_like(ft_preds_internal[:, 1]),
+                    create_graph=True,
+                    retain_graph=True,
+                    allow_unused=True
+                )[0][:, 2]  # Gradient w.r.t. t_normalized (index 2)
+
+                # Sum derivatives (linearity: d(f+g)/dt = df/dt + dg/dt)
+                dx_prime_dt_prime = torch.abs(dx_mag_dt) + dx_ft_dt
+                dv_prime_dt_prime = torch.abs(dv_mag_dt) + dv_ft_dt
+                # dx_prime_dt_prime = torch.abs(dx_mag_dt)
+                # dv_prime_dt_prime = torch.abs(dv_mag_dt)
+
+        # ==============================================
+        # STEP 1: Compute TARGET derivatives (ground truth from dataset)
+        # ==============================================
+        # Extract targets
+        x_target = targets_valid[:, 3]  # x' target (SIGNED normalized log-space)
+        v_target = targets_valid[:, 4]  # v' target (SIGNED normalized log-space)
+        a_target = targets_valid[:, 5]  # a' target (SIGNED normalized log-space)
+
+        # Denormalize targets to real space
+        x_target_real = torch.exp((beta_x * x_target + alpha_x) * ln10)
+        v_target_real = torch.exp((beta_v * v_target + alpha_v) * ln10)
+        a_target_real = torch.exp((beta_a * a_target + alpha_a) * ln10)
+
+        # Compute common factors from targets (inverse of theory formula)
+        common_factor_v_target = (beta_x / t_beta) * (x_target_real / (t_real_valid + eps))
+        common_factor_a_target = (beta_v / t_beta) * (v_target_real / (t_real_valid + eps))
+
+        # Invert formula to get target derivatives
+        # v_theory = |common_factor * dx'/dt'| → |dx'/dt'| = v / common_factor
+        dx_dt_target = torch.abs(v_target_real / (common_factor_v_target + eps))
+        dv_dt_target = torch.abs(a_target_real / (common_factor_a_target + eps))
+
+        # ==============================================
+        # STEP 2: Compute PREDICTION-based derivatives (from model's v' and a' outputs)
+        # ==============================================
+        # Extract signs from targets (targets contain SIGNED values)
+        # targets[:, 3:6] are already SIGNED normalized log-space values
+        logabs_targets = targets_valid[:, 3:]  # [x', v', a'] in normalized log-space (signed)
+        logabs_sign = torch.sign(logabs_targets)  # Extract signs from logabs targets
+
+        # Extract predicted v' and a' from model predictions and apply signs
+        if self.input_grad_outside:
+            # MODE 1: Use mag_preds_valid (unsigned magnitudes)
+            v_prime_predict = mag_preds_valid[:, 1] * logabs_sign[:, 1]  # Apply sign to v'
+            a_prime_predict = mag_preds_valid[:, 2] * logabs_sign[:, 2]  # Apply sign to a'
+        else:
+            # MODE 2: Use mag_preds_internal (unsigned magnitudes)
+            v_prime_predict = mag_preds_internal[:, 1] * logabs_sign[:, 1]  # Apply sign to v'
+            a_prime_predict = mag_preds_internal[:, 2] * logabs_sign[:, 2]  # Apply sign to a'
+
+        # Denormalize predicted v' and a' to real space
+        v_predict_real = torch.exp((beta_v * v_prime_predict + alpha_v) * ln10)
+        a_predict_real = torch.exp((beta_a * a_prime_predict + alpha_a) * ln10)
+
+        # Compute prediction-based derivatives using theory formula
+        # Theory: v_theory = |common_factor_v * dx'/dt'| → |dx'/dt'| = v / common_factor_v
+        dx_dt_predict = torch.abs(v_predict_real / (common_factor_v_target + eps))
+        dv_dt_predict = torch.abs(a_predict_real / (common_factor_a_target + eps))
+
+        # ==============================================
+        # STEP 3: Use AUTOGRAD-based derivatives (from spatial gradients ∂x'/∂t')
+        # ==============================================
+        # Phase 1: dx_prime_dt_prime = torch.abs(dx_mag_dt)
+        # Phase 2: dx_prime_dt_prime = torch.abs(dx_mag_dt) + dx_ft_dt
+        model_dx_dt = dx_prime_dt_prime  # Use the phase-aware combined derivatives (from autograd)
+        model_dv_dt = dv_prime_dt_prime
+
+        # ======================
+        # DERIVATIVE-BASED CONSISTENCY LOSS
+        # ======================
+        # STEP 9: Compute loss (log-space MSE or regular MSE based on use_log)
+        # DUAL CONSISTENCY: Compare BOTH autograd derivatives AND prediction-based derivatives
+        if self.use_log:
+            # Autograd-based derivative loss (from ∂x'/∂t')
+            v_consistency_loss_autograd = torch.mean(torch.log(torch.abs((model_dx_dt - dx_dt_target) / (dx_dt_target + eps)) + 1))
+            a_consistency_loss_autograd = torch.mean(torch.log(torch.abs((model_dv_dt - dv_dt_target) / (dv_dt_target + eps)) + 1))
+
+            # Prediction-based derivative loss (from predicted v' and a')
+            v_consistency_loss_predict = torch.mean(torch.log(torch.abs((dx_dt_predict - dx_dt_target) / (dx_dt_target + eps)) + 1))
+            a_consistency_loss_predict = torch.mean(torch.log(torch.abs((dv_dt_predict - dv_dt_target) / (dv_dt_target + eps)) + 1))
+
+            # Combine both losses
+            v_consistency_loss = v_consistency_loss_autograd + v_consistency_loss_predict
+            a_consistency_loss = a_consistency_loss_autograd + a_consistency_loss_predict
+        else:
+            # Relative error MSE - comparing derivatives
+            # Autograd-based derivative loss
+            v_consistency_loss_autograd = torch.mean(((torch.abs(model_dx_dt) - torch.abs(dx_dt_target)) / torch.abs(model_dx_dt)) ** 2)
+            a_consistency_loss_autograd = torch.mean(((torch.abs(model_dv_dt) - torch.abs(dv_dt_target)) / torch.abs(model_dv_dt)) ** 2)
+
+            # Prediction-based derivative loss
+            v_consistency_loss_predict = torch.mean(((torch.abs(dx_dt_predict) - torch.abs(dx_dt_target)) / torch.abs(dx_dt_predict)) ** 2)
+            a_consistency_loss_predict = torch.mean(((torch.abs(dv_dt_predict) - torch.abs(dv_dt_target)) / torch.abs(dv_dt_predict)) ** 2)
+
+            # Combine both losses
+            v_consistency_loss = v_consistency_loss_autograd + v_consistency_loss_predict
+            a_consistency_loss = a_consistency_loss_autograd + a_consistency_loss_predict
+
+        # STEP 10: Total consistency loss
+        total_loss = v_consistency_loss + a_consistency_loss
+
+        return total_loss
+
+
 
 
 class ExponentialPINNLoss(nn.Module):
@@ -1276,7 +2875,10 @@ class ExponentialPINNLoss(nn.Module):
             weight = config.get("weight", 1.0)
             sign_bce_weight = config.get("sign_bce_weight", 1.0)
             real_sign_bce_weight = config.get("real_sign_bce_weight", 1.0)
-            self.loss_components["MSE"] = MSELoss(weight=weight, use_relative=use_relative, use_log=use_log, sign_bce_weight=sign_bce_weight, real_sign_bce_weight=real_sign_bce_weight)
+            ft_cal_weight = config.get("ft_cal_weight", 1.0)
+            # Use model.use_finetune to determine if ft_cal_loss should be computed
+            use_finetune_loss = getattr(model, 'use_finetune', False)
+            self.loss_components["MSE"] = MSELoss(weight=weight, use_relative=use_relative, use_log=use_log, sign_bce_weight=sign_bce_weight, real_sign_bce_weight=real_sign_bce_weight, ft_cal_weight=ft_cal_weight, use_finetune_loss=use_finetune_loss)
 
         # Initialize Residual loss if requested
         if self._should_enable("Residual"):
@@ -1285,25 +2887,17 @@ class ExponentialPINNLoss(nn.Module):
             weight = config.get("weight", 1.0)
             self.loss_components["Residual"] = ExponentialResidualLoss(weight=weight, use_relative=use_relative)
 
-        # Initialize Consistency loss if requested
+        # Initialize Consistency loss if requested (auto diff only)
         if self._should_enable("Consistency"):
             config = self.loss_config.get("Consistency")
             t_threshold = config.get("t_threshold", 1e-6)
             weight = config.get("weight", 1.0)
-            use_relative = config.get("use_relative", False)
             use_log = config.get("use_log", True)
-            consistency_type = config.get("type", "auto")  # "auto" or "finite"
-
-            if consistency_type == "auto":
-                self.loss_components["Consistency"] = ConsistencyLoss_auto_diff(
-                    weight=weight, model=model, t_threshold=t_threshold, use_log=use_log
-                )
-            elif consistency_type == "finite":
-                self.loss_components["Consistency"] = ConsistencyLoss_finite_diff(
-                    weight=weight, use_relative=use_relative, t_threshold=t_threshold, use_log=use_log
-                )
-            else:
-                raise ValueError(f"Unknown consistency type: {consistency_type}. Use 'auto' or 'finite'.")
+            input_grad_outside = config.get("Input_grad_outside", False)
+            self.loss_components["Consistency"] = ConsistencyLoss_auto_diff(
+                weight=weight, model=model, t_threshold=t_threshold, use_log=use_log,
+                input_grad_outside=input_grad_outside
+            )
 
         # Print configuration
         self._print_config()
@@ -1328,9 +2922,9 @@ class ExponentialPINNLoss(nn.Module):
         Args:
             loss_args: Dictionary with loss arguments
                 {
-                    "MSE": (mag_preds, targets, logabs_sign_probs, None, None, real_sign_probs),
-                    "Residual": (outputs, inputs_real),
-                    "Consistency": (inputs, inputs_real, norm_params)
+                    "MSE": (mag_preds, targets, logabs_sign_probs, None, None, real_sign_probs, ft_cal, output_normalizer),
+                    "Residual": (outputs, targets, inputs_real, output_normalizer),
+                    "Consistency": (inputs, inputs_normalizer, outputs_normalizer, targets, ft_cal)
                 }
 
         Returns:
@@ -1342,10 +2936,13 @@ class ExponentialPINNLoss(nn.Module):
 
         # MSE Loss
         if "MSE" in self.loss_components and "MSE" in loss_args:
-            # Unpack 6 arguments: (mag_preds, targets, logabs_sign_probs, None, None, real_sign_probs)
-            mag_preds, targets, logabs_sign_probs, _, _, real_sign_probs = loss_args["MSE"]
+            # Unpack 8 arguments: (mag_preds, targets, logabs_sign_probs, None, None, real_sign_probs, ft_cal, output_normalizer)
+            mag_preds, targets, logabs_sign_probs, _, _, real_sign_probs, ft_cal, output_normalizer = loss_args["MSE"]
             mse_value = self.loss_components["MSE"](
-                mag_preds, targets, logabs_sign_probs, None, None, real_sign_probs
+                mag_preds, targets,
+                logabs_sigmoid_probs=logabs_sign_probs,
+                real_sign_probs=real_sign_probs,
+                ft_cal=ft_cal
             )
             total_loss += mse_value
             loss_summary["mse_loss"] = mse_value.item()
@@ -1357,36 +2954,34 @@ class ExponentialPINNLoss(nn.Module):
                 loss_summary["logabs_sign_bce_loss"] = self.loss_components["MSE"].last_logabs_sign_bce_loss
             if hasattr(self.loss_components["MSE"], 'last_real_sign_bce_loss'):
                 loss_summary["real_sign_bce_loss"] = self.loss_components["MSE"].last_real_sign_bce_loss
+            if hasattr(self.loss_components["MSE"], 'last_ft_cal_loss'):
+                loss_summary["ft_cal_loss"] = self.loss_components["MSE"].last_ft_cal_loss
 
         # Residual Loss
         if "Residual" in self.loss_components and "Residual" in loss_args:
-            outputs, inputs_real = loss_args["Residual"]
+            outputs_for_residual, targets, inputs_real, output_normalizer = loss_args["Residual"]
             residual_value = self.loss_components["Residual"](
-                outputs, None, None, None, inputs_real
+                outputs_for_residual, targets,
+                inputs_real=inputs_real,
+                output_normalizer=output_normalizer
             )
             total_loss += residual_value
             loss_summary["residual_loss"] = residual_value.item()
 
         # Consistency Loss
         if "Consistency" in self.loss_components and "Consistency" in loss_args:
-            # Check if it's auto or finite based on number of arguments
-            consistency_args = loss_args["Consistency"]
-
-            if isinstance(self.loss_components["Consistency"], ConsistencyLoss_auto_diff):
-                # Auto diff: (inputs, inputs_real, norm_params)
-                inputs, inputs_real, norm_params = consistency_args
-                consistency_value = self.loss_components["Consistency"](
-                    None, None, inputs, norm_params, inputs_real
-                )
-            elif isinstance(self.loss_components["Consistency"], ConsistencyLoss_finite_diff):
-                # Finite diff: (outputs, outputs_dt, targets)
-                outputs, outputs_dt, targets = consistency_args
-                consistency_value = self.loss_components["Consistency"](
-                    outputs, targets, None, None, outputs_dt
-                )
-            else:
-                raise ValueError("Unknown consistency loss type")
-
+            # New signature: (predictions, targets, inputs, inputs_normalizer, outputs_normalizer, ft_cal, valid_mask)
+            # predictions = mag_preds (MODE 1) or None (MODE 2)
+            # valid_mask = boolean tensor (MODE 1) or None (MODE 2)
+            predictions, targets, inputs, inputs_normalizer, outputs_normalizer, ft_cal, valid_mask = loss_args["Consistency"]
+            consistency_value = self.loss_components["Consistency"](
+                predictions, targets,
+                inputs=inputs,
+                inputs_normalizer=inputs_normalizer,
+                outputs_normalizer=outputs_normalizer,
+                ft_cal=ft_cal,
+                valid_mask=valid_mask
+            )
             total_loss += consistency_value
             loss_summary["consistency_loss"] = consistency_value.item()
 

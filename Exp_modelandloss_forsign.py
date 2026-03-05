@@ -360,6 +360,132 @@ class ExponentialSignNN_ver3(nn.Module):
         return predictions
 
 
+class ExponentialSignNN_ver4(nn.Module):
+    """Binary Classification Network with Residual Connections (3-input version)
+
+    Modified version of ExponentialSignNN_ver3 that:
+    - Takes only 3 inputs: [a, b, t] (no magnitude inputs)
+    - Outputs sign predictions directly (not multiplied by magnitudes)
+    - Uses identity tensor instead of input magnitudes
+
+    Uses sigmoid outputs and BCE loss for sign classification.
+    """
+
+    def __init__(self, hidden_dims=[128, 64, 32], activation='relu', dropout=0.3):
+        super().__init__()
+
+        # Choose activation function
+        if activation == 'tanh':
+            act = nn.Tanh
+        elif activation == 'elu':
+            act = nn.ELU
+        elif activation == 'relu':
+            act = nn.ReLU
+        else:
+            act = nn.ReLU
+
+        input_dim = 3  # [a, b, t] only
+
+        # Decide whether to use residual blocks
+        if len(hidden_dims) <= 2:
+            # Simple sequential layers (no residual)
+            self.use_residual = False
+            layers = []
+            for hidden_dim in hidden_dims:
+                layers.append(nn.Linear(input_dim, hidden_dim))
+                layers.append(act())
+                layers.append(nn.BatchNorm1d(hidden_dim))
+                layers.append(nn.Dropout(dropout))
+                input_dim = hidden_dim
+            self.shared_layers = nn.Sequential(*layers)
+        else:
+            # Build residual blocks
+            self.use_residual = True
+            self.blocks = nn.ModuleList()
+
+            # Pair up hidden_dims for residual blocks
+            # Example: [128, 64, 32] → pairs: [(3,128,64)], remaining: [32]
+            # Example: [128, 64, 32, 16] → pairs: [(3,128,64), (64,32,16)]
+            dims = [input_dim] + hidden_dims
+            i = 0
+            while i + 2 < len(dims):
+                # Create residual block for dims[i] → dims[i+1] → dims[i+2]
+                block = ResidualBlock(dims[i], dims[i+1], dims[i+2], act, dropout)
+                self.blocks.append(block)
+                i += 2
+
+            # Handle remaining layer if odd number
+            if i + 1 < len(dims):
+                # Add simple layer: dims[i] → dims[i+1]
+                remaining_layer = nn.Sequential(
+                    nn.Linear(dims[i], dims[i+1]),
+                    act(),
+                    nn.BatchNorm1d(dims[i+1]),
+                    nn.Dropout(dropout)
+                )
+                self.blocks.append(remaining_layer)
+                input_dim = dims[i+1]
+            else:
+                input_dim = dims[i]
+
+        # Output heads (one for each of the 3 outputs)
+        num_outputs = 3
+        self.output_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(input_dim, 16),
+                act(),
+                nn.Linear(16, 1),
+                nn.Sigmoid()
+            )
+            for _ in range(num_outputs)
+        ])
+
+        # Initialize weights
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_normal_(m.weight)
+            nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (batch_size, 3)
+               [a, b, t]
+
+        Returns:
+            predictions: Output tensor of shape (batch_size, 3)
+                        Sign predictions: values in [-1, 1]
+        """
+        # Shared feature extraction
+        if self.use_residual:
+            # Pass through residual blocks
+            for block in self.blocks:
+                x = block(x)
+            shared_features = x
+        else:
+            # Pass through sequential layers
+            shared_features = self.shared_layers(x)
+
+        # Three independent binary classifiers (sigmoid outputs in [0, 1])
+        outputs = [head(shared_features) for head in self.output_heads]
+
+        # Concatenate to [batch_size, 3]
+        probs = torch.cat(outputs, dim=1)
+
+        # Store probabilities for loss computation
+        self.last_sign_probs = probs
+
+        # Convert probabilities to signs: [0, 1] -> [-1, 1]
+        signs = 2 * probs - 1
+
+        # Return signs directly (no magnitude multiplication)
+        predictions = signs
+
+        return predictions
+
+
 class BaseLossComponent(ABC, nn.Module):
     """Abstract base class for loss components"""
 
@@ -439,8 +565,9 @@ class SignBCELoss(BaseLossComponent):
 
         # Convert target signs to binary labels: {-1, +1} -> {0, 1}
         # Zeros are treated as positive (label=1.0)
-        target_signs = torch.sign(targets).float()  # Shape: [batch, num_outputs], values: -1, 0, +1
-        labels = (target_signs >= 0).float()  # Shape: [batch, num_outputs], values: 0 or 1
+        # Use targets.dtype to match the dtype (float32 or float64)
+        target_signs = torch.sign(targets).to(dtype=targets.dtype)  # Shape: [batch, num_outputs], values: -1, 0, +1
+        labels = (target_signs >= 0).to(dtype=targets.dtype)  # Shape: [batch, num_outputs], values: 0 or 1
 
         # Compute BCE for each output and sum
         num_outputs = sigmoid_probs.shape[1]
