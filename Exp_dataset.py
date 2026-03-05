@@ -145,6 +145,7 @@ class Exponential_DataNormalizer:
         is_tensor = torch.is_tensor(X_norm)
         if is_tensor:
             device = X_norm.device
+            original_dtype = X_norm.dtype
             X_norm = X_norm.detach().cpu().numpy()
 
         # Create dictionary from array
@@ -166,9 +167,10 @@ class Exponential_DataNormalizer:
 
         # Convert back to tensor if input was tensor
         if is_tensor:
-            X_denorm = torch.FloatTensor(X_denorm).to(device)
+            X_denorm = torch.tensor(X_denorm, dtype=original_dtype, device=device)
 
         return X_denorm
+
 
 
 class Exponential_OutputNormalizer:
@@ -186,7 +188,7 @@ class Exponential_OutputNormalizer:
                                   If False, use standard normalization.
         """
         self.use_log_normalization = use_log_normalization
-
+        self.eps = 1e-12 # Small epsilon for numerical stability
         if self.use_log_normalization:
             self.log_features = ['x', 'v', 'a']  # All outputs use log normalization
             self.log_mean = {}
@@ -208,7 +210,7 @@ class Exponential_OutputNormalizer:
             for feat in self.log_features:
                 values = data_dict[feat]
                 # Assume all values are positive, add epsilon to avoid log(0)
-                log_values = np.log10(np.abs(values) + 1e-10)
+                log_values = np.log10(np.abs(values) + self.eps)
                 self.log_mean[feat] = np.mean(log_values)
                 self.log_std[feat] = np.std(log_values)
         else:
@@ -217,7 +219,7 @@ class Exponential_OutputNormalizer:
                 self.linear_mean[feat] = np.mean(data_dict[feat])
                 self.linear_std[feat] = np.std(data_dict[feat])
 
-    def transform(self, data_dict, eps=1e-10):
+    def transform(self, data_dict):
         """
         Normalize data
 
@@ -240,7 +242,7 @@ class Exponential_OutputNormalizer:
                 # Extract signs
                 signs[feat] = np.sign(values)
                 # Apply log transform to absolute values
-                log_values = np.log10(np.abs(values) + eps)
+                log_values = np.log10(np.abs(values) + self.eps)
                 normalized[feat] = (log_values - self.log_mean[feat]) / self.log_std[feat]
             return normalized, signs
         else:
@@ -248,14 +250,13 @@ class Exponential_OutputNormalizer:
                 normalized[feat] = (data_dict[feat] - self.linear_mean[feat]) / self.linear_std[feat]
             return normalized, None
 
-    def inverse_transform(self, normalized_dict, signs_dict=None, eps=1e-10):
+    def inverse_transform(self, normalized_dict, signs_dict=None):
         """
         Denormalize data
 
         Args:
             normalized_dict: Dictionary with normalized feature arrays
             signs_dict: Optional dictionary with sign arrays (only used when use_log_normalization=True)
-            eps: Small epsilon value for numerical stability
 
         Returns:
             Dictionary with original features
@@ -305,6 +306,41 @@ class Exponential_OutputNormalizer:
             'a': Y[:, 2]
         }
 
+        # Compute unnormalized log values first (for printing)
+        if self.use_log_normalization:
+            # Print normalizer statistics
+            print(f"Output normalizer stats:")
+            print(f"  x: log_mean={self.log_mean['x']:.6f}, log_std={self.log_std['x']:.6f}")
+            print(f"  v: log_mean={self.log_mean['v']:.6f}, log_std={self.log_std['v']:.6f}")
+            print(f"  a: log_mean={self.log_mean['a']:.6f}, log_std={self.log_std['a']:.6f}")
+
+            
+            abs_x = np.abs(data_dict['x'])
+            abs_v = np.abs(data_dict['v'])
+            abs_a = np.abs(data_dict['a'])
+
+            log_values_x = np.log10(abs_x + self.eps)
+            log_values_v = np.log10(abs_v + self.eps)
+            log_values_a = np.log10(abs_a + self.eps)
+
+            # Find minimum absolute values and their corresponding log values
+            min_abs_x = np.min(abs_x)
+            min_abs_v = np.min(abs_v)
+            min_abs_a = np.min(abs_a)
+
+            min_abs_x_idx = np.argmin(abs_x)
+            min_abs_v_idx = np.argmin(abs_v)
+            min_abs_a_idx = np.argmin(abs_a)
+
+            print(f"Minimum absolute values and their log values:")
+            print(f"  x: min(|x|)={min_abs_x:.10e}, corresponding log10(|x|+eps)={log_values_x[min_abs_x_idx]:.6f}")
+            print(f"  v: min(|v|)={min_abs_v:.10e}, corresponding log10(|v|+eps)={log_values_v[min_abs_v_idx]:.6f}")
+            print(f"  a: min(|a|)={min_abs_a:.10e}, corresponding log10(|a|+eps)={log_values_a[min_abs_a_idx]:.6f}")
+
+            print(f"Min/Max of Y_logabs 'x' (before norm): {np.min(log_values_x):.6f}, {np.max(log_values_x):.6f}")
+            print(f"Min/Max of Y_logabs 'v' (before norm): {np.min(log_values_v):.6f}, {np.max(log_values_v):.6f}")
+            print(f"Min/Max of Y_logabs 'a' (before norm): {np.min(log_values_a):.6f}, {np.max(log_values_a):.6f}")
+
         # Normalize using transform
         normalized_dict, sign_dict = self.transform(data_dict)
 
@@ -326,9 +362,9 @@ class Exponential_OutputNormalizer:
             # Concatenate: [sign_x, sign_v, sign_a, logabs_x, logabs_v, logabs_a]
             Y_norm = np.concatenate([signs_array, logabs_array], axis=1)
 
-            print(f"Min/Max of Y_norm logabs 'x': {np.min(Y_norm[:, 3])}, {np.max(Y_norm[:, 3])}")
-            print(f"Min/Max of Y_norm logabs 'v': {np.min(Y_norm[:, 4])}, {np.max(Y_norm[:, 4])}")
-            print(f"Min/Max of Y_norm logabs 'a': {np.min(Y_norm[:, 5])}, {np.max(Y_norm[:, 5])}")
+            print(f"Min/Max of Y_norm logabs 'x' (after norm):  {np.min(Y_norm[:, 3]):.6f}, {np.max(Y_norm[:, 3]):.6f}")
+            print(f"Min/Max of Y_norm logabs 'v' (after norm):  {np.min(Y_norm[:, 4]):.6f}, {np.max(Y_norm[:, 4]):.6f}")
+            print(f"Min/Max of Y_norm logabs 'a' (after norm):  {np.min(Y_norm[:, 5]):.6f}, {np.max(Y_norm[:, 5]):.6f}")
         else:
             # Linear normalization - just stack the normalized values
             Y_norm = np.stack([
@@ -362,6 +398,7 @@ class Exponential_OutputNormalizer:
         is_tensor = torch.is_tensor(Y_norm)
         if is_tensor:
             device = Y_norm.device
+            original_dtype = Y_norm.dtype
             Y_norm = Y_norm.detach().cpu().numpy()
 
         if self.use_log_normalization:
@@ -407,22 +444,22 @@ class Exponential_OutputNormalizer:
         ], axis=1)
 
         if is_tensor:
-            Y = torch.FloatTensor(Y).to(device)
+            Y = torch.tensor(Y, dtype=original_dtype, device=device)
 
         return Y
-
 
 class ExponentialDataset(Dataset):
     """PyTorch Dataset for exponential data"""
 
-    def __init__(self, inputs, outputs):
+    def __init__(self, inputs, outputs, dtype=torch.float32):
         """
         Args:
             inputs: numpy array of shape (N, 3) - [a, b, t]
-            outputs: numpy array of shape (N, 3) - [x_t, v_t, a_t]
+            outputs: numpy array of shape (N, 3) or (N, 6) - [x_t, v_t, a_t] or with signs
+            dtype: torch dtype for the tensors (default: torch.float32)
         """
-        self.inputs = torch.FloatTensor(inputs)
-        self.outputs = torch.FloatTensor(outputs)
+        self.inputs = torch.tensor(inputs, dtype=dtype)
+        self.outputs = torch.tensor(outputs, dtype=dtype)
 
     def __len__(self):
         return len(self.inputs)
@@ -431,7 +468,7 @@ class ExponentialDataset(Dataset):
         return self.inputs[idx], self.outputs[idx]
 
 
-def load_exponential_data(filepath='exponential_trainval_data.npz', batch_size=32, shuffle_train=True, normalize=True):
+def load_exponential_data(filepath='exponential_trainval_data.npz', batch_size=32, shuffle_train=True, normalize=True, dtype=torch.float32, inputs_normalizer=None, outputs_normalizer=None):
     """Loads and prepares exponential data from an .npz file.
 
     This function splits the data into training, validation, and test sets,
@@ -445,16 +482,23 @@ def load_exponential_data(filepath='exponential_trainval_data.npz', batch_size=3
         batch_size (int): Batch size for the DataLoaders.
         shuffle_train (bool): Whether to shuffle the training data.
         normalize (bool): If True, normalizes both input and output features.
+        dtype (torch.dtype): Torch dtype for the tensors (default: torch.float32).
+        inputs_normalizer (Exponential_DataNormalizer or None): Pre-fitted input normalizer.
+            If provided, this normalizer will be used instead of creating a new one.
+            Useful for applying train/val normalization to test data.
+        outputs_normalizer (Exponential_OutputNormalizer or None): Pre-fitted output normalizer.
+            If provided, this normalizer will be used instead of creating a new one.
+            Useful for applying train/val normalization to test data.
 
     Returns:
         tuple: A tuple containing:
             - train_loader (DataLoader): DataLoader for the training set.
             - val_loader (DataLoader): DataLoader for the validation set.
             - test_loader (DataLoader): DataLoader for the test set.
-            - inputs_normalizer (Exponential_DataNormalizer or None): The fitted
-              input normalizer instance if normalize=True, otherwise None.
-            - outputs_normalizer (Exponential_OutputNormalizer or None): The fitted
-              output normalizer instance if normalize=True, otherwise None.
+            - inputs_normalizer (Exponential_DataNormalizer or None): The input normalizer
+              (either provided as parameter or newly fitted). Returns None if normalize=False.
+            - outputs_normalizer (Exponential_OutputNormalizer or None): The output normalizer
+              (either provided as parameter or newly fitted). Returns None if normalize=False.
     """
     # Load data
     data = np.load(filepath)
@@ -478,31 +522,31 @@ def load_exponential_data(filepath='exponential_trainval_data.npz', batch_size=3
         X_temp, y_temp, test_size=0.2, random_state=32)
 
     # Normalize inputs and outputs if requested
-    inputs_normalizer = None
-    outputs_normalizer = None
-
     if normalize:
-        # Create data dictionaries for training set
-        train_input_dict = {
-            'a': X_train[:, 0],
-            'b': X_train[:, 1],
-            't': X_train[:, 2]
-        }
+        # Check if normalizers were provided as parameters
+        if inputs_normalizer is None or outputs_normalizer is None:
+            # Create and fit new normalizers on training data only
+            train_input_dict = {
+                'a': X_train[:, 0],
+                'b': X_train[:, 1],
+                't': X_train[:, 2]
+            }
 
-        train_output_dict = {
-            'x': y_train[:, 0],
-            'v': y_train[:, 1],
-            'a': y_train[:, 2]
-        }
+            train_output_dict = {
+                'x': y_train[:, 0],
+                'v': y_train[:, 1],
+                'a': y_train[:, 2]
+            }
 
-        # Fit normalizers on training data only
-        inputs_normalizer = Exponential_DataNormalizer()
-        inputs_normalizer.fit(train_input_dict)
+            if inputs_normalizer is None:
+                inputs_normalizer = Exponential_DataNormalizer()
+                inputs_normalizer.fit(train_input_dict)
 
-        outputs_normalizer = Exponential_OutputNormalizer(use_log_normalization=True)
-        outputs_normalizer.fit(train_output_dict)
+            if outputs_normalizer is None:
+                outputs_normalizer = Exponential_OutputNormalizer(use_log_normalization=True)
+                outputs_normalizer.fit(train_output_dict)
 
-        # Normalize all splits
+        # Use provided or newly fitted normalizers to normalize all splits
         X_train = inputs_normalizer.normalize_inputs(X_train)
         X_val = inputs_normalizer.normalize_inputs(X_val)
         X_test = inputs_normalizer.normalize_inputs(X_test)
@@ -510,11 +554,15 @@ def load_exponential_data(filepath='exponential_trainval_data.npz', batch_size=3
         y_train = outputs_normalizer.normalize_outputs(y_train)
         y_val = outputs_normalizer.normalize_outputs(y_val)
         y_test = outputs_normalizer.normalize_outputs(y_test)
+    else:
+        # If normalize=False, set normalizers to None
+        inputs_normalizer = None
+        outputs_normalizer = None
 
     # Create PyTorch Datasets
-    train_dataset = ExponentialDataset(X_train, y_train)
-    val_dataset = ExponentialDataset(X_val, y_val)
-    test_dataset = ExponentialDataset(X_test, y_test)
+    train_dataset = ExponentialDataset(X_train, y_train, dtype=dtype)
+    val_dataset = ExponentialDataset(X_val, y_val, dtype=dtype)
+    test_dataset = ExponentialDataset(X_test, y_test, dtype=dtype)
 
     # Create DataLoaders
     train_loader = DataLoader(
@@ -538,21 +586,22 @@ def load_exponential_data(filepath='exponential_trainval_data.npz', batch_size=3
         num_workers=0
     )
 
-    # results = check_all_datasets(
-    #     train_loader, val_loader, test_loader,
-    #     inputs_normalizer, outputs_normalizer,
-    #     error_threshold=0.10,  # 10% threshold
-    #     verbose=False,  # Set True to see 5 sample errors per dataset
-    #     plot_io_relation=True,
-    #     plot_sample_rate=10
-    # )
+    results = check_all_datasets(
+        train_loader, val_loader, test_loader,
+        inputs_normalizer, outputs_normalizer,
+        error_threshold=0.10,  # 10% threshold
+        verbose=False,  # Set True to see 5 sample errors per dataset
+        plot_io_relation=True,
+        plot_sample_rate=10
+    )
 
     return train_loader, val_loader, test_loader, inputs_normalizer, outputs_normalizer
 
 
 def check_dataset_consistency(dataset, inputs_normalizer, outputs_normalizer,
                               dataset_name="Dataset", error_threshold=0.10, verbose=False,
-                              plot_io_relation=False, save_dir=None, plot_sample_rate=1):
+                              plot_io_relation=False, save_dir=None, plot_sample_rate=1,
+                              verify_derivatives=False):
     """
     Check if normalized dataset is consistent with analytical solution.
 
@@ -562,6 +611,7 @@ def check_dataset_consistency(dataset, inputs_normalizer, outputs_normalizer,
     3. Compares log10(abs(analytical_solution)) with the normalized targets
     4. Reports percentage of samples with error > threshold
     5. Optionally plots input-output relationships (9 scatter plots: 3 inputs × 3 outputs)
+    6. Optionally verifies derivative formulas (analytical vs numerical methods)
 
     Args:
         dataset: PyTorch Dataset with (inputs, outputs)
@@ -573,9 +623,10 @@ def check_dataset_consistency(dataset, inputs_normalizer, outputs_normalizer,
         plot_io_relation: If True, plot input vs output scatter plots (default False)
         save_dir: Directory to save plots. If None, uses './IOrelation' (default None)
         plot_sample_rate: Plot every Nth sample (e.g., 10 means plot 1 out of 10 samples) (default 1)
+        verify_derivatives: If True, verify derivative formulas (analytical vs numerical) (default False)
 
     Returns:
-        dict: Statistics including error counts and samples
+        dict: Statistics including error counts and samples (and derivative verification if enabled)
     """
     print(f"\n{'='*70}")
     print(f"Checking {dataset_name} Dataset ({len(dataset)} samples)")
@@ -634,8 +685,12 @@ def check_dataset_consistency(dataset, inputs_normalizer, outputs_normalizer,
         normalized_analytical_array[:, i] = (log_values - outputs_normalizer.log_mean[feat]) / outputs_normalizer.log_std[feat]
 
     # Step 5: Compare with actual targets
+    # Extract normalized log values from all_targets (columns 3-5)
+    # all_targets shape is (N, 6): [sign_x, sign_v, sign_a, logabs_x_norm, logabs_v_norm, logabs_a_norm]
+    all_targets_normalized = all_targets[:, 3:6]  # Extract columns 3-5
+
     # Compute absolute and relative errors
-    abs_errors = np.abs(all_targets - normalized_analytical_array)
+    abs_errors = np.abs(all_targets_normalized - normalized_analytical_array)
 
     # For relative error, avoid division by zero
     denom = np.abs(normalized_analytical_array) + 1e-10
@@ -664,6 +719,299 @@ def check_dataset_consistency(dataset, inputs_normalizer, outputs_normalizer,
           f"{high_error_count_per_sample} / {n_samples} "
           f"({high_error_count_per_sample/n_samples*100:.2f}%)")
 
+    # ========================================================================
+    # DERIVATIVE VERIFICATION (if requested)
+    # ========================================================================
+    if verify_derivatives:
+        print(f"\n{'='*70}")
+        print(f"DERIVATIVE FORMULA VERIFICATION - ANALYTICAL VS NUMERICAL")
+        print(f"{'='*70}")
+
+        # Extract normalization constants
+        std_x = outputs_normalizer.log_std['x']
+        std_v = outputs_normalizer.log_std['v']
+        std_a = outputs_normalizer.log_std['a']
+        std_t = inputs_normalizer.log_std['t']
+
+        mean_x = outputs_normalizer.log_mean['x']
+        mean_v = outputs_normalizer.log_mean['v']
+        mean_a = outputs_normalizer.log_mean['a']
+        mean_t = inputs_normalizer.log_mean['t']
+
+        print(f"\nNormalization constants:")
+        print(f"  std_x: {std_x:.6f}, mean_x: {mean_x:.6f}")
+        print(f"  std_v: {std_v:.6f}, mean_v: {mean_v:.6f}")
+        print(f"  std_a: {std_a:.6f}, mean_a: {mean_a:.6f}")
+        print(f"  std_t: {std_t:.6f}, mean_t: {mean_t:.6f}")
+
+        # Initialize error storage lists
+        errors_v_analytical = []
+        errors_v_numerical = []
+        errors_vprime_analytical = []
+        errors_vprime_numerical = []
+
+        errors_a_analytical = []
+        errors_a_numerical = []
+        errors_aprime_analytical = []
+        errors_aprime_numerical = []
+
+        # Store predictions for random sample display
+        v_real_samples = []
+        v_analytical_samples = []
+        v_numerical_samples = []
+        v_prime_real_samples = []
+        v_prime_analytical_samples = []
+        v_prime_numerical_samples = []
+
+        a_real_samples = []
+        a_analytical_samples = []
+        a_numerical_samples = []
+        a_prime_real_samples = []
+        a_prime_analytical_samples = []
+        a_prime_numerical_samples = []
+
+        ln10 = np.log(10.0)
+        deriv_invalid_count = 0
+
+        # Loop through each sample
+        for i in range(n_samples):
+            # Skip if analytical solution was invalid
+            if np.isnan(analytical_outputs[i, 0]):
+                deriv_invalid_count += 1
+                continue
+
+            # Extract data
+            a = a_values[i]
+            b = b_values[i]
+            t = t_values[i]
+            x_t = analytical_outputs[i, 0]
+            v_t = analytical_outputs[i, 1]
+            a_t = analytical_outputs[i, 2]
+
+            # Get normalized ground truth from all_targets
+            # Note: all_targets has shape (N, 6) with columns [sign_x, sign_v, sign_a, logabs_x_norm, logabs_v_norm, logabs_a_norm]
+            # We need the normalized log absolute values (columns 3-5)
+            x_prime = all_targets[i, 3]
+            v_prime = all_targets[i, 4]
+            a_prime = all_targets[i, 5]
+
+            # Compute t_prime
+            t_prime = (np.log10(t) - mean_t) / std_t
+
+            # Method 1: Analytical dx'/dt' and dv'/dt'
+            dx_prime_dt_prime_analytical = (std_t / std_x) * a * np.exp((std_t * t_prime + mean_t) * ln10)
+            dv_prime_dt_prime_analytical = (std_t / std_v) * a * np.exp((std_t * t_prime + mean_t) * ln10)
+
+            # Method 2: Numerical dx'/dt' and dv'/dt'
+            t_prime_low = 0.9999 * t_prime
+            t_prime_high = 1.0001 * t_prime
+
+            # Convert back to real time
+            t_low = np.exp((std_t * t_prime_low + mean_t) * ln10)
+            t_high = np.exp((std_t * t_prime_high + mean_t) * ln10)
+
+            # Get analytical solutions at perturbed times
+            x_t_low, v_t_low, _ = analytical_solution_exp(a, b, t_low)
+            x_t_high, v_t_high, _ = analytical_solution_exp(a, b, t_high)
+
+            # Check for validity
+            if any(np.isnan([x_t_low, x_t_high, v_t_low, v_t_high])) or \
+               any(np.isinf([x_t_low, x_t_high, v_t_low, v_t_high])):
+                deriv_invalid_count += 1
+                continue
+
+            # Normalize x and v at perturbed times
+            x_prime_low = (np.log10(np.abs(x_t_low)) - mean_x) / std_x
+            x_prime_high = (np.log10(np.abs(x_t_high)) - mean_x) / std_x
+            v_prime_low = (np.log10(np.abs(v_t_low)) - mean_v) / std_v
+            v_prime_high = (np.log10(np.abs(v_t_high)) - mean_v) / std_v
+
+            # Finite differences (derivative with respect to normalized time t')
+            dx_prime_dt_prime_numerical = (x_prime_high - x_prime_low) / (t_prime_high - t_prime_low)
+            dv_prime_dt_prime_numerical = (v_prime_high - v_prime_low) / (t_prime_high - t_prime_low)
+
+            # Compute velocities AND accelerations using both methods
+            # Velocity predictions (x -> v)
+            common_factor_v = (std_x / std_t) * (np.exp((std_x * x_prime + mean_x) * ln10) / t)
+            v_analytical_method = np.abs(common_factor_v * dx_prime_dt_prime_analytical)
+            v_numerical_method = np.abs(common_factor_v * dx_prime_dt_prime_numerical)
+
+            # Acceleration predictions (v -> a)
+            common_factor_a = (std_v / std_t) * (np.exp((std_v * v_prime + mean_v) * ln10) / t)
+            a_analytical_method = np.abs(common_factor_a * dv_prime_dt_prime_analytical)
+            a_numerical_method = np.abs(common_factor_a * dv_prime_dt_prime_numerical)
+
+            # Ground truths
+            v_real_abs = np.abs(v_t)
+            a_real_abs = np.abs(a_t)
+
+            # Compute normalized v' and a' from predictions
+            v_prime_analytical = (np.log10(v_analytical_method) - mean_v) / std_v
+            v_prime_numerical = (np.log10(v_numerical_method) - mean_v) / std_v
+
+            a_prime_analytical = (np.log10(a_analytical_method) - mean_a) / std_a
+            a_prime_numerical = (np.log10(a_numerical_method) - mean_a) / std_a
+
+            # Compute errors in real space
+            error_v_analytical = v_analytical_method - v_real_abs
+            error_v_numerical = v_numerical_method - v_real_abs
+            error_a_analytical = a_analytical_method - a_real_abs
+            error_a_numerical = a_numerical_method - a_real_abs
+
+            # Errors in normalized space
+            error_vprime_analytical = v_prime_analytical - v_prime
+            error_vprime_numerical = v_prime_numerical - v_prime
+            error_aprime_analytical = a_prime_analytical - a_prime
+            error_aprime_numerical = a_prime_numerical - a_prime
+
+            # Store all errors
+            errors_v_analytical.append(error_v_analytical/v_real_abs)
+            errors_v_numerical.append(error_v_numerical/v_real_abs)
+            errors_vprime_analytical.append(error_vprime_analytical/v_prime)
+            errors_vprime_numerical.append(error_vprime_numerical/v_prime)
+
+            errors_a_analytical.append(error_a_analytical/a_real_abs)
+            errors_a_numerical.append(error_a_numerical/a_real_abs)
+            errors_aprime_analytical.append(error_aprime_analytical/a_prime)
+            errors_aprime_numerical.append(error_aprime_numerical/a_prime)
+
+            # Store actual values for random sample display
+            v_real_samples.append(v_real_abs)
+            v_analytical_samples.append(v_analytical_method)
+            v_numerical_samples.append(v_numerical_method)
+            v_prime_real_samples.append(v_prime)
+            v_prime_analytical_samples.append(v_prime_analytical)
+            v_prime_numerical_samples.append(v_prime_numerical)
+
+            a_real_samples.append(a_real_abs)
+            a_analytical_samples.append(a_analytical_method)
+            a_numerical_samples.append(a_numerical_method)
+            a_prime_real_samples.append(a_prime)
+            a_prime_analytical_samples.append(a_prime_analytical)
+            a_prime_numerical_samples.append(a_prime_numerical)
+
+        # Convert lists to arrays
+        errors_v_analytical = np.array(errors_v_analytical)
+        errors_v_numerical = np.array(errors_v_numerical)
+        errors_vprime_analytical = np.array(errors_vprime_analytical)
+        errors_vprime_numerical = np.array(errors_vprime_numerical)
+
+        errors_a_analytical = np.array(errors_a_analytical)
+        errors_a_numerical = np.array(errors_a_numerical)
+        errors_aprime_analytical = np.array(errors_aprime_analytical)
+        errors_aprime_numerical = np.array(errors_aprime_numerical)
+
+        valid_deriv_samples = len(errors_v_analytical)
+
+        print(f"\nValid samples: {valid_deriv_samples}")
+        print(f"Invalid samples (NaN/Inf): {deriv_invalid_count}")
+
+        # VELOCITY VERIFICATION
+        print(f"\n{'-'*70}")
+        print(f"VELOCITY VERIFICATION (x -> v)")
+        print(f"{'-'*70}")
+
+        print(f"\nReal Space (v in units):")
+        print(f"  Analytical dx'/dt':")
+        print(f"    Mean error:   {np.mean(errors_v_analytical):.6e}    Median: {np.median(errors_v_analytical):.6e}")
+        print(f"    Max error:    {np.max(np.abs(errors_v_analytical)):.6e}    Std:    {np.std(errors_v_analytical):.6e}")
+
+        print(f"\n  Numerical dx'/dt':")
+        print(f"    Mean error:   {np.mean(errors_v_numerical):.6e}    Median: {np.median(errors_v_numerical):.6e}")
+        print(f"    Max error:    {np.max(np.abs(errors_v_numerical)):.6e}    Std:    {np.std(errors_v_numerical):.6e}")
+
+        print(f"\nNormalized Space (v'):")
+        print(f"  Analytical dx'/dt':")
+        print(f"    Mean error:   {np.mean(errors_vprime_analytical):.6e}    Median: {np.median(errors_vprime_analytical):.6e}")
+        print(f"    Max error:    {np.max(np.abs(errors_vprime_analytical)):.6e}    Std:    {np.std(errors_vprime_analytical):.6e}")
+
+        print(f"\n  Numerical dx'/dt':")
+        print(f"    Mean error:   {np.mean(errors_vprime_numerical):.6e}    Median: {np.median(errors_vprime_numerical):.6e}")
+        print(f"    Max error:    {np.max(np.abs(errors_vprime_numerical)):.6e}    Std:    {np.std(errors_vprime_numerical):.6e}")
+
+        # ACCELERATION VERIFICATION
+        print(f"\n{'-'*70}")
+        print(f"ACCELERATION VERIFICATION (v -> a)")
+        print(f"{'-'*70}")
+
+        print(f"\nReal Space (a in units):")
+        print(f"  Analytical dv'/dt':")
+        print(f"    Mean error:   {np.mean(errors_a_analytical):.6e}    Median: {np.median(errors_a_analytical):.6e}")
+        print(f"    Max error:    {np.max(np.abs(errors_a_analytical)):.6e}    Std:    {np.std(errors_a_analytical):.6e}")
+
+        print(f"\n  Numerical dv'/dt':")
+        print(f"    Mean error:   {np.mean(errors_a_numerical):.6e}    Median: {np.median(errors_a_numerical):.6e}")
+        print(f"    Max error:    {np.max(np.abs(errors_a_numerical)):.6e}    Std:    {np.std(errors_a_numerical):.6e}")
+
+        print(f"\nNormalized Space (a'):")
+        print(f"  Analytical dv'/dt':")
+        print(f"    Mean error:   {np.mean(errors_aprime_analytical):.6e}    Median: {np.median(errors_aprime_analytical):.6e}")
+        print(f"    Max error:    {np.max(np.abs(errors_aprime_analytical)):.6e}    Std:    {np.std(errors_aprime_analytical):.6e}")
+
+        print(f"\n  Numerical dv'/dt':")
+        print(f"    Mean error:   {np.mean(errors_aprime_numerical):.6e}    Median: {np.median(errors_aprime_numerical):.6e}")
+        print(f"    Max error:    {np.max(np.abs(errors_aprime_numerical)):.6e}    Std:    {np.std(errors_aprime_numerical):.6e}")
+
+        # Display random samples
+        if valid_deriv_samples >= 5:
+            random_indices = np.random.choice(valid_deriv_samples, size=5, replace=False)
+
+            print(f"\nRandom 5 V samples:")
+            print(f"Real Abs Space (v in units):")
+            for i, idx in enumerate(random_indices, 1):
+                print(f"{i}. [{v_real_samples[idx]:.6e}, {v_analytical_samples[idx]:.6e}, {v_numerical_samples[idx]:.6e}]")
+
+            print(f"\nNormalized Space (v'):")
+            for i, idx in enumerate(random_indices, 1):
+                print(f"{i}. [{v_prime_real_samples[idx]:.6e}, {v_prime_analytical_samples[idx]:.6e}, {v_prime_numerical_samples[idx]:.6e}]")
+
+            print(f"\nRandom 5 A samples:")
+            print(f"Real Abs Space (a in units):")
+            for i, idx in enumerate(random_indices, 1):
+                print(f"{i}. [{a_real_samples[idx]:.6e}, {a_analytical_samples[idx]:.6e}, {a_numerical_samples[idx]:.6e}]")
+
+            print(f"\nNormalized Space (a'):")
+            for i, idx in enumerate(random_indices, 1):
+                print(f"{i}. [{a_prime_real_samples[idx]:.6e}, {a_prime_analytical_samples[idx]:.6e}, {a_prime_numerical_samples[idx]:.6e}]")
+
+        print(f"\n{'='*70}")
+
+        # Store derivative verification results for return
+        deriv_results = {
+            'valid_samples': valid_deriv_samples,
+            'invalid_samples': deriv_invalid_count,
+            'velocity': {
+                'analytical': {
+                    'v_errors': errors_v_analytical,
+                    'vprime_errors': errors_vprime_analytical,
+                    'mean_v_error': float(np.mean(errors_v_analytical)),
+                    'mean_vprime_error': float(np.mean(errors_vprime_analytical))
+                },
+                'numerical': {
+                    'v_errors': errors_v_numerical,
+                    'vprime_errors': errors_vprime_numerical,
+                    'mean_v_error': float(np.mean(errors_v_numerical)),
+                    'mean_vprime_error': float(np.mean(errors_vprime_numerical))
+                }
+            },
+            'acceleration': {
+                'analytical': {
+                    'a_errors': errors_a_analytical,
+                    'aprime_errors': errors_aprime_analytical,
+                    'mean_a_error': float(np.mean(errors_a_analytical)),
+                    'mean_aprime_error': float(np.mean(errors_aprime_analytical))
+                },
+                'numerical': {
+                    'a_errors': errors_a_numerical,
+                    'aprime_errors': errors_aprime_numerical,
+                    'mean_a_error': float(np.mean(errors_a_numerical)),
+                    'mean_aprime_error': float(np.mean(errors_aprime_numerical))
+                }
+            }
+        }
+    else:
+        deriv_results = None
+
     # Optionally show sample high-error cases
     if verbose and high_error_count_per_sample > 0:
         print(f"\nShowing 5 sample high-error cases:")
@@ -674,7 +1022,7 @@ def check_dataset_consistency(dataset, inputs_normalizer, outputs_normalizer,
             print(f"    Input (a, b, t): [{a_values[idx]:.3f}, {b_values[idx]:.3f}, {t_values[idx]:.6f}]")
             for j, name in enumerate(feature_names):
                 if high_error_mask[idx, j]:
-                    print(f"    {name}: target={all_targets[idx, j]:.4f}, "
+                    print(f"    {name}: target={all_targets_normalized[idx, j]:.4f}, "
                           f"expected={normalized_analytical_array[idx, j]:.4f}, "
                           f"rel_err={rel_errors[idx, j]*100:.2f}%")
 
@@ -690,11 +1038,11 @@ def check_dataset_consistency(dataset, inputs_normalizer, outputs_normalizer,
         if plot_sample_rate > 1:
             sample_indices = np.arange(0, n_samples, plot_sample_rate)
             sampled_inputs = denorm_inputs[sample_indices]
-            sampled_targets = all_targets[sample_indices]
+            sampled_targets = all_targets_normalized[sample_indices]
             n_plot_samples = len(sample_indices)
         else:
             sampled_inputs = denorm_inputs
-            sampled_targets = all_targets
+            sampled_targets = all_targets_normalized
             n_plot_samples = n_samples
 
         print(f"\nGenerating input-output relationship plots...")
@@ -731,7 +1079,7 @@ def check_dataset_consistency(dataset, inputs_normalizer, outputs_normalizer,
         print(f"Saved 9 plots to {save_dir}")
 
     # Return statistics
-    return {
+    result = {
         'n_samples': n_samples,
         'invalid_count': invalid_count,
         'high_error_count': high_error_count_per_sample,
@@ -741,6 +1089,12 @@ def check_dataset_consistency(dataset, inputs_normalizer, outputs_normalizer,
         'mean_rel_errors': np.nanmean(rel_errors, axis=0),
         'high_error_counts_per_feature': high_error_mask.sum(axis=0)
     }
+
+    # Add derivative verification results if enabled
+    if verify_derivatives:
+        result['derivative_verification'] = deriv_results
+
+    return result
 
 
 def check_all_datasets(train_loader, val_loader, test_loader,
@@ -821,3 +1175,357 @@ def check_all_datasets(train_loader, val_loader, test_loader,
     print("="*70)
 
     return results
+
+
+def check_raw_data_residuals(data_path, use_relative=False):
+    """
+    Check physics residuals for raw data (before normalization).
+    This validates that the original generated data satisfies the physics equation:
+    (1/(2a))*a_t + 0.5*v_t - a*x_t = 0
+
+    Args:
+        data_path: Path to the .npz data file
+        use_relative: If True, compute scale-invariant relative residual
+
+    Returns:
+        dict: Statistics about residuals including mean, std, min, max
+    """
+    print("\n" + "="*80)
+    print("CHECKING RAW DATA PHYSICS RESIDUALS (Before Normalization)")
+    print("="*80)
+    print(f"Data file: {data_path}")
+    print(f"Use relative residual: {use_relative}")
+    print("-"*80)
+
+    # Load raw data
+    data = np.load(data_path)
+
+
+    # Extract the array (npz files can contain multiple arrays)
+    if isinstance(data, np.lib.npyio.NpzFile):
+        # Get the first array in the npz file
+        array_name = list(data.keys())[0]
+        data_array = data[array_name]
+    else:
+        data_array = data
+    # Extract inputs and targets (raw, unnormalized)
+    # inputs: [a, b, t]
+    # targets: [x_t, v_t, a_t] (raw real values, not log-space)
+    inputs = data_array[:, :3]   # Shape: (n_samples, 3)
+    targets = data_array[:, 3:]  # Shape: (n_samples, 3)
+
+    # Extract parameters and target values
+    a = inputs[:, 0]  # exponential rate parameter
+    x_t = targets[:, 0]
+    v_t = targets[:, 1]
+    a_t = targets[:, 2]
+
+    # DIAGNOSTIC: Print raw data sample values
+    print(f"\n[DIAGNOSTIC] Raw data sample values (first sample):")
+    print(f"  a: {a[0]:.6e}, x_t: {x_t[0]:.6e}, v_t: {v_t[0]:.6e}, a_t: {a_t[0]:.6e}")
+
+    # Physics residual: (1/(2a))*a_t + 0.5*v_t - a*x_t = 0
+    eps = 1e-10
+    residual = (1.0 / (2.0 * a + eps)) * a_t + 0.5 * v_t - a * x_t
+
+    if use_relative:
+        # Scale-invariant relative residual
+        # Normalize by target's acceleration term: (1/(2a))*a_target
+        scale = np.abs((1.0 / (2.0 * a + eps)) * a_t) + eps
+        residual = residual / scale
+        residual_type = "relative"
+    else:
+        residual_type = "absolute"
+
+    # Calculate statistics
+    mean_abs_residual = np.mean(np.abs(residual))
+    std_residual = np.std(residual)
+    min_residual = np.min(residual)
+    max_residual = np.max(residual)
+
+    # Print results
+    print(f"\nRaw data {residual_type} residual statistics:")
+    print(f"  Mean absolute residual: {mean_abs_residual:.6e}")
+    print(f"  Std residual:           {std_residual:.6e}")
+    print(f"  Min residual:           {min_residual:.6e}")
+    print(f"  Max residual:           {max_residual:.6e}")
+    print(f"  Residual range:         [{min_residual:.6e}, {max_residual:.6e}]")
+
+    # Evaluation
+    if use_relative:
+        threshold = 1e-3
+    else:
+        threshold = 1e-6
+
+    if mean_abs_residual < threshold:
+        print(f"\n✓ PASSED: Raw data residual is very small (< {threshold:.0e})")
+        print("  The original data satisfies the physics equation well!")
+    elif mean_abs_residual < threshold * 1000:
+        print(f"\n⚠ WARNING: Raw data residual is small but not negligible (< {threshold*1000:.0e})")
+        print("  The data may have numerical errors from generation.")
+    else:
+        print(f"\n✗ FAILED: Raw data residual is large (>= {threshold*1000:.0e})")
+        print("  The data generation may have errors!")
+
+    print("="*80 + "\n")
+
+    return {
+        'mean_abs_residual': mean_abs_residual,
+        'std_residual': std_residual,
+        'min_residual': min_residual,
+        'max_residual': max_residual,
+        'use_relative': use_relative
+    }
+
+
+def examinenormalizer(filepath, tolerance=1e-3, batch_size=1024):
+    """
+    Examine if normalization→denormalization is perfectly reversible.
+
+    This function tests whether the normalization pipeline can perfectly reconstruct
+    the original data after normalize→denormalize operations. Tests both:
+    1. Direct numpy array normalization/denormalization
+    2. DataLoader-based (tensor format) normalization/denormalization
+
+    Args:
+        filepath: Path to .npz data file
+        tolerance: Maximum acceptable relative error (default: 1e-6)
+        batch_size: Batch size for DataLoader test (default: 1024)
+
+    Returns:
+        dict with diagnostic results:
+            - 'inputs_max_error': Max relative error for inputs
+            - 'outputs_max_error': Max relative error for outputs
+            - 'inputs_failed_samples': Number of samples exceeding tolerance
+            - 'outputs_failed_samples': Number of samples exceeding tolerance
+            - 'dataloader_inputs_failed_samples': Number failing in DataLoader
+            - 'dataloader_outputs_failed_samples': Number failing in DataLoader
+    """
+    print("\n" + "="*80)
+    print("EXAMINING NORMALIZER REVERSIBILITY")
+    print("="*80)
+    print(f"Testing normalization→denormalization pipeline on: {filepath}")
+    print(f"Tolerance: {tolerance:.0e}")
+
+    # Step 1: Load raw data
+    data = np.load(filepath)
+    data_array = data['data']  # Shape: (N, 6) = [a, b, t, x_t, v_t, a_t]
+
+    print(f"Testing all {len(data_array)} samples")
+
+    # Split inputs and outputs
+    input_data = data_array[:, :3]   # [a, b, t]
+    output_data = data_array[:, 3:]  # [x_t, v_t, a_t]
+
+    # Step 2: Create and fit normalizers (same as load_exponential_data)
+    print("\n[FITTING NORMALIZERS]")
+    inputs_normalizer = Exponential_DataNormalizer()
+    targets_normalizer = Exponential_OutputNormalizer(use_log_normalization=True)
+
+    inputs_normalizer.fit({
+        'a': input_data[:, 0],
+        'b': input_data[:, 1],
+        't': input_data[:, 2]
+    })
+
+    targets_normalizer.fit({
+        'x': output_data[:, 0],
+        'v': output_data[:, 1],
+        'a': output_data[:, 2]
+    })
+
+    # Print normalization statistics
+    print("\n[INPUT NORMALIZER STATS]")
+    print(f"  Linear features (a, b):")
+    print(f"    a: mean={inputs_normalizer.linear_mean['a']:.6f}, std={inputs_normalizer.linear_std['a']:.6f}")
+    print(f"    b: mean={inputs_normalizer.linear_mean['b']:.6f}, std={inputs_normalizer.linear_std['b']:.6f}")
+    print(f"  Log features (t):")
+    print(f"    t: log_mean={inputs_normalizer.log_mean['t']:.6f}, log_std={inputs_normalizer.log_std['t']:.6f}")
+
+    print("\n[OUTPUT NORMALIZER STATS]")
+    print(f"  Log features (x, v, a):")
+    print(f"    x: log_mean={targets_normalizer.log_mean['x']:.6f}, log_std={targets_normalizer.log_std['x']:.6f}")
+    print(f"    v: log_mean={targets_normalizer.log_mean['v']:.6f}, log_std={targets_normalizer.log_std['v']:.6f}")
+    print(f"    a: log_mean={targets_normalizer.log_mean['a']:.6f}, log_std={targets_normalizer.log_std['a']:.6f}")
+
+    # Step 3: Test inputs normalization reversibility
+    print("\n[TESTING INPUTS REVERSIBILITY]")
+    inputs_dict = {
+        'a': input_data[:, 0],
+        'b': input_data[:, 1],
+        't': input_data[:, 2]
+    }
+    inputs_normalized = inputs_normalizer.transform(inputs_dict)
+
+    # Convert to array format (same as load_exponential_data)
+    inputs_array_norm = np.stack([
+        inputs_normalized['a'],
+        inputs_normalized['b'],
+        inputs_normalized['t']
+    ], axis=1)
+
+    # Denormalize back
+    inputs_reconstructed = inputs_normalizer.denormalize_inputs(inputs_array_norm)
+
+    # Compute errors
+    inputs_error = np.abs(input_data - inputs_reconstructed)
+    inputs_rel_error = inputs_error / (np.abs(input_data) + 1e-10)
+    inputs_max_error = np.max(inputs_rel_error)
+    inputs_failed = np.sum(np.max(inputs_rel_error, axis=1) > tolerance)
+
+    print(f"  Max relative error: {inputs_max_error:.6e}")
+    print(f"  Failed samples (>{tolerance:.0e}): {inputs_failed}/{len(input_data)}")
+
+    if inputs_max_error > tolerance:
+        print(f"  ✗ FAILED: Inputs normalization is NOT reversible!")
+        # Print worst sample
+        worst_idx = np.argmax(np.max(inputs_rel_error, axis=1))
+        print(f"\n  Worst sample (index {worst_idx}):")
+        print(f"    Original:      a={input_data[worst_idx, 0]:.6e}, b={input_data[worst_idx, 1]:.6e}, t={input_data[worst_idx, 2]:.6e}")
+        print(f"    Reconstructed: a={inputs_reconstructed[worst_idx, 0]:.6e}, b={inputs_reconstructed[worst_idx, 1]:.6e}, t={inputs_reconstructed[worst_idx, 2]:.6e}")
+        print(f"    Relative error: a={inputs_rel_error[worst_idx, 0]:.6e}, b={inputs_rel_error[worst_idx, 1]:.6e}, t={inputs_rel_error[worst_idx, 2]:.6e}")
+    else:
+        print(f"  ✓ PASSED: Inputs normalization is reversible")
+
+    # Step 4: Test outputs normalization reversibility
+    print("\n[TESTING OUTPUTS REVERSIBILITY]")
+    outputs_dict = {
+        'x': output_data[:, 0],
+        'v': output_data[:, 1],
+        'a': output_data[:, 2]
+    }
+    outputs_normalized, signs_dict = targets_normalizer.transform(outputs_dict)
+
+    # Convert to array format (same as load_exponential_data)
+    outputs_array_norm = np.stack([
+        signs_dict['x'],
+        signs_dict['v'],
+        signs_dict['a'],
+        outputs_normalized['x'],
+        outputs_normalized['v'],
+        outputs_normalized['a']
+    ], axis=1)  # Shape: (N, 6) = [sign_x, sign_v, sign_a, logabs_x, logabs_v, logabs_a]
+
+    # Denormalize back using denormalize_outputs()
+    outputs_reconstructed = targets_normalizer.denormalize_outputs(outputs_array_norm)
+
+    # Compute errors
+    outputs_error = np.abs(output_data - outputs_reconstructed)
+    outputs_rel_error = outputs_error / (np.abs(output_data) + 1e-10)
+    outputs_max_error = np.max(outputs_rel_error)
+    outputs_failed = np.sum(np.max(outputs_rel_error, axis=1) > tolerance)
+
+    print(f"  Max relative error: {outputs_max_error:.6e}")
+    print(f"  Failed samples (>{tolerance:.0e}): {outputs_failed}/{len(output_data)}")
+
+    if outputs_max_error > tolerance:
+        print(f"  ✗ FAILED: Outputs normalization is NOT reversible!")
+        # Print worst sample
+        worst_idx = np.argmax(np.max(outputs_rel_error, axis=1))
+        print(f"\n  Worst sample (index {worst_idx}):")
+        print(f"    Original:      x_t={output_data[worst_idx, 0]:.6e}, v_t={output_data[worst_idx, 1]:.6e}, a_t={output_data[worst_idx, 2]:.6e}")
+        print(f"    Reconstructed: x_t={outputs_reconstructed[worst_idx, 0]:.6e}, v_t={outputs_reconstructed[worst_idx, 1]:.6e}, a_t={outputs_reconstructed[worst_idx, 2]:.6e}")
+        print(f"    Relative error: x_t={outputs_rel_error[worst_idx, 0]:.6e}, v_t={outputs_rel_error[worst_idx, 1]:.6e}, a_t={outputs_rel_error[worst_idx, 2]:.6e}")
+        print(f"    Signs: x={signs_dict['x'][worst_idx]}, v={signs_dict['v'][worst_idx]}, a={signs_dict['a'][worst_idx]}")
+        print(f"    Normalized logabs: x={outputs_normalized['x'][worst_idx]:.6f}, v={outputs_normalized['v'][worst_idx]:.6f}, a={outputs_normalized['a'][worst_idx]:.6f}")
+    else:
+        print(f"  ✓ PASSED: Outputs normalization is reversible")
+
+    # Step 5: Test with DataLoader (tensor format, no shuffle)
+    print("\n[TESTING DATALOADER REVERSIBILITY (TENSOR FORMAT)]")
+    print(f"Creating DataLoader with batch_size={batch_size}, shuffle=False")
+
+    # Create dataset from normalized arrays
+    dataset = ExponentialDataset(inputs_array_norm, outputs_array_norm)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+    # Collect all denormalized data from dataloader
+    all_inputs_from_loader = []
+    all_outputs_from_loader = []
+
+    for batch_inputs, batch_outputs in dataloader:
+        # Convert to numpy for denormalization
+        batch_inputs_np = batch_inputs.numpy()
+        batch_outputs_np = batch_outputs.numpy()
+
+        # Denormalize
+        batch_inputs_denorm = inputs_normalizer.denormalize_inputs(batch_inputs_np)
+        batch_outputs_denorm = targets_normalizer.denormalize_outputs(batch_outputs_np)
+
+        all_inputs_from_loader.append(batch_inputs_denorm)
+        all_outputs_from_loader.append(batch_outputs_denorm)
+
+    # Concatenate all batches
+    inputs_from_loader = np.concatenate(all_inputs_from_loader, axis=0)
+    outputs_from_loader = np.concatenate(all_outputs_from_loader, axis=0)
+
+    # Compare with original raw data
+    loader_inputs_error = np.abs(input_data - inputs_from_loader)
+    loader_inputs_rel_error = loader_inputs_error / (np.abs(input_data) + 1e-10)
+    loader_inputs_max_error = np.max(loader_inputs_rel_error)
+    loader_inputs_failed = np.sum(np.max(loader_inputs_rel_error, axis=1) > tolerance)
+
+    loader_outputs_error = np.abs(output_data - outputs_from_loader)
+    loader_outputs_rel_error = loader_outputs_error / (np.abs(output_data) + 1e-10)
+    loader_outputs_max_error = np.max(loader_outputs_rel_error)
+    loader_outputs_failed = np.sum(np.max(loader_outputs_rel_error, axis=1) > tolerance)
+
+    print(f"  Inputs:")
+    print(f"    Max relative error: {loader_inputs_max_error:.6e}")
+    print(f"    Failed samples (>{tolerance:.0e}): {loader_inputs_failed}/{len(input_data)}")
+
+    print(f"  Outputs:")
+    print(f"    Max relative error: {loader_outputs_max_error:.6e}")
+    print(f"    Failed samples (>{tolerance:.0e}): {loader_outputs_failed}/{len(output_data)}")
+
+    if loader_inputs_max_error > tolerance or loader_outputs_max_error > tolerance:
+        print(f"  ✗ FAILED: DataLoader tensor format introduces errors!")
+        if loader_outputs_max_error > tolerance:
+            worst_idx = np.argmax(np.max(loader_outputs_rel_error, axis=1))
+            print(f"\n  Worst output sample (index {worst_idx}):")
+            print(f"    Original:    x_t={output_data[worst_idx, 0]:.6e}, v_t={output_data[worst_idx, 1]:.6e}, a_t={output_data[worst_idx, 2]:.6e}")
+            print(f"    From loader: x_t={outputs_from_loader[worst_idx, 0]:.6e}, v_t={outputs_from_loader[worst_idx, 1]:.6e}, a_t={outputs_from_loader[worst_idx, 2]:.6e}")
+            print(f"    Rel error:   x_t={loader_outputs_rel_error[worst_idx, 0]:.6e}, v_t={loader_outputs_rel_error[worst_idx, 1]:.6e}, a_t={loader_outputs_rel_error[worst_idx, 2]:.6e}")
+    else:
+        print(f"  ✓ PASSED: DataLoader tensor format preserves data correctly")
+
+    # Summary
+    print("\n" + "="*80)
+    print("SUMMARY")
+    print("="*80)
+    print(f"Direct numpy test:")
+    print(f"  Inputs failed:  {inputs_failed}/{len(input_data)} samples")
+    print(f"  Outputs failed: {outputs_failed}/{len(output_data)} samples")
+    print(f"DataLoader test:")
+    print(f"  Inputs failed:  {loader_inputs_failed}/{len(input_data)} samples")
+    print(f"  Outputs failed: {loader_outputs_failed}/{len(output_data)} samples")
+    print()
+
+    if inputs_max_error < tolerance and outputs_max_error < tolerance:
+        if loader_inputs_max_error < tolerance and loader_outputs_max_error < tolerance:
+            print("✓ ALL PASSED: Both direct and DataLoader normalization are reversible")
+            print("  → Normalizer implementation is correct")
+            print("  → Problem must be elsewhere in the training pipeline")
+        else:
+            print("✗ DATALOADER FAILED: DataLoader introduces errors")
+            print("  → Direct normalization works, but DataLoader format has issues")
+            print("  → Check tensor conversions or batch processing")
+    elif outputs_max_error > tolerance:
+        print("✗ OUTPUTS FAILED: Outputs normalization has bugs")
+        print("  → Check transform() / inverse_transform() / denormalize_outputs()")
+        print("  → Likely issue with sign handling or log-space operations")
+    else:
+        print("✗ INPUTS FAILED: Inputs normalization has bugs")
+        print("  → Check input normalizer implementation")
+    print("="*80 + "\n")
+
+    return {
+        'inputs_max_error': float(inputs_max_error),
+        'outputs_max_error': float(outputs_max_error),
+        'inputs_failed_samples': int(inputs_failed),
+        'outputs_failed_samples': int(outputs_failed),
+        'dataloader_inputs_max_error': float(loader_inputs_max_error),
+        'dataloader_outputs_max_error': float(loader_outputs_max_error),
+        'dataloader_inputs_failed_samples': int(loader_inputs_failed),
+        'dataloader_outputs_failed_samples': int(loader_outputs_failed)
+    }
