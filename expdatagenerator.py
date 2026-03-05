@@ -395,8 +395,8 @@ def main():
     Saves to NPZ file with columns: [a, b, t, x_t, v_t, a_t]
     """
     n = 100000  # Target number of samples
-    output_filename = 'exponential_test_data.npz'
-    output_folder = 'exp_test_data_distributions'
+    output_filename = 'new_exponential_test_data.npz'
+    output_folder = 'new_exp_test_data_distributions'
     data = np.zeros((n, 6))
 
     print(f"Generating {n} valid exponential samples...")
@@ -446,7 +446,7 @@ def main():
                 rejected_large += 1
             # Accept only 1% of very small values (< 1e-2)
             elif any(np.abs([x_t, v_t, acc_t]) < 1e-4):
-                if np.random.rand() > 0.01:
+                if np.random.rand() > 0.01 or any(np.abs([x_t, v_t, acc_t]) < 1e-6):
                     is_valid = False
                     rejected_small += 1
 
