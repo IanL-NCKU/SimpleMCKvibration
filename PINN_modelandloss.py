@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from abc import ABC, abstractmethod
+from PINN_dataset import generalize_alpha, generalize_beta
 
 class SignWithHardTanh(torch.autograd.Function):
     """Custom gradient function for sign operation
@@ -616,6 +617,7 @@ class VibrationPINN_ver3(nn.Module):
 
             ft_cal_raw = self.finetune_network(finetune_input)/self.finetune_scale  # Shape: [batch, 3]
             ft_cal = ln10 * torch.tanh(ft_cal_raw)
+            ft_cal = torch.zeros_like(mag_preds)
         else:
             ft_cal = torch.zeros_like(mag_preds)
 
@@ -988,16 +990,23 @@ class ConsistencyLoss_auto_diff(BaseLossComponent):
         dtype = inputs.dtype
         eps = 1e-12
 
-        # Get normalization parameters (needed for both modes)
-        std_x = outputs_normalizer.log_std['x']
-        std_v = outputs_normalizer.log_std['v']
-        std_a = outputs_normalizer.log_std['a']
-        mean_x = outputs_normalizer.log_mean['x']
-        mean_v = outputs_normalizer.log_mean['v']
-        mean_a = outputs_normalizer.log_mean['a']
-        std_t = inputs_normalizer.log_std['t']
-        t_mean = inputs_normalizer.log_mean['t']
-        t_std = inputs_normalizer.log_std['t']
+        # Get normalization parameters and adjust for map_range if applied
+        alpha_x = outputs_normalizer.log_mean['x']
+        beta_x  = outputs_normalizer.log_std['x']
+        alpha_x = generalize_alpha(outputs_normalizer, alpha_x, beta_x, 'x')
+        beta_x  = generalize_beta( outputs_normalizer, alpha_x, beta_x, 'x')
+        alpha_v = outputs_normalizer.log_mean['v']
+        beta_v  = outputs_normalizer.log_std['v']
+        alpha_v = generalize_alpha(outputs_normalizer, alpha_v, beta_v, 'v')
+        beta_v  = generalize_beta( outputs_normalizer, alpha_v, beta_v, 'v')
+        alpha_a = outputs_normalizer.log_mean['a']
+        beta_a  = outputs_normalizer.log_std['a']
+        alpha_a = generalize_alpha(outputs_normalizer, alpha_a, beta_a, 'a')
+        beta_a  = generalize_beta( outputs_normalizer, alpha_a, beta_a, 'a')
+        t_alpha = inputs_normalizer.log_mean['t']
+        t_beta  = inputs_normalizer.log_std['t']
+        t_alpha = generalize_alpha(inputs_normalizer, t_alpha, t_beta, 't')
+        t_beta  = generalize_beta( inputs_normalizer, t_alpha, t_beta, 't')
         ln10 = torch.log(torch.tensor(10.0, device=device, dtype=dtype))
 
         # ======================
@@ -1027,7 +1036,7 @@ class ConsistencyLoss_auto_diff(BaseLossComponent):
 
             # Compute t_real for valid samples (vibration: t is at index 3)
             t_normalized_valid = inputs_valid[:, 3]
-            t_real_valid = torch.exp((t_std * t_normalized_valid + t_mean) * ln10)
+            t_real_valid = torch.exp((t_beta * t_normalized_valid + t_alpha) * ln10)
 
             # STEP 1: Get unsigned magnitude predictions and compute derivatives separately
             # Detect phase
@@ -1143,7 +1152,7 @@ class ConsistencyLoss_auto_diff(BaseLossComponent):
 
             # Denormalize inputs to get t_real (vibration: t is at index 3)
             t_normalized = inputs[:, 3]
-            t_real = torch.exp((t_std * t_normalized + t_mean) * ln10)
+            t_real = torch.exp((t_beta * t_normalized + t_alpha) * ln10)
 
             # Filter out samples where t_real ≈ 0 (to avoid division by zero)
             valid_mask = t_real > self.t_threshold
@@ -1225,13 +1234,13 @@ class ConsistencyLoss_auto_diff(BaseLossComponent):
         a_target = targets_valid[:, 5]  # a' target (SIGNED normalized log-space)
 
         # Denormalize targets to real space
-        x_target_real = torch.exp((std_x * x_target + mean_x) * ln10)
-        v_target_real = torch.exp((std_v * v_target + mean_v) * ln10)
-        a_target_real = torch.exp((std_a * a_target + mean_a) * ln10)
+        x_target_real = torch.exp((beta_x * x_target + alpha_x) * ln10)
+        v_target_real = torch.exp((beta_v * v_target + alpha_v) * ln10)
+        a_target_real = torch.exp((beta_a * a_target + alpha_a) * ln10)
 
         # Compute common factors from targets (inverse of theory formula)
-        common_factor_v_target = (std_x / std_t) * (x_target_real / (t_real_valid + eps))
-        common_factor_a_target = (std_v / std_t) * (v_target_real / (t_real_valid + eps))
+        common_factor_v_target = (beta_x / t_beta) * (x_target_real / (t_real_valid + eps))
+        common_factor_a_target = (beta_v / t_beta) * (v_target_real / (t_real_valid + eps))
 
         # Invert formula to get target derivatives
         # v_theory = |common_factor * dx'/dt'| → |dx'/dt'| = v / common_factor
@@ -1257,8 +1266,8 @@ class ConsistencyLoss_auto_diff(BaseLossComponent):
             a_prime_predict = mag_preds_internal[:, 2] * logabs_sign[:, 2]  # Apply sign to a'
 
         # Denormalize predicted v' and a' to real space
-        v_predict_real = torch.exp((std_v * v_prime_predict + mean_v) * ln10)
-        a_predict_real = torch.exp((std_a * a_prime_predict + mean_a) * ln10)
+        v_predict_real = torch.exp((beta_v * v_prime_predict + alpha_v) * ln10)
+        a_predict_real = torch.exp((beta_a * a_prime_predict + alpha_a) * ln10)
 
         # Compute prediction-based derivatives using theory formula
         # Theory: v_theory = |common_factor_v * dx'/dt'| → |dx'/dt'| = v / common_factor_v

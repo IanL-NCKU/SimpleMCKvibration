@@ -747,6 +747,96 @@ def prediction_performance(data_path, model_pt_path, model, inputs_normalizer, o
     print("Prediction performance plots generated successfully!")
     print(f"{'='*60}\n")
 
+
+def prediction_performance_absonly(data_path, model_pt_path, model, inputs_normalizer, outputs_normalizer, device, dtype=torch.float32, data_sampling_step=1, figure_folder='./figures'):
+    """
+    Plot mag_preds (unsigned, no sign applied) vs signed logabs targets.
+    X-axis: signed logabs targets (ground truth, unchanged)
+    Y-axis: mag_preds only (always positive, from Softplus)
+    Expected shape: V-shape (positive targets → upper right, negative targets → upper left)
+    """
+    print(f"\n{'='*60}")
+    print("Generating Abs-Only Prediction Plots (mag_preds vs signed targets)")
+    print(f"{'='*60}")
+
+    if not os.path.exists(figure_folder):
+        os.makedirs(figure_folder)
+
+    model.load_state_dict(torch.load(model_pt_path))
+    model.eval()
+    print(f"Loaded model from: {model_pt_path}")
+
+    test_loader, _, _, _, _ = load_vibration_data(
+        filepath=data_path,
+        batch_size=256,
+        normalize=True,
+        shuffle_train=False,
+        inputs_normalizer=inputs_normalizer,
+        outputs_normalizer=outputs_normalizer
+    )
+
+    all_mag_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        for inputs, targets in tqdm(test_loader, desc="Evaluating (abs-only)"):
+            inputs = inputs.to(device, dtype=dtype)
+            targets = targets.to(device, dtype=dtype)
+
+            mag_preds, logabs_sign_pred, real_sign_pred, ft_cal = model(inputs)
+
+            # Unsigned magnitude predictions (no sign applied)
+            all_mag_preds.append(mag_preds.detach().cpu().numpy())
+            # Signed logabs targets (unchanged)
+            all_targets.append(targets[:, 3:].detach().cpu().numpy())
+
+    all_mag_preds = np.concatenate(all_mag_preds, axis=0)
+    all_targets = np.concatenate(all_targets, axis=0)
+
+    if data_sampling_step > 1 and len(all_mag_preds) > data_sampling_step:
+        sampled_indices = np.arange(0, len(all_mag_preds), data_sampling_step)
+        mag_preds_sampled = all_mag_preds[sampled_indices]
+        targets_sampled = all_targets[sampled_indices]
+    else:
+        mag_preds_sampled = all_mag_preds
+        targets_sampled = all_targets
+
+    output_names = ['logabs_x', 'logabs_v', 'logabs_a']
+    output_titles = [
+        'Log-Abs Position: mag_preds vs signed target',
+        'Log-Abs Velocity: mag_preds vs signed target',
+        'Log-Abs Acceleration: mag_preds vs signed target',
+    ]
+
+    for idx, (name, title) in enumerate(zip(output_names, output_titles)):
+        plt.figure(figsize=(8, 8))
+
+        ground_truth = targets_sampled[:, idx]   # signed
+        predictions = mag_preds_sampled[:, idx]  # unsigned (always >= 0)
+
+        plt.scatter(ground_truth, predictions, alpha=0.5, s=20)
+
+        min_val = min(ground_truth.min(), predictions.min())
+        max_val = max(ground_truth.max(), predictions.max())
+        plt.plot([min_val, max_val], [min_val, max_val], 'r-', linewidth=2, label='y=x')
+
+        plt.grid(True, alpha=0.3)
+        plt.xlabel('Signed Ground Truth (logabs)', fontsize=12)
+        plt.ylabel('mag_preds (unsigned)', fontsize=12)
+        plt.title(title, fontsize=14, fontweight='bold')
+        plt.legend()
+
+        filename = f"{name}_absonly_prediction.png"
+        filepath = os.path.join(figure_folder, filename)
+        plt.savefig(filepath, dpi=100, bbox_inches='tight')
+        print(f"Saved: {filepath}")
+        plt.close()
+
+    print(f"{'='*60}")
+    print("Abs-only plots generated successfully!")
+    print(f"{'='*60}\n")
+
+
 def main_ver0():
 
     device_index = 0
@@ -1478,7 +1568,8 @@ def main_ver0():
 def main():
     device_index = 0
     train_in_64 = True
-    epochs = 500
+    epochs = 50
+    plot_only = True  # Set True to skip training and just regenerate plots
 
     # Setup float64 training if requested (MUST be done BEFORE loading data)
     if train_in_64:
@@ -1505,7 +1596,8 @@ def main():
         batch_size=1024,
         normalize=data_normalize,
         shuffle_train=True,
-        dtype=dtype
+        dtype=dtype,
+        inputs_map_range=[-1, 1]
     )
 
     test_loader, _, _, test_inputs_normalizer, test_targets_normalizer = load_vibration_data(
@@ -1524,8 +1616,8 @@ def main():
     device = torch.device(f'cuda:{device_index}' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    model_file_name = 'vibration_model_onlymse_mag.pt'
-    model_and_result_folder = './vibration_onlymse_mag'
+    model_file_name = 'vibration_model_onlymse_mag_map.pt'
+    model_and_result_folder = './vibration_onlymse_mag_map'
     
     # Create the results folder if it doesn't exist
     if not os.path.exists(model_and_result_folder):
@@ -1547,15 +1639,39 @@ def main():
                           real_sign_network_hidden_dims=[128, 64, 64, 32, 32, 16],
                           real_sign_network_dropout=0.3).to(device)
 
+    if plot_only:
+        model, train_val_inputs_normalizer, train_val_targets_normalizer = load_checkpoint(model_save_path, model)
+        prediction_performance(
+            data_path=Plot_data_source,
+            model_pt_path=model_save_path,
+            model=model,
+            inputs_normalizer=train_val_inputs_normalizer,
+            outputs_normalizer=train_val_targets_normalizer,
+            device=device,
+            dtype=dtype,
+            data_sampling_step=100,
+            figure_folder=model_and_result_folder
+        )
+        prediction_performance_absonly(
+            data_path=Plot_data_source,
+            model_pt_path=model_save_path,
+            model=model,
+            inputs_normalizer=train_val_inputs_normalizer,
+            outputs_normalizer=train_val_targets_normalizer,
+            device=device,
+            dtype=dtype,
+            data_sampling_step=100,
+            figure_folder=model_and_result_folder
+        )
+        return
 
-    
     """
     # check for the consistency of the ft_cal implementation
     # first load the best model from previous training
     
     """
-    # previous_model_path = r'H:\Postgraudate\Research\Test\SimpleMCKvibration\expwithsign_model_elu_newsignmodel_realtest64_finetunene_consistency_testInside.pt'
-    # model.load_state_dict(torch.load(previous_model_path))
+    previous_model_path = r'H:\Postgraudate\Research\Test\SimpleMCKvibration\vibration_onlymse_mag_map\vibration_model_onlymse_mag_map.pt'
+    model.load_state_dict(torch.load(previous_model_path))
     # print(f"Loaded previous model from: {previous_model_path} for ft_cal consistency check.")
 
 
@@ -1579,13 +1695,13 @@ def main():
 
     # Create separate schedulers for each optimizer
     mag_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        mag_optimizer, T_max=np.max([epochs//25,1]), eta_min=1e-12
+        mag_optimizer, T_max=np.max([epochs//5,1]), eta_min=1e-12
     )
     finetune_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        finetune_optimizer, T_max=np.max([epochs//25,1]), eta_min=1e-12
+        finetune_optimizer, T_max=np.max([epochs//5,1]), eta_min=1e-12
     )
     sign_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        sign_optimizer, T_max=np.max([epochs//25,1]), eta_min=1e-12
+        sign_optimizer, T_max=np.max([epochs//5,1]), eta_min=1e-12
     )
 
     # Prepare inputs_normalizer for consistency loss
@@ -1632,7 +1748,7 @@ def main():
     # Input data shape: (batch_size, 3) -> [a, b, t]
     # Target data shape: (batch_size, 3) -> [x_t, v_t, a_t]
     best_combined_loss = float('inf')
-    finetune_activation_epoch = int(epochs * 0.4)  # Activate finetune network after 40% of epochs
+    finetune_activation_epoch = int(epochs * 0.8)  # Activate finetune network after 40% of epochs
 
 
 
@@ -1741,11 +1857,13 @@ def main():
                     # MODE 1: Pass mag_preds and valid_mask
                     # Compute valid_mask for t_real > threshold
                     t_threshold = consistency_config.get("t_threshold", 1e-6)
-                    t_normalized = inputs[:, 2]
-                    t_mean = train_val_inputs_normalizer.log_mean['t']
-                    t_std = train_val_inputs_normalizer.log_std['t']
+                    t_normalized = inputs[:, 3]
+                    t_alpha = train_val_inputs_normalizer.log_mean['t']
+                    t_beta  = train_val_inputs_normalizer.log_std['t']
+                    t_alpha = generalize_alpha(train_val_inputs_normalizer, t_alpha, t_beta, 't')
+                    t_beta  = generalize_beta( train_val_inputs_normalizer, t_alpha, t_beta, 't')
                     ln10 = torch.log(torch.tensor(10.0, device=device, dtype=dtype))
-                    t_real = torch.exp((t_std * t_normalized + t_mean) * ln10)
+                    t_real = torch.exp((t_beta * t_normalized + t_alpha) * ln10)
                     valid_mask = t_real > t_threshold
 
                     # Combine mag_preds + ft_cal_consistency outside (phase-aware)
@@ -1815,9 +1933,6 @@ def main():
 
         # Print residuals if residual loss is active
         if loss_fn.has_loss("Residual"):
-            # Extract parameter 'a' from inputs_real
-            a_values = inputs_real[:, 0]  # (batch_size,)
-
             # Use phase-appropriate ft_cal (same as used in residual loss)
             # ft_cal_phase was already computed above when residual loss is active
             # Reconstruct predictions with phase-appropriate ft_cal
@@ -1829,11 +1944,14 @@ def main():
             pred_real = train_val_targets_normalizer.denormalize_outputs(outputs_for_print.detach().cpu().numpy())
             target_real = train_val_targets_normalizer.denormalize_outputs(targets.detach().cpu().numpy())
 
-            # Calculate physics residuals: (1/(2a))*a_t + 0.5*v_t - a*x_t
-            # pred_real shape: (batch_size, 6) -> [x, v, a] are columns 0, 1, 2
-            a_values_np = a_values.detach().cpu().numpy()
-            pred_residual = (1/(2*a_values_np)) * pred_real[:, 2] + 0.5 * pred_real[:, 1] - a_values_np * pred_real[:, 0]
-            target_residual = (1/(2*a_values_np)) * target_real[:, 2] + 0.5 * target_real[:, 1] - a_values_np * target_real[:, 0]
+            # Calculate physics residuals: m*a + c*v + k*x = 0
+            # inputs_real: [m, zeta, k, t, x0, v0], pred_real: [x, v, a] are columns 0, 1, 2
+            m_values_np = inputs_real[:, 0].detach().cpu().numpy()
+            zeta_values_np = inputs_real[:, 1].detach().cpu().numpy()
+            k_values_np = inputs_real[:, 2].detach().cpu().numpy()
+            c_values_np = 2 * zeta_values_np * np.sqrt(m_values_np * k_values_np)
+            pred_residual = m_values_np * pred_real[:, 2] + c_values_np * pred_real[:, 1] + k_values_np * pred_real[:, 0]
+            target_residual = m_values_np * target_real[:, 2] + c_values_np * target_real[:, 1] + k_values_np * target_real[:, 0]
 
             # Take last batch sample
             pred_res_val = pred_residual[-1]
@@ -1958,13 +2076,15 @@ def main():
                         # For validation, it's better to use MODE 2 (compute internally)
                         # But if user explicitly requests MODE 1, we respect it
                         t_threshold = consistency_config.get("t_threshold", 1e-6)
-                        t_normalized = inputs[:, 2]
-                        t_mean = train_val_inputs_normalizer.log_mean['t']
-                        t_std = train_val_inputs_normalizer.log_std['t']
+                        t_normalized = inputs[:, 3]
+                        t_alpha = train_val_inputs_normalizer.log_mean['t']
+                        t_beta  = train_val_inputs_normalizer.log_std['t']
+                        t_alpha = generalize_alpha(train_val_inputs_normalizer, t_alpha, t_beta, 't')
+                        t_beta  = generalize_beta( train_val_inputs_normalizer, t_alpha, t_beta, 't')
                         ln10 = torch.log(torch.tensor(10.0, device=device, dtype=dtype))
-                        t_real = torch.exp((t_std * t_normalized + t_mean) * ln10)
+                        t_real = torch.exp((t_beta * t_normalized + t_alpha) * ln10)
                         valid_mask = t_real > t_threshold
-                        
+
                         # Signature: (mag_preds, targets, inputs, inputs_normalizer, outputs_normalizer, ft_cal, valid_mask)
                         loss_args["Consistency"] = (mag_preds, targets, inputs, train_val_inputs_normalizer,
                                                    train_val_targets_normalizer, ft_cal_consistency, valid_mask)
@@ -2032,19 +2152,27 @@ def main():
                 diag_ft_cal_phase = diag_ft_cal  # Phase 2
 
             # Get normalizer stats
-            t_mean = train_val_inputs_normalizer.log_mean['t']
-            t_std = train_val_inputs_normalizer.log_std['t']
-            mean_x = train_val_targets_normalizer.log_mean['x']
-            std_x = train_val_targets_normalizer.log_std['x']
-            mean_v = train_val_targets_normalizer.log_mean['v']
-            std_v = train_val_targets_normalizer.log_std['v']
-            mean_a = train_val_targets_normalizer.log_mean['a']
-            std_a = train_val_targets_normalizer.log_std['a']
+            t_alpha = train_val_inputs_normalizer.log_mean['t']
+            t_beta  = train_val_inputs_normalizer.log_std['t']
+            t_alpha = generalize_alpha(train_val_inputs_normalizer, t_alpha, t_beta, 't')
+            t_beta  = generalize_beta( train_val_inputs_normalizer, t_alpha, t_beta, 't')
+            alpha_x = train_val_targets_normalizer.log_mean['x']
+            beta_x  = train_val_targets_normalizer.log_std['x']
+            alpha_x = generalize_alpha(train_val_targets_normalizer, alpha_x, beta_x, 'x')
+            beta_x  = generalize_beta( train_val_targets_normalizer, alpha_x, beta_x, 'x')
+            alpha_v = train_val_targets_normalizer.log_mean['v']
+            beta_v  = train_val_targets_normalizer.log_std['v']
+            alpha_v = generalize_alpha(train_val_targets_normalizer, alpha_v, beta_v, 'v')
+            beta_v  = generalize_beta( train_val_targets_normalizer, alpha_v, beta_v, 'v')
+            alpha_a = train_val_targets_normalizer.log_mean['a']
+            beta_a  = train_val_targets_normalizer.log_std['a']
+            alpha_a = generalize_alpha(train_val_targets_normalizer, alpha_a, beta_a, 'a')
+            beta_a  = generalize_beta( train_val_targets_normalizer, alpha_a, beta_a, 'a')
             ln10 = torch.log(torch.tensor(10.0, device=device, dtype=dtype))
 
             # Compute valid mask
-            t_normalized = diag_inputs[:, 2]
-            t_real = torch.exp((t_std * t_normalized + t_mean) * ln10)
+            t_normalized = diag_inputs[:, 3]
+            t_real = torch.exp((t_beta * t_normalized + t_alpha) * ln10)
             valid_mask = t_real > t_threshold
 
             # Combine mag_preds + ft_cal (now both are from the fresh forward pass)
@@ -2068,7 +2196,7 @@ def main():
                     allow_unused=True
                 )[0]
                 if dx_prime_dt_prime is not None:
-                    dx_prime_dt_prime = dx_prime_dt_prime[valid_mask, 2]
+                    dx_prime_dt_prime = dx_prime_dt_prime[valid_mask, 3]
 
                     dv_prime_dt_prime = torch.autograd.grad(
                         outputs=mag_v,
@@ -2079,7 +2207,7 @@ def main():
                         allow_unused=True
                     )[0]
                     if dv_prime_dt_prime is not None:
-                        dv_prime_dt_prime = dv_prime_dt_prime[valid_mask, 2]
+                        dv_prime_dt_prime = dv_prime_dt_prime[valid_mask, 3]
 
                         # Compute theory values from MODEL predictions
                         logabs_targets = targets_valid[:, 3:]
@@ -2088,18 +2216,18 @@ def main():
                         x_pred = logabs_sign[:, 0] * mag_x
                         v_pred = logabs_sign[:, 1] * mag_v
 
-                        x_real = torch.exp((std_x * x_pred.detach() + mean_x) * ln10)
-                        v_real = torch.exp((std_v * v_pred.detach() + mean_v) * ln10)
+                        x_real = torch.exp((beta_x * x_pred.detach() + alpha_x) * ln10)
+                        v_real = torch.exp((beta_v * v_pred.detach() + alpha_v) * ln10)
 
                         eps = 1e-12
-                        common_factor_v_model = (std_x / t_std) * (x_real / (t_real_valid + eps))
+                        common_factor_v_model = (beta_x / t_beta) * (x_real / (t_real_valid + eps))
                         v_theory_model = torch.abs(common_factor_v_model * dx_prime_dt_prime.detach())
 
-                        common_factor_a_model = (std_v / t_std) * (v_real / (t_real_valid + eps))
+                        common_factor_a_model = (beta_v / t_beta) * (v_real / (t_real_valid + eps))
                         a_theory_model = torch.abs(common_factor_a_model * dv_prime_dt_prime.detach())
 
-                        v_theory_model_normalized = (torch.log10(v_theory_model + eps) - mean_v) / std_v
-                        a_theory_model_normalized = (torch.log10(a_theory_model + eps) - mean_a) / std_a
+                        v_theory_model_normalized = (torch.log10(v_theory_model + eps) - alpha_v) / beta_v
+                        a_theory_model_normalized = (torch.log10(a_theory_model + eps) - alpha_a) / beta_a
 
                         # Compute theory values from GROUND TRUTH targets (analytical)
                         # Extract target values in normalized log space
@@ -2107,8 +2235,8 @@ def main():
                         v_target = targets_valid[:, 4]  # v' normalized
 
                         # Denormalize targets to real space
-                        x_target_real = torch.exp((std_x * x_target + mean_x) * ln10)
-                        v_target_real = torch.exp((std_v * v_target + mean_v) * ln10)
+                        x_target_real = torch.exp((beta_x * x_target + alpha_x) * ln10)
+                        v_target_real = torch.exp((beta_v * v_target + alpha_v) * ln10)
 
                         # Compute analytical derivatives dx'/dt' and dv'/dt' from ground truth
                         # Using formula from check_dataset_consistency: dx'/dt' = (std_t / std_x) * a * t_real
@@ -2119,18 +2247,18 @@ def main():
                         denorm_inputs = train_val_inputs_normalizer.denormalize_inputs(inputs_valid_np)
                         a_param_real = torch.tensor(denorm_inputs[:, 0], device=device, dtype=dtype)
 
-                        dx_dt_target_analytical = (t_std / std_x) * a_param_real * t_real_valid
-                        dv_dt_target_analytical = (t_std / std_v) * a_param_real * t_real_valid
+                        dx_dt_target_analytical = (t_beta / beta_x) * a_param_real * t_real_valid
+                        dv_dt_target_analytical = (t_beta / beta_v) * a_param_real * t_real_valid
 
                         # Compute theory from target's derivatives
-                        common_factor_v_target = (std_x / t_std) * (x_target_real / (t_real_valid + eps))
+                        common_factor_v_target = (beta_x / t_beta) * (x_target_real / (t_real_valid + eps))
                         v_theory_target = torch.abs(common_factor_v_target * dx_dt_target_analytical)
 
-                        common_factor_a_target = (std_v / t_std) * (v_target_real / (t_real_valid + eps))
+                        common_factor_a_target = (beta_v / t_beta) * (v_target_real / (t_real_valid + eps))
                         a_theory_target = torch.abs(common_factor_a_target * dv_dt_target_analytical)
 
-                        v_theory_target_normalized = (torch.log10(v_theory_target + eps) - mean_v) / std_v
-                        a_theory_target_normalized = (torch.log10(a_theory_target + eps) - mean_a) / std_a
+                        v_theory_target_normalized = (torch.log10(v_theory_target + eps) - alpha_v) / beta_v
+                        a_theory_target_normalized = (torch.log10(a_theory_target + eps) - alpha_a) / beta_a
 
                         # Print diagnostics
                         v_theory_model_log = v_theory_model_normalized.detach().cpu().numpy()
@@ -2354,11 +2482,13 @@ def main():
                     # Note: In test, inputs doesn't have requires_grad=True, so this mode won't compute gradients
                     # For test, it's better to use MODE 2 (compute internally)
                     t_threshold = consistency_config.get("t_threshold", 1e-6)
-                    t_normalized = inputs[:, 2]
-                    t_mean = test_inputs_normalizer.log_mean['t']
-                    t_std = test_inputs_normalizer.log_std['t']
+                    t_normalized = inputs[:, 3]
+                    t_alpha = test_inputs_normalizer.log_mean['t']
+                    t_beta  = test_inputs_normalizer.log_std['t']
+                    t_alpha = generalize_alpha(test_inputs_normalizer, t_alpha, t_beta, 't')
+                    t_beta  = generalize_beta( test_inputs_normalizer, t_alpha, t_beta, 't')
                     ln10 = torch.log(torch.tensor(10.0, device=device, dtype=dtype))
-                    t_real = torch.exp((t_std * t_normalized + t_mean) * ln10)
+                    t_real = torch.exp((t_beta * t_normalized + t_alpha) * ln10)
                     valid_mask = t_real > t_threshold
 
                     # Signature: (mag_preds, targets, inputs, inputs_normalizer, outputs_normalizer, ft_cal, valid_mask)
@@ -2503,11 +2633,13 @@ def main():
 
                 if input_grad_outside:
                     t_threshold = consistency_config.get("t_threshold", 1e-6)
-                    t_normalized = inputs[:, 2]
-                    t_mean = train_val_inputs_normalizer.log_mean['t']
-                    t_std = train_val_inputs_normalizer.log_std['t']
+                    t_normalized = inputs[:, 3]
+                    t_alpha = train_val_inputs_normalizer.log_mean['t']
+                    t_beta  = train_val_inputs_normalizer.log_std['t']
+                    t_alpha = generalize_alpha(train_val_inputs_normalizer, t_alpha, t_beta, 't')
+                    t_beta  = generalize_beta( train_val_inputs_normalizer, t_alpha, t_beta, 't')
                     ln10 = torch.log(torch.tensor(10.0, device=device, dtype=dtype))
-                    t_real = torch.exp((t_std * t_normalized + t_mean) * ln10)
+                    t_real = torch.exp((t_beta * t_normalized + t_alpha) * ln10)
                     valid_mask = t_real > t_threshold
                     loss_args["Consistency"] = (mag_preds, targets, inputs, train_val_inputs_normalizer,
                                                train_val_targets_normalizer, ft_cal_consistency, valid_mask)
@@ -2572,11 +2704,13 @@ def main():
 
                 if input_grad_outside:
                     t_threshold = consistency_config.get("t_threshold", 1e-6)
-                    t_normalized = inputs[:, 2]
-                    t_mean = train_val_inputs_normalizer.log_mean['t']
-                    t_std = train_val_inputs_normalizer.log_std['t']
+                    t_normalized = inputs[:, 3]
+                    t_alpha = train_val_inputs_normalizer.log_mean['t']
+                    t_beta  = train_val_inputs_normalizer.log_std['t']
+                    t_alpha = generalize_alpha(train_val_inputs_normalizer, t_alpha, t_beta, 't')
+                    t_beta  = generalize_beta( train_val_inputs_normalizer, t_alpha, t_beta, 't')
                     ln10 = torch.log(torch.tensor(10.0, device=device, dtype=dtype))
-                    t_real = torch.exp((t_std * t_normalized + t_mean) * ln10)
+                    t_real = torch.exp((t_beta * t_normalized + t_alpha) * ln10)
                     valid_mask = t_real > t_threshold
                     loss_args["Consistency"] = (mag_preds, targets, inputs, train_val_inputs_normalizer,
                                                train_val_targets_normalizer, ft_cal_consistency, valid_mask)
