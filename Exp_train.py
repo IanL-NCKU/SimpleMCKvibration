@@ -514,7 +514,7 @@ def testdataloaderunchange():
 def main():
     device_index = 0
     train_in_64 = True
-    epochs = 500
+    epochs = 200
 
     # Setup float64 training if requested (MUST be done BEFORE loading data)
     if train_in_64:
@@ -538,7 +538,7 @@ def main():
     # Load the dataset
     train_loader, val_loader, _, train_val_inputs_normalizer, train_val_targets_normalizer = load_exponential_data(
         filepath=Train_Val_data_source,
-        batch_size=1024,
+        batch_size=2048,
         normalize=data_normalize,
         shuffle_train=True,
         dtype=dtype,
@@ -547,7 +547,7 @@ def main():
 
     test_loader, _, _, test_inputs_normalizer, test_targets_normalizer = load_exponential_data(
         filepath=Test_data_source,
-        batch_size=1024,
+        batch_size=2048,
         normalize=data_normalize,
         shuffle_train=False,
         dtype=dtype,
@@ -561,8 +561,8 @@ def main():
     device = torch.device(f'cuda:{device_index}' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    model_file_name = 'exp_mapconsist.pt'#consistency_testOutside_nolog.pt'
-    model_and_result_folder = './exp_mapconsist'
+    model_file_name = 'exp_checkallloss.pt'#consistency_testOutside_nolog.pt'
+    model_and_result_folder = './exp_checkallloss' #./consistency_testOutside_nolog'
 
     # Create the results folder if it doesn't exist
     if not os.path.exists(model_and_result_folder):
@@ -575,7 +575,7 @@ def main():
     # Create the Exponential PINN model
     model = ExponentialPINN_ver3(hidden_dims=[16, 32, 64, 64, 32, 16],
                           activation='elu',
-                          use_log_output=False,
+                          use_internal_sign=False,
                           use_finetune=True,
                           finetune_hidden_dims=[32, 128, 32],
                           finetune_scale=10,
@@ -616,13 +616,13 @@ def main():
 
     # Create separate schedulers for each optimizer
     mag_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        mag_optimizer, T_max=np.max([epochs//25,1]), eta_min=1e-12
+        mag_optimizer, T_max=np.max([epochs//10,1]), eta_min=1e-12
     )
     finetune_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        finetune_optimizer, T_max=np.max([epochs//25,1]), eta_min=1e-12
+        finetune_optimizer, T_max=np.max([epochs//10,1]), eta_min=1e-12
     )
     sign_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        sign_optimizer, T_max=np.max([epochs//25,1]), eta_min=1e-12
+        sign_optimizer, T_max=np.max([epochs//10,1]), eta_min=1e-12
     )
 
     # Prepare inputs_normalizer for consistency loss
